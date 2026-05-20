@@ -1,0 +1,80 @@
+"""Project paths and runtime configuration.
+
+When running from source (`python -m scripts.launcher`), config and data
+live in the project root. When running from a packaged PyInstaller exe,
+they live in `%APPDATA%\\caseload-notes\\` so the install dir can stay
+read-only and the app works across user accounts.
+"""
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+
+
+def _bundle_root() -> Optional[Path]:
+    """Directory containing bundled data files when running as a frozen
+    exe, or None when running from source.
+
+    Detection covers:
+    - PyInstaller: sets sys._MEIPASS to the extracted-bundle path.
+    - Nuitka standalone: adds `__compiled__` to compiled module globals
+      and the exe sits in the bundle directory itself.
+    - Other freezers that follow the sys.frozen convention.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)  # PyInstaller
+    if "__compiled__" in globals() or getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent  # Nuitka / others
+    return None
+
+
+def _is_frozen() -> bool:
+    return _bundle_root() is not None
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _user_config_dir() -> Path:
+    if _is_frozen():
+        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(appdata) / "caseload-notes"
+    return PROJECT_ROOT
+
+
+USER_CONFIG_DIR = _user_config_dir()
+USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Point Playwright at the bundled Chromium when running from the exe.
+# This must happen before any module imports playwright.sync_api.
+_bundle = _bundle_root()
+if _bundle is not None:
+    _bundled_browsers = _bundle / "ms-playwright"
+    if _bundled_browsers.exists():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_bundled_browsers)
+
+# Load .env from user config (priority) and project root (dev fallback).
+load_dotenv(USER_CONFIG_DIR / ".env")
+if not _is_frozen():
+    load_dotenv(PROJECT_ROOT / ".env")
+
+NOTES_YAML = USER_CONFIG_DIR / "notes.yaml"
+BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
+SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
+
+CASELOAD_URL = os.getenv("CASELOAD_URL", "").strip()
+
+
+def _seed_user_notes_yaml() -> None:
+    """First-run convenience: copy the bundled default notes.yaml into
+    the user's config dir if they don't have one yet."""
+    if NOTES_YAML.exists():
+        return
+    bundled_default = (_bundle / "notes.yaml") if _bundle is not None else (PROJECT_ROOT / "notes.yaml")
+    if bundled_default.exists():
+        NOTES_YAML.write_bytes(bundled_default.read_bytes())
+
+
+_seed_user_notes_yaml()

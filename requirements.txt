@@ -1,0 +1,5 @@
+playwright>=1.40
+python-dotenv>=1.0
+pyyaml>=6.0
+pynput>=1.7
+customtkinter>=5.2

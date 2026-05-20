@@ -1,0 +1,23 @@
+.venv/
+browser_data/
+screenshots/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.playwright/
+.idea/
+.vscode/
+.claude/
+build/
+dist/
+dist-nuitka/
+*.spec.bak
+
+# Real student data captured during inspection — FERPA, don't commit.
+resources/
+
+# Nuitka intermediates
+*.build/
+*.dist/
+*.onefile-build/

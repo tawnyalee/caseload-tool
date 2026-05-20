@@ -1,0 +1,35 @@
+scenarios:
+  welcome:
+    hotkey: F3
+    close_tab_after: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: general welcome email sent. T1 info.
+      academic_activities: []
+      submit: true
+  approval:
+    hotkey: F2
+    close_tab_after: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email from Student
+      body: Task 1 approval sent for review
+      academic_activities:
+      - Course/Program Information Discussed
+      - Course/Program Information Requested
+      submit: true
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: Task 1 approval form approved and emailed. Task 2 info sent.
+      academic_activities: []
+      submit: true
+  custom:
+    hotkey: F4
+    close_tab_after: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: ''
+      academic_activities: []
+      submit: true
