@@ -24,3 +24,6 @@ resources/
 
 # Release archives — distribute via GitHub Releases, not the repo.
 CaseloadNotes-*.zip
+
+# Per-user session log (created at runtime in dev mode).
+note_log.csv

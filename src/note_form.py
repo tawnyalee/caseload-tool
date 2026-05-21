@@ -28,6 +28,7 @@ class NoteData:
     academic_activities: list[str] = field(default_factory=list)  # checkbox labels to tick
     body: str = ""                         # rich-text body; "" = skip
     submit: bool = False                   # leave False while we dial in selectors
+    append_clipboard: bool = False         # paste clipboard text after body at fire time
 
 
 def _screenshot_failure(page: Page, tag: str) -> Path:

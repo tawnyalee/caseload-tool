@@ -63,6 +63,7 @@ if not _is_frozen():
 NOTES_YAML = USER_CONFIG_DIR / "notes.yaml"
 BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
 SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
+NOTE_LOG_CSV = USER_CONFIG_DIR / "note_log.csv"
 
 # Default to WGU's standard Caseload page. Override via .env in the user
 # config dir if your campus / org uses a different Salesforce instance.

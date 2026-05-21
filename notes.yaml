@@ -1,13 +1,14 @@
 scenarios:
   welcome:
-    hotkey: F3
+    hotkey: F6
     close_tab_after: true
     notes:
     - interaction_format: Single Interaction
       interaction_type: Email to Student
-      body: general welcome email sent. T1 info.
+      body: Testgin 2
       academic_activities: []
       submit: true
+      append_clipboard: false
   approval:
     hotkey: F2
     close_tab_after: true
@@ -19,13 +20,25 @@ scenarios:
       - Course/Program Information Discussed
       - Course/Program Information Requested
       submit: true
+      append_clipboard: false
     - interaction_format: Single Interaction
       interaction_type: Email to Student
       body: Task 1 approval form approved and emailed. Task 2 info sent.
       academic_activities: []
       submit: true
-  custom:
-    hotkey: F4
+      append_clipboard: false
+  Test (Admin):
+    hotkey: Ctrl+Alt+A
+    close_tab_after: true
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Admin Note
+      body: 'Test note. '
+      academic_activities: []
+      submit: false
+      append_clipboard: true
+  Test Note2:
+    hotkey: ''
     close_tab_after: true
     notes:
     - interaction_format: Single Interaction
@@ -33,3 +46,4 @@ scenarios:
       body: ''
       academic_activities: []
       submit: true
+      append_clipboard: false
