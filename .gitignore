@@ -21,3 +21,6 @@ resources/
 *.build/
 *.dist/
 *.onefile-build/
+
+# Release archives — distribute via GitHub Releases, not the repo.
+CaseloadNotes-*.zip
