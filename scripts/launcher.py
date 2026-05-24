@@ -518,21 +518,34 @@ class NoteEditor:
     Interaction Format, Interaction Type, Academic Activities, Body.
     Collapsible via the ▼/▶ header button."""
 
-    def __init__(self, parent, index: int):
+    def __init__(self, parent, index: int, on_delete: Optional[Callable] = None):
         self.index = index
         self._collapsed = False
         self.frame = ctk.CTkFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
 
-        # Header button — clicking collapses/expands the content frame.
+        # Header row — collapse toggle (fills width) + optional ✕ delete.
+        header_row = ctk.CTkFrame(self.frame, fg_color="transparent")
+        header_row.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
+        header_row.grid_columnconfigure(0, weight=1)
         self.toggle_btn = ctk.CTkButton(
-            self.frame, text=self._header_text(),
+            header_row, text=self._header_text(),
             command=self._toggle_collapse, anchor="w", height=28,
             fg_color="transparent", text_color=("gray10", "gray90"),
             hover_color=("gray85", "gray25"),
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.toggle_btn.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
+        self.toggle_btn.grid(row=0, column=0, sticky="ew")
+        if on_delete is not None:
+            # Visible default fill + red hover so it reads as a delete
+            # affordance instead of disappearing into the header.
+            ctk.CTkButton(
+                header_row, text="✕  Delete note", width=110, height=28,
+                fg_color=("gray80", "gray30"),
+                hover_color=("#e74c3c", "#c0392b"),
+                text_color=("gray10", "gray90"),
+                command=lambda: on_delete(self),
+            ).grid(row=0, column=1, padx=(8, 4))
 
         # Content frame — everything below the header lives here so we
         # can grid_remove() it to collapse.
@@ -614,6 +627,12 @@ class NoteEditor:
             content, text="Submit and close automatically",
             variable=self.submit_var,
         ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
+
+    def set_index(self, index: int) -> None:
+        """Renumber this note in-place (Note 1, Note 2, …). Called after
+        a sibling note is added or deleted."""
+        self.index = index
+        self.toggle_btn.configure(text=self._header_text())
 
     def _header_text(self) -> str:
         arrow = "▶" if self._collapsed else "▼"
@@ -713,12 +732,22 @@ class ScenarioEditor:
             hotkey_row, text="Press to set", width=110, command=self._start_capture,
         ).pack(side="left", padx=(8, 0))
 
-        # One NoteEditor per note in the scenario.
+        # Notes live in their own container so add/delete can just
+        # pack/destroy children without disturbing the outer grid rows.
+        row += 1
+        self.notes_container = ctk.CTkFrame(self.frame, fg_color="transparent")
+        self.notes_container.grid(row=row, column=0, sticky="ew", padx=0, pady=0)
+        self.notes_container.grid_columnconfigure(0, weight=1)
         self.note_editors: list[NoteEditor] = []
-        for i, note in enumerate(scenario.notes):
-            ne = NoteEditor(self.frame, i)
-            ne.frame.grid(row=row + 1 + i, column=0, sticky="ew", padx=4, pady=4)
-            self.note_editors.append(ne)
+        for note in scenario.notes:
+            self._add_note_editor(note)
+
+        # + Add note button under the notes container.
+        row += 1
+        ctk.CTkButton(
+            self.frame, text="+ Add note",
+            command=self._add_note, width=120, height=32,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(4, 8))
 
         self.load(scenario)
 
@@ -736,6 +765,46 @@ class ScenarioEditor:
                 self.hotkey_entry.insert(0, combo)
 
         self.capture_handler(apply)
+
+    def _add_note_editor(self, note_data: NoteData) -> NoteEditor:
+        ne = NoteEditor(
+            self.notes_container,
+            index=len(self.note_editors),
+            on_delete=self._delete_note,
+        )
+        ne.frame.pack(fill="x", padx=4, pady=4)
+        ne.load(note_data)
+        self.note_editors.append(ne)
+        return ne
+
+    def _add_note(self) -> None:
+        """Append a new blank note. Draft until 'Save changes' — same
+        model as scenario add/delete."""
+        default = NoteData(
+            interaction_format="Single Interaction",
+            interaction_type="",
+            course_code="", subject="", body="",
+            academic_activities=[],
+            submit=True, append_clipboard=False,
+        )
+        self._add_note_editor(default)
+
+    def _delete_note(self, ne: NoteEditor) -> None:
+        # load_scenarios() rejects scenarios with zero notes, so
+        # deleting the last would just cause Save to fail.
+        if len(self.note_editors) <= 1:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Can't delete",
+                "A scenario needs at least one note. Use 'Delete "
+                "scenario' in the editor's action row if you want to "
+                "remove the whole scenario.",
+            )
+            return
+        self.note_editors.remove(ne)
+        ne.frame.destroy()
+        for i, e in enumerate(self.note_editors):
+            e.set_index(i)
 
     def load(self, scenario: ScenarioConfig) -> None:
         self.name_entry.delete(0, "end")
@@ -911,6 +980,11 @@ class App:
             command=self._new_scenario, width=140, height=34,
         ).pack(side="left", padx=4, pady=2)
         ctk.CTkButton(
+            save_frame, text="Delete scenario",
+            command=self._delete_scenario, width=140, height=34,
+            fg_color="transparent", border_width=1,
+        ).pack(side="left", padx=4, pady=2)
+        ctk.CTkButton(
             save_frame, text="Save changes",
             command=self._save_yaml, width=140, height=34,
         ).pack(side="right", padx=4, pady=2)
@@ -1000,16 +1074,45 @@ class App:
 
         open_hotkey_capture(self.root, wrapped)
 
+    def _delete_scenario(self) -> None:
+        """Drop the currently-selected scenario from the in-memory dict
+        and rebuild tabs/buttons. The deletion is *draft* — notes.yaml
+        isn't touched until the user clicks 'Save changes'. 'Revert'
+        brings the scenario back."""
+        try:
+            name = self.tabview.get()
+        except Exception:
+            self._append_log("No scenario tab selected.")
+            return
+        if not name or name not in self.scenarios:
+            self._append_log("No scenario tab selected.")
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "Delete scenario",
+            f"Delete scenario {name!r}?\n\n"
+            "This only updates the editor — click 'Save changes' to "
+            "persist, or 'Revert' to undo.",
+        ):
+            return
+        self.scenarios.pop(name, None)
+        self._rebuild_editor_tabs()
+        self._rebuild_scenario_buttons()
+        self._append_log(
+            f"Scenario {name!r} marked for deletion. "
+            "Click 'Save changes' to persist or 'Revert' to undo."
+        )
+
     def _revert_editor(self) -> None:
-        # Reload from disk; throw away unsaved widget state.
+        # Reload from disk and rebuild tabs/buttons so structural drafts
+        # (added or deleted scenarios) are undone, not just field edits.
         try:
             self.scenarios = load_scenarios()
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
             return
-        for name, ed in self.scenario_editors.items():
-            if name in self.scenarios:
-                ed.load(self.scenarios[name])
+        self._rebuild_editor_tabs()
+        self._rebuild_scenario_buttons()
         self._append_log("Editor reverted to saved YAML.")
 
     def _save_yaml(self) -> None:
