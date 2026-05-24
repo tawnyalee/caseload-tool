@@ -189,6 +189,12 @@ class BrowserWorker:
                     #   - --disable-features=CalculateNativeWinOcclusion
                     #     and other throttling-related Chromium flags
                     #   - Monkey-patching window.open in the page
+                    #   - Startup "warming" block: wait_for_load_state
+                    #     "networkidle" + page.evaluate("document.title")
+                    #     + page.locator("body").count() + mouse.move —
+                    #     so the unstick trigger isn't generic
+                    #     DOM/JS/input activity; it's something specific
+                    #     to a user-driven later action.
                     # Workaround documented in README: middle-click or
                     # right-click → "Open link in new tab".
                 self.on_status("Browser ready.")
