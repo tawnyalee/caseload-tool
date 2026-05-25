@@ -45,9 +45,16 @@ class EmailConfig:
     `inline_images` is a list of image filenames living in the user's
     templates directory. Each image's CID (referenced in the HTML body
     as `<img src="cid:NAME">`) is auto-derived from the filename stem
-    — e.g. `signature.png` → CID `signature`."""
+    — e.g. `signature.png` → CID `signature`.
+
+    `to` is an optional override of the recipient address. If left
+    empty, the email goes to `{{student_email}}` from the caseload
+    row. Otherwise the string is rendered with the same variables as
+    the subject/body — useful for test mode, e.g.
+    `to: "test{{first_name}}{{last_name}}@wgu.edu"`."""
     subject: str = ""
     body_html_file: str = ""
+    to: str = ""
     inline_images: list[str] = field(default_factory=list)
     cc_pm: bool = False
 
@@ -96,6 +103,7 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
     return EmailConfig(
         subject=d.get("subject", ""),
         body_html_file=d.get("body_html_file", ""),
+        to=d.get("to", ""),
         inline_images=list(d.get("inline_images") or []),
         cc_pm=bool(d.get("cc_pm", False)),
     )

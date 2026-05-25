@@ -1779,6 +1779,7 @@ class ScenarioEditor:
             out["email"] = {
                 "subject": self._email_config.subject,
                 "body_html_file": self._email_config.body_html_file,
+                "to": self._email_config.to,
                 "inline_images": list(self._email_config.inline_images),
                 "cc_pm": self._email_config.cc_pm,
             }
@@ -2650,7 +2651,10 @@ class App:
         try:
             template_html = email_template.load_template(template_path)
             body_html = email_template.render(template_html, student_ctx)
-            subject = email_template.render(email_cfg.subject, student_ctx)
+            # Subject and addresses are plain text — never HTML-escape.
+            subject = email_template.render_plain(
+                email_cfg.subject, student_ctx,
+            )
         except Exception as e:
             self._append_log(f"Email template render failed: {e}")
             return False
@@ -2661,7 +2665,12 @@ class App:
             for fname in email_cfg.inline_images
         }
 
-        to = student_ctx.get("student_email", "")
+        # To: optional override (for test-mode addresses or any custom
+        # routing), falling back to the student's email from caseload.
+        if email_cfg.to:
+            to = email_template.render_plain(email_cfg.to, student_ctx).strip()
+        else:
+            to = student_ctx.get("student_email", "")
         cc = student_ctx.get("pm_email", "") if email_cfg.cc_pm else ""
         if not to:
             if not messagebox.askyesno(

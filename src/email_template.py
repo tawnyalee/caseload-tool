@@ -65,6 +65,23 @@ def render(
     return _VAR_RE.sub(replace, template_text)
 
 
+def render_plain(template_text: str, variables: dict) -> str:
+    """Same as render() but with NO HTML escaping. Use for fields
+    whose output is plain text (email subject, To/CC addresses) —
+    those go into Outlook as-is and should not contain `&amp;`,
+    `&lt;`, etc. Unknown placeholders are still preserved."""
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        if name not in variables:
+            return match.group(0)
+        value = variables[name]
+        if value is None:
+            value = ""
+        return str(value)
+
+    return _VAR_RE.sub(replace, template_text)
+
+
 def load_template(path: Path) -> str:
     """Read a UTF-8 template file."""
     return Path(path).read_text(encoding="utf-8")

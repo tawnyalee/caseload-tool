@@ -118,19 +118,28 @@ def compose_email(
         mail.CC = cc
     mail.Subject = subject or ""
 
-    # Trigger Outlook to insert the default signature into HTMLBody
-    # *before* we set our content. GetInspector is a property — just
-    # accessing it forces inspector creation (which populates the
-    # signature) without showing a window yet.
-    signature_html = ""
-    try:
-        _ = mail.GetInspector
-        signature_html = mail.HTMLBody or ""
-    except Exception:
-        # No signature retrievable — proceed without one.
-        pass
-
-    mail.HTMLBody = (html_body or "") + signature_html
+    if auto_send:
+        # IMPORTANT: do NOT touch GetInspector here. Accessing the
+        # Inspector to capture the signature seems to leave the
+        # MailItem in a state that breaks `Send()` programmatically
+        # — Outlook returns 0x80070057 ('parameter is incorrect').
+        # Trade-off: auto-sent emails go out without the user's
+        # Outlook signature. If/when we want signatures on auto-sent
+        # mail, read them from `%APPDATA%\Microsoft\Signatures\*.htm`
+        # and concatenate manually rather than via Inspector.
+        mail.HTMLBody = html_body or ""
+    else:
+        # Display mode: capture the user's default Outlook signature
+        # (inserted by Outlook when the Inspector is created), then
+        # prepend our content so the final body is
+        # `<our html><signature>`.
+        signature_html = ""
+        try:
+            _ = mail.GetInspector
+            signature_html = mail.HTMLBody or ""
+        except Exception:
+            pass
+        mail.HTMLBody = (html_body or "") + signature_html
 
     if inline_images:
         for cid, path in inline_images.items():
