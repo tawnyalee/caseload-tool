@@ -36,9 +36,11 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import caseload_filter, email_template
+from src import caseload_csv, caseload_filter, email_template
 from src.browser import persistent_context
-from src.config import CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR
+from src.config import (
+    CASELOAD_CSV_PATH, CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR,
+)
 from src.note_form import NoteData
 from src.scenarios import (
     NOTES_YAML, BatchConfig, EmailConfig, ScenarioConfig,
@@ -265,6 +267,16 @@ class BrowserWorker:
             "CLICK_MATCH_BY_FILTER", query, expected_name, on_done,
         ))
 
+    def submit_download_caseload_csv(
+        self,
+        save_path: Path,
+        on_done: Callable[[bool, str], None],
+    ) -> None:
+        """Drive Salesforce's List View → Export UI and save the
+        resulting CSV to `save_path`. `on_done(success, message)` is
+        called from the worker thread when the export completes."""
+        self.q.put(("DOWNLOAD_CASELOAD_CSV", save_path, on_done))
+
     def shutdown(self) -> None:
         self.q.put(self.SHUTDOWN)
 
@@ -329,7 +341,7 @@ class BrowserWorker:
                         try:
                             success = self._click_match_by_name(ctx, name)
                             if success:
-                                tgt = ctx.pages[-1] if ctx.pages else None
+                                tgt = self._active_page(ctx)
                                 if tgt is not None:
                                     try:
                                         tgt.wait_for_timeout(2000)
@@ -368,7 +380,7 @@ class BrowserWorker:
                                 ctx, query, expected_name=expected_name,
                             )
                             if success:
-                                tgt = ctx.pages[-1] if ctx.pages else None
+                                tgt = self._active_page(ctx)
                                 if tgt is not None:
                                     try:
                                         tgt.wait_for_timeout(2000)
@@ -376,6 +388,15 @@ class BrowserWorker:
                                         pass
                         finally:
                             on_done(success)
+                    elif cmd[0] == "DOWNLOAD_CASELOAD_CSV":
+                        _, save_path, on_done = cmd
+                        success, message = False, ""
+                        try:
+                            success, message = self._download_caseload_csv(
+                                ctx, save_path,
+                            )
+                        finally:
+                            on_done(success, message)
         except Exception as e:
             self.on_status(f"Browser worker crashed: {e}")
 
@@ -404,7 +425,7 @@ class BrowserWorker:
         return True
 
     def _handle_find(self, ctx, query: str) -> None:
-        target = ctx.pages[-1] if ctx.pages else None
+        target = self._active_page(ctx)
         if target is None:
             self.on_status("No browser pages open.")
             return
@@ -470,7 +491,11 @@ class BrowserWorker:
             if filter_input.count() == 0:
                 self.on_status("Couldn't find Caseload's row filter input.")
                 return
-            filter_input.click()
+            # focus() instead of click() — when the user's Caseload
+            # view has many columns the search input scrolls off the
+            # viewport horizontally; click() refuses (requires viewport
+            # visibility), focus() doesn't.
+            filter_input.focus()
             filter_input.fill("")
             filter_input.fill(query)
             filter_input.press("Enter")
@@ -502,7 +527,7 @@ class BrowserWorker:
              see all rows (fuzzy is stuck with the ~10 visible ones).
           5. clear row-filter, fuzzy as a last resort
         """
-        target = ctx.pages[-1] if ctx.pages else None
+        target = self._active_page(ctx)
         if target is None:
             self.on_status("No browser pages open.")
             self._last_matches = []
@@ -555,7 +580,7 @@ class BrowserWorker:
                 if filter_input is None:
                     return []
                 try:
-                    filter_input.click()
+                    filter_input.focus()
                     filter_input.fill("")
                     filter_input.fill(text)
                     filter_input.press("Enter")
@@ -591,7 +616,7 @@ class BrowserWorker:
         if filter_input is not None:
             try:
                 self.on_status("Clearing row filter for fuzzy search...")
-                filter_input.click()
+                filter_input.focus()
                 filter_input.fill("")
                 filter_input.press("Enter")
                 target.wait_for_timeout(1500)
@@ -606,7 +631,7 @@ class BrowserWorker:
         return [m[2] for m in fuzzy]
 
     def _click_match_by_name(self, ctx, name: str) -> bool:
-        target = ctx.pages[-1] if ctx.pages else None
+        target = self._active_page(ctx)
         if target is None:
             self.on_status("No browser pages open.")
             return False
@@ -639,7 +664,11 @@ class BrowserWorker:
             if filter_input.count() == 0:
                 self.on_status("No row filter input; can't fast-find.")
                 return False
-            filter_input.click()
+            # focus() instead of click() — when the user's Caseload
+            # view has many columns the search input scrolls off the
+            # viewport horizontally; click() refuses (requires viewport
+            # visibility), focus() doesn't.
+            filter_input.focus()
             filter_input.fill("")
             filter_input.fill(query)
             filter_input.press("Enter")
@@ -719,7 +748,7 @@ class BrowserWorker:
         `name_hint` lets the caller supply the name we just navigated
         to (e.g. from find-first) when the note panel hasn't been
         opened yet so get_active_student_name() would return ''."""
-        target = ctx.pages[-1] if ctx.pages else None
+        target = self._active_page(ctx)
         if target is None:
             return None
         name = name_hint or (get_active_student_name(target) or "")
@@ -736,37 +765,62 @@ class BrowserWorker:
             "pm_email": info.get("pm_email", ""),
         }
 
+    @staticmethod
+    def _active_page(ctx):
+        """Return the most-recent non-closed page in `ctx`, or None.
+        Defensive against stale closed pages — e.g. download-capture
+        tabs that Playwright hasn't yet cleaned out of ctx.pages."""
+        for page in reversed(ctx.pages):
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception:
+                continue
+        return None
+
     def _open_caseload_table(self, ctx):
         """Common helper: navigate to Caseload (if not already there)
-        and return a locator for the data table. Skipping the goto
-        when the page is already on Caseload saves ~3–5s per batch
-        iteration."""
-        target = ctx.pages[-1] if ctx.pages else None
-        if target is None:
-            return None, None
-        # Only navigate if we're not already on caseload — Salesforce's
-        # URLs can include hash/query suffixes, so use a substring
-        # match against the Caseload page path.
-        try:
-            current_url = target.url or ""
-        except Exception:
-            current_url = ""
-        if CASELOAD_URL and "Caseload_App_Page" not in current_url:
+        and return a locator for the data table.
+
+        Retries on transient failures (page closed mid-goto, target
+        died between active_page check and call). If no live page is
+        available at all, creates a fresh one rather than giving up
+        — keeps the launcher usable even after browser hiccups."""
+        last_error = ""
+        for attempt in range(3):
+            target = self._active_page(ctx)
+            if target is None:
+                try:
+                    target = ctx.new_page()
+                except Exception as e:
+                    last_error = f"new_page failed: {e}"
+                    continue
             try:
-                target.goto(CASELOAD_URL, wait_until="domcontentloaded")
+                current_url = target.url or ""
+            except Exception:
+                current_url = ""
+            if CASELOAD_URL and "Caseload_App_Page" not in current_url:
+                try:
+                    target.goto(CASELOAD_URL, wait_until="domcontentloaded")
+                except Exception as e:
+                    self.on_status(
+                        f"  [debug] goto caseload (attempt {attempt + 1}): {e}"
+                    )
+                    last_error = str(e)
+                    continue
+            try:
+                tables = (
+                    target.locator("table")
+                    .filter(has=target.locator('th:has-text("Course Code")'))
+                    .filter(has=target.locator('th:has-text("Name")'))
+                )
+                tables.first.wait_for(state="visible", timeout=20_000)
+                return target, tables.first
             except Exception as e:
-                self.on_status(f"  [debug] goto caseload: {e}")
-        try:
-            tables = (
-                target.locator("table")
-                .filter(has=target.locator('th:has-text("Course Code")'))
-                .filter(has=target.locator('th:has-text("Name")'))
-            )
-            tables.first.wait_for(state="visible", timeout=20_000)
-            return target, tables.first
-        except Exception as e:
-            self.on_status(f"Caseload table didn't load: {e}")
-            return target, None
+                last_error = str(e)
+                continue
+        self.on_status(f"Caseload table didn't load after retries: {last_error}")
+        return None, None
 
     @staticmethod
     def _clean_caseload_headers(table) -> list[str]:
@@ -816,6 +870,63 @@ class BrowserWorker:
             {"name": h, "type": caseload_filter.sniff_column_type(s)}
             for h, s in zip(headers, samples)
         ]
+
+    def _download_caseload_csv(
+        self, ctx, save_path: Path,
+    ) -> tuple[bool, str]:
+        """Click WGU's custom Download button on the Caseload list
+        view and save the resulting CSV to `save_path`. Returns
+        (success, message).
+
+        The Download button (`title="Download"`) lives directly to
+        the left of the Mass-email button in the list view toolbar
+        — confirmed unique via the saved Caseload.html snapshot.
+        Playwright's `expect_download` context catches the file
+        before Edge dumps it into its temp artifacts folder.
+
+        IMPORTANT: clears Salesforce's row filter before clicking
+        Download. The Export honors the current filter, so a leftover
+        value (from a prior fast-find) would emit a single-row CSV
+        and silently corrupt the cache."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return False, "caseload table didn't load"
+
+        # Clear any leftover row filter so the export covers the
+        # whole caseload, not whatever a previous fast-find narrowed
+        # the view to.
+        try:
+            filter_input = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if filter_input.count() > 0:
+                filter_input.focus()
+                filter_input.fill("")
+                filter_input.press("Enter")
+                target.wait_for_timeout(800)
+        except Exception as e:
+            self.on_status(f"  [export] couldn't clear row filter: {e}")
+
+        try:
+            btn = target.locator('button[title="Download"]').first
+            btn.wait_for(state="visible", timeout=10_000)
+        except Exception as e:
+            return False, f"Download button not found: {e}"
+
+        try:
+            with target.expect_download(timeout=30_000) as dl_info:
+                btn.click()
+                self.on_status("  [export] clicked Download button")
+            download = dl_info.value
+        except Exception as e:
+            return False, f"download did not start: {e}"
+
+        try:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            download.save_as(str(save_path))
+        except Exception as e:
+            return False, f"download save failed: {e}"
+        return True, f"saved to {Path(save_path).name}"
 
     def _read_all_caseload_rows(
         self, ctx,
@@ -893,7 +1004,7 @@ class BrowserWorker:
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
     ) -> None:
-        target = ctx.pages[-1] if ctx.pages else None
+        target = self._active_page(ctx)
         if target is None:
             self.on_status("No browser pages open.")
             return
@@ -1780,6 +1891,7 @@ class ScenarioEditor:
                 "subject": self._email_config.subject,
                 "body_html_file": self._email_config.body_html_file,
                 "to": self._email_config.to,
+                "signature_file": self._email_config.signature_file,
                 "inline_images": list(self._email_config.inline_images),
                 "cc_pm": self._email_config.cc_pm,
             }
@@ -1802,6 +1914,21 @@ class App:
         ctk.set_default_color_theme("blue")
 
         self.scenarios = load_scenarios()
+
+        # In-memory caseload cache populated from CASELOAD_CSV_PATH.
+        # Set by _reload_caseload_cache() (called on startup and via
+        # the Reload button). When None, batches fall back to the
+        # DOM-scroll scrape — slower but always works.
+        self._caseload_rows: Optional[list[dict]] = None
+        self._caseload_csv_mtime = None
+        self._reload_caseload_cache(silent=True)
+
+        # Busy-state guard so the user can't fire a second action
+        # while one is in flight (auto-refresh, manual refresh, a
+        # scenario, or a batch). Toggled by _set_busy / _set_idle.
+        self._is_busy = False
+        self._busy_message = ""
+        self._busy_spinner_index = 0
 
         self.root = ctk.CTk()
         self.root.title("Caseload Note Automation")
@@ -1833,6 +1960,11 @@ class App:
         self._start_hotkeys()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Once the worker has the browser open, auto-refresh the
+        # caseload CSV in the background so the first batch fire is
+        # instant. Failures log a hint but never block startup.
+        self.root.after(500, self._poll_worker_then_auto_download)
 
     # ----- Main (left) pane -----
 
@@ -1882,13 +2014,30 @@ class App:
         self.scenario_buttons: dict[str, ctk.CTkButton] = {}
         self._rebuild_scenario_buttons()
 
-        # Editor toggle row
+        # Editor toggle row (also hosts the caseload-cache refresh).
         toggle_frame = ctk.CTkFrame(pane, fg_color="transparent")
         toggle_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 0))
         self.editor_toggle_btn = ctk.CTkButton(
             toggle_frame, text="Hide editor", width=120, command=self._toggle_editor,
         )
         self.editor_toggle_btn.pack(side="left")
+        self.caseload_refresh_btn = ctk.CTkButton(
+            toggle_frame, text="↻ Caseload",
+            width=120, command=self._on_caseload_refresh_clicked,
+            fg_color="transparent", border_width=1,
+        )
+        self.caseload_refresh_btn.pack(side="left", padx=(8, 0))
+        # Busy indicator — right-aligned spinner + text. Empty when
+        # idle; high-contrast yellow background when active so it's
+        # impossible to miss in the row of action buttons.
+        self.busy_label = ctk.CTkLabel(
+            toggle_frame, text="", anchor="e", justify="right",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="transparent",
+            text_color=("#7a4f00", "#ffd166"),
+            corner_radius=6,
+        )
+        self.busy_label.pack(side="right", padx=(8, 0), fill="x", expand=True)
 
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
@@ -2218,6 +2367,12 @@ class App:
         self.worker.submit_find_student(query)
 
     def _fire(self, scenario: ScenarioConfig) -> None:
+        if self._is_busy:
+            self._append_log(
+                f"Busy — wait for the current task to finish before "
+                f"firing {scenario.name!r}."
+            )
+            return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
@@ -2227,8 +2382,23 @@ class App:
         # Batch scenarios have their own driver — load the caseload,
         # apply filters, show a review/confirm dialog, then loop.
         if scenario.batch is not None:
-            self._fire_batch(scenario, override)
+            self._set_busy(f"Batch: {scenario.name}")
+            try:
+                self._fire_batch(scenario, override)
+            finally:
+                self._set_idle()
             return
+
+        self._set_busy(f"Running {scenario.name}…")
+        try:
+            self._fire_per_student(scenario, override)
+        finally:
+            self._set_idle()
+
+    def _fire_per_student(self, scenario: ScenarioConfig, override: str) -> None:
+        """Per-student (non-batch) scenario fire — wraps the original
+        in-line `_fire` body so we can sandwich it between _set_busy
+        and _set_idle."""
 
         # Step 1: find + pick (if enabled). Combined dialog lets the
         # user retype if the first query was wrong or surfaces too
@@ -2292,20 +2462,37 @@ class App:
         point on)."""
         from tkinter import messagebox
 
-        # Step 1: load all caseload rows. The worker emits a
-        # "Caseload loaded: N rows" status of its own when done, so
-        # we don't duplicate it here.
-        self._append_log(
-            f"Batch {scenario.name!r}: loading caseload "
-            "(this can take 5–30s for a full caseload)..."
-        )
-        rows = self._read_all_caseload_rows_blocking()
-        if not rows:
-            self._append_log("Batch aborted: couldn't load caseload rows.")
-            return
+        # Step 1: load the caseload rows. Prefer the CSV cache (~50ms,
+        # ~100 fields available); fall back to scroll-load DOM scrape
+        # if no CSV is present (slow but always works).
+        if self._caseload_rows is not None:
+            rows = self._caseload_rows
+            age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
+            self._append_log(
+                f"Batch {scenario.name!r}: using cached caseload "
+                f"({len(rows)} rows from CSV, {age})"
+            )
+        else:
+            self._append_log(
+                f"Batch {scenario.name!r}: no CSV cache; "
+                "loading caseload from DOM (5–30s for a full caseload)..."
+            )
+            rows = self._read_all_caseload_rows_blocking()
+            if not rows:
+                self._append_log("Batch aborted: couldn't load caseload rows.")
+                return
 
-        # Step 2: apply filters.
-        filters = list(scenario.batch.filters)
+        # Step 2: apply filters. Translate any display-name columns
+        # (e.g. 'Last Assigned CI Contact') to the CSV / DOM column
+        # the data actually uses (e.g. 'MyCourseContact'). Identity
+        # entries pass through unchanged.
+        csv_headers = list(rows[0].keys()) if rows else []
+        filters = [
+            {**f, "column": caseload_csv.resolve_column(
+                f.get("column", ""), csv_headers,
+            )}
+            for f in scenario.batch.filters
+        ]
         matched = caseload_filter.apply_filters(filters, rows)
         if not matched:
             messagebox.showinfo(
@@ -2361,17 +2548,22 @@ class App:
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
-        # Step 6: loop. For each student, navigate via fast-find,
-        # then run the email + note sequence. For email batches the
-        # FIRST student is a template preview (user reviews + sends
-        # in Outlook); the remaining students auto-send through
-        # Outlook with no further user prompts. Cancelling the
-        # template preview aborts the entire batch.
-        processed = 0
-        skipped: list[tuple[str, str]] = []
+        # Step 6: template preview (only if an email is configured).
+        # One placeholder-rendered draft opens in Outlook; the user
+        # reviews + clicks Yes/No. Yes proceeds to the loop with
+        # auto-send for everyone; No aborts the whole batch.
         total = len(confirmed)
         has_email = scenario.email is not None
-        first_email_done = False  # set after the user previews + sends #1
+        if has_email:
+            if not self._show_template_preview(scenario.email, total):
+                self._append_log("Batch aborted at template preview.")
+                return
+
+        # Step 7: loop. For each student: fast-find → auto-send
+        # email (if configured) → file note. Everyone is treated
+        # the same now that template review happened upfront.
+        processed = 0
+        skipped: list[tuple[str, str]] = []
         for idx, row in enumerate(confirmed, start=1):
             student_name = row.get("Name", "")
             student_id = row.get("Student ID", "")
@@ -2379,9 +2571,7 @@ class App:
                 f"--- batch {idx}/{total}: {student_name!r} ---"
             )
 
-            # 6a. Fast-find: type Student ID (or Name) into Caseload's
-            # row filter, then click the single matching row. ~3s vs
-            # ~25s for the full DOM scan find-first uses.
+            # 7a. Fast-find: row filter on Student ID, then click.
             query = student_id or student_name
             if not self._click_match_by_filter_blocking(
                 query, expected_name=student_name,
@@ -2392,7 +2582,8 @@ class App:
                 skipped.append((student_name, "find/click failed"))
                 continue
 
-            # 6b. Email step (if configured).
+            # 7b. Auto-send email (if configured). Failure skips the
+            # note for this student but doesn't halt the batch.
             if has_email:
                 ctx_info = self._get_student_context_blocking(
                     name_hint=student_name,
@@ -2403,37 +2594,13 @@ class App:
                     )
                     skipped.append((student_name, "no context"))
                     continue
-                if not first_email_done:
-                    # First student → template review with modal.
-                    # Remaining = total - idx (this many will auto-send).
-                    batch_remaining = total - idx
-                    ok = self._send_scenario_email(
-                        scenario.email, ctx_info,
-                        auto_send=False,
-                        batch_remaining=batch_remaining,
-                    )
-                    if not ok:
-                        self._append_log(
-                            "Batch aborted at email-template preview."
-                        )
-                        # Count the rest as skipped so the summary is honest.
-                        for r in confirmed[idx - 1:]:
-                            skipped.append((
-                                r.get("Name", ""),
-                                "batch cancelled at preview",
-                            ))
-                        break
-                    first_email_done = True
-                else:
-                    # Auto-send. Failures skip the note but don't
-                    # halt the batch.
-                    if not self._send_scenario_email(
-                        scenario.email, ctx_info, auto_send=True,
-                    ):
-                        skipped.append((student_name, "auto-send failed"))
-                        continue
+                if not self._send_scenario_email(
+                    scenario.email, ctx_info, auto_send=True,
+                ):
+                    skipped.append((student_name, "auto-send failed"))
+                    continue
 
-            # 6c. Notes — block until the worker finishes this RUN.
+            # 7c. Notes — block until the worker finishes this RUN.
             self._submit_scenario_blocking(
                 scenario, override, clipboard, custom_bodies,
             )
@@ -2487,6 +2654,30 @@ class App:
         self.worker.submit_click_match(name, on_done)
         self.root.wait_variable(done_var)
         return holder["success"]
+
+    def _download_caseload_csv_blocking(self) -> tuple[bool, str]:
+        """Ask the worker to download the caseload CSV. Blocks until
+        it's saved (or fails). Reloads the in-memory cache on success."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"success": False, "message": ""}
+
+        def on_done(success: bool, message: str) -> None:
+            def set_main() -> None:
+                holder["success"] = success
+                holder["message"] = message
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["success"] = success
+                holder["message"] = message
+                done_var.set(True)
+
+        self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
+        self.root.wait_variable(done_var)
+        if holder["success"]:
+            self._reload_caseload_cache(silent=False)
+        return holder["success"], holder["message"]
 
     def _click_match_by_filter_blocking(
         self, query: str, expected_name: str = "",
@@ -2599,25 +2790,91 @@ class App:
         )
         self.root.wait_variable(done_var)
 
+    def _show_template_preview(
+        self, email_cfg: EmailConfig, n_students: int,
+    ) -> bool:
+        """Pop a placeholder-rendered Outlook draft so the user can
+        review the email template before the batch loop fires. The
+        draft is NOT meant to be sent (the To address is a literal
+        `<STUDENT EMAIL>` placeholder, which Outlook will reject if
+        the user tries Send). The Yes/No modal gates the batch:
+        Yes → loop with auto-send, No → abort."""
+        from tkinter import messagebox
+        from src import outlook_email
+
+        template_path = TEMPLATES_DIR / email_cfg.body_html_file
+        if not template_path.exists():
+            self._append_log(
+                f"Email template not found: {template_path}; batch aborted."
+            )
+            messagebox.showerror(
+                "Email template missing",
+                f"Couldn't find template:\n{template_path}",
+            )
+            return False
+
+        try:
+            template_html = email_template.load_template(template_path)
+            preview_body = email_template.render_with_placeholders(template_html)
+            preview_subject = email_template.render_plain_with_placeholders(
+                email_cfg.subject,
+            )
+            if email_cfg.to:
+                preview_to = email_template.render_plain_with_placeholders(
+                    email_cfg.to,
+                )
+            else:
+                preview_to = "<STUDENT EMAIL>"
+            preview_cc = "<PROGRAM MENTOR EMAIL>" if email_cfg.cc_pm else ""
+        except Exception as e:
+            self._append_log(f"Template preview render failed: {e}")
+            return False
+
+        inline_images = {
+            Path(fname).stem: TEMPLATES_DIR / fname
+            for fname in email_cfg.inline_images
+        }
+
+        self._append_log("Opening template preview in Outlook...")
+        try:
+            outlook_email.compose_email(
+                to=preview_to, cc=preview_cc, subject=preview_subject,
+                html_body=preview_body, inline_images=inline_images,
+                # auto_send=False — Display() so the user can review.
+                # GetInspector here is fine (we never call Send on this draft).
+            )
+        except Exception as e:
+            self._append_log(f"Outlook preview failed: {e}")
+            return False
+
+        return messagebox.askyesno(
+            "Template preview — send the batch?",
+            f"The Outlook draft shows your email TEMPLATE for this "
+            f"batch. Each `<PLACEHOLDER>` (e.g. <STUDENT FIRST NAME>, "
+            f"<COURSE CODE>) will be replaced with that student's "
+            f"actual data when the email is sent.\n\n"
+            f"▸ Click Yes to auto-send personalized versions to all "
+            f"{n_students} students and file the notes.\n"
+            f"▸ Click No to cancel — discard the preview draft in "
+            f"Outlook (it won't deliver; the placeholder address is "
+            f"invalid).",
+        )
+
     def _send_scenario_email(
         self,
         email_cfg: EmailConfig,
         student_ctx: dict,
         *,
         auto_send: bool = False,
-        batch_remaining: int = 0,
     ) -> bool:
         """Render the template and either Display() the draft for
         review (default) or Send() it programmatically (`auto_send`).
 
         Args:
-            auto_send: skip the Outlook window and the "Done with the
-                email?" modal; just send through Outlook. Used by the
-                batch driver for every student after the first.
-            batch_remaining: when previewing the first email of a
-                batch, this is the count of students that will be
-                auto-sent after this one. Used to make the modal text
-                explicit about what Yes/No does.
+            auto_send: skip the Outlook window and the per-email
+                confirm modal; just send through Outlook. Used by
+                the batch driver for every student (template review
+                happens upfront via _show_template_preview).
 
         Returns True to proceed with the note step (or, in
         auto_send mode, True if Send() succeeded). False aborts."""
@@ -2691,6 +2948,7 @@ class App:
                     to=to, cc=cc, subject=subject,
                     html_body=body_html, inline_images=inline_images,
                     auto_send=True,
+                    signature_name=email_cfg.signature_file,
                 )
             except Exception as e:
                 self._append_log(f"Auto-send failed for {full_name}: {e}")
@@ -2711,28 +2969,168 @@ class App:
                 "Proceed with the note only?",
             )
 
-        if batch_remaining > 0:
-            modal_text = (
-                f"This draft is the email for {full_name} — the first of "
-                f"{batch_remaining + 1} students in this batch.\n\n"
-                "▸ Review and Send this email in Outlook.\n"
-                f"▸ Editing the draft here only affects {full_name}; "
-                f"the remaining {batch_remaining} students will get the "
-                "un-edited template.\n"
-                "▸ Click Yes after sending — the remaining "
-                f"{batch_remaining} will then auto-send through Outlook "
-                "with no further review.\n\n"
-                "Click No to cancel the whole batch (no further emails "
-                "sent, no further notes filed)."
+        return messagebox.askyesno(
+            "Done with the email?",
+            f"A draft is now open in Outlook for {full_name}.\n\n"
+            "▸ Send the email yourself from Outlook (or discard it).\n"
+            "▸ Then click Yes to file the Salesforce note.\n\n"
+            "Click No to skip the note for this student and move on.",
+        )
+
+    def _poll_worker_then_auto_download(self) -> None:
+        """Wait for the worker to finish browser setup (max ~60s),
+        then fire one CSV download in the background. Non-blocking
+        — uses root.after polling so the launcher window stays
+        responsive throughout. Action buttons are disabled (via
+        _set_busy) for the duration so the user can't fire a batch
+        against a stale cache while we're refreshing."""
+        if not self.worker.ready_event.is_set():
+            self.root.after(500, self._poll_worker_then_auto_download)
+            return
+        self._set_busy("Auto-refreshing caseload CSV…")
+        self._append_log("Auto-refreshing caseload CSV...")
+
+        def on_done(success: bool, message: str) -> None:
+            def set_main() -> None:
+                if success:
+                    self._append_log(f"Caseload CSV: {message}")
+                    self._reload_caseload_cache(silent=False)
+                else:
+                    self._append_log(
+                        f"Caseload CSV auto-download failed: {message}. "
+                        "You can retry with ↻ Caseload. Until then, "
+                        "batches will fall back to the DOM scrape."
+                    )
+                self._set_idle()
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                pass
+
+        self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
+
+    def _on_caseload_refresh_clicked(self) -> None:
+        """Manual caseload-CSV refresh from the toolbar button. Blocks
+        the UI with a wait_variable nested mainloop while running; the
+        busy-state guard keeps buttons disabled so the user can't
+        stack another action on top."""
+        if self._is_busy:
+            self._append_log(
+                "Already working on something — wait for the current "
+                "task to finish."
             )
-        else:
-            modal_text = (
-                f"A draft is now open in Outlook for {full_name}.\n\n"
-                "▸ Send the email yourself from Outlook (or discard it).\n"
-                "▸ Then click Yes to file the Salesforce note.\n\n"
-                "Click No to skip the note for this student and move on."
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._set_busy("Refreshing caseload CSV…")
+        self._append_log("Refreshing caseload CSV (manual)...")
+        try:
+            success, message = self._download_caseload_csv_blocking()
+            if success:
+                self._append_log(f"Caseload CSV: {message}")
+            else:
+                self._append_log(f"Caseload CSV refresh failed: {message}")
+        finally:
+            self._set_idle()
+
+    # ----- Busy-state guard -----
+
+    # Braille-pattern animation frames — looks like a smooth circular
+    # spinner in any monospaced font and renders cleanly in CTkLabel.
+    _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def _set_busy(self, message: str) -> None:
+        """Enter a busy state: disable action buttons, show a spinner
+        + status label, and start the animation. Idempotent — calling
+        again while busy just updates the message."""
+        was_already_busy = self._is_busy
+        self._is_busy = True
+        self._busy_message = message
+        try:
+            self.caseload_refresh_btn.configure(state="disabled")
+        except Exception:
+            pass
+        for btn in self.scenario_buttons.values():
+            try:
+                btn.configure(state="disabled")
+            except Exception:
+                pass
+        if not was_already_busy:
+            self._tick_spinner()  # kicks off the animation loop
+
+    def _set_idle(self) -> None:
+        """Leave the busy state — re-enable action buttons, clear the
+        spinner label and its background tag."""
+        self._is_busy = False
+        self._busy_message = ""
+        try:
+            self.busy_label.configure(text="", fg_color="transparent")
+        except Exception:
+            pass
+        try:
+            self.caseload_refresh_btn.configure(state="normal")
+        except Exception:
+            pass
+        for btn in self.scenario_buttons.values():
+            try:
+                btn.configure(state="normal")
+            except Exception:
+                pass
+
+    def _tick_spinner(self) -> None:
+        if not self._is_busy:
+            return
+        try:
+            frame = self._SPINNER_FRAMES[
+                self._busy_spinner_index % len(self._SPINNER_FRAMES)
+            ]
+            # Yellow pill — pad with non-breaking spaces so the
+            # background tag is wide enough to stand out visually.
+            self.busy_label.configure(
+                text=f"  {frame}  WORKING — {self._busy_message}  ",
+                fg_color=("#ffefc1", "#5a4500"),
             )
-        return messagebox.askyesno("Done with the email?", modal_text)
+        except Exception:
+            return
+        self._busy_spinner_index += 1
+        try:
+            self.root.after(90, self._tick_spinner)
+        except Exception:
+            pass
+
+    def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
+        """Read CASELOAD_CSV_PATH into self._caseload_rows. Returns
+        True on success, False if the file doesn't exist or can't be
+        parsed. Called on startup (silent=True — the log widget isn't
+        built yet) and from the manual Reload button (silent=False
+        so the user sees the result)."""
+        try:
+            rows = caseload_csv.load_caseload_csv(CASELOAD_CSV_PATH)
+        except FileNotFoundError:
+            if not silent:
+                self._append_log(
+                    f"No caseload CSV found at {CASELOAD_CSV_PATH}. "
+                    "Falling back to DOM scrape for batches."
+                )
+            self._caseload_rows = None
+            self._caseload_csv_mtime = None
+            return False
+        except Exception as e:
+            if not silent:
+                self._append_log(f"Caseload CSV load failed: {e}")
+            self._caseload_rows = None
+            self._caseload_csv_mtime = None
+            return False
+        self._caseload_rows = rows
+        self._caseload_csv_mtime = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
+        if not silent:
+            age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
+            self._append_log(
+                f"Caseload cache: {len(rows)} rows from "
+                f"{CASELOAD_CSV_PATH.name} ({age})"
+            )
+        return True
 
     def _read_clipboard_content(self) -> str:
         """Pull text from clipboard. If image data is also present,
@@ -2783,6 +3181,12 @@ class App:
         self._append_log(msg)
 
     def _append_log(self, msg: str) -> None:
+        # Defensive: if called before _build_main_pane has created
+        # the widget (e.g. very early startup), fall back to stderr
+        # so we don't crash the app with AttributeError.
+        if not hasattr(self, "log") or self.log is None:
+            print(msg, file=sys.stderr)
+            return
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
         self.log.see("end")

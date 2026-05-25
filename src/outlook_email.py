@@ -79,6 +79,7 @@ def compose_email(
     inline_images: Optional[dict[str, Path]] = None,
     *,
     auto_send: bool = False,
+    signature_name: str = "",
 ) -> None:
     """Build a MailItem in Outlook. By default opens it for the user
     to review and send (`Display(False)`). When `auto_send=True`,
@@ -120,14 +121,18 @@ def compose_email(
 
     if auto_send:
         # IMPORTANT: do NOT touch GetInspector here. Accessing the
-        # Inspector to capture the signature seems to leave the
-        # MailItem in a state that breaks `Send()` programmatically
-        # — Outlook returns 0x80070057 ('parameter is incorrect').
-        # Trade-off: auto-sent emails go out without the user's
-        # Outlook signature. If/when we want signatures on auto-sent
-        # mail, read them from `%APPDATA%\Microsoft\Signatures\*.htm`
-        # and concatenate manually rather than via Inspector.
-        mail.HTMLBody = html_body or ""
+        # Inspector to capture the signature leaves the MailItem in
+        # a state that breaks `Send()` programmatically — Outlook
+        # returns 0x80070057 ('parameter is incorrect'). Read the
+        # signature directly from `%APPDATA%\Microsoft\Signatures\`
+        # instead. Embedded images in the signature may render as
+        # broken in the recipient's view (relative paths don't
+        # survive); a future fix is base64 or CID embedding.
+        from src import outlook_signature
+        sig_html = outlook_signature.find_default_signature_html(
+            signature_name,
+        ) or ""
+        mail.HTMLBody = (html_body or "") + sig_html
     else:
         # Display mode: capture the user's default Outlook signature
         # (inserted by Outlook when the Inspector is created), then

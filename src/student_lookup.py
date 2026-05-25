@@ -349,20 +349,32 @@ def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
     several click targets because Lightning's data grid name cells use
     custom Aura components, not native anchors.
 
-    Scrolls the row into view first — after the batch driver's
-    scroll-to-load-all the table can be parked at the bottom; rows
-    near the top stay in the DOM but Lightning won't render them as
-    visible, and Playwright refuses to click invisible elements."""
+    Defensive two-step for off-viewport cells (common when the user's
+    Caseload view has many columns enabled — the Name cell scrolls
+    off horizontally even though it's clearly in the DOM):
+      1. JS scrollIntoView with `inline: 'center'` to bring the cell
+         into the horizontal viewport before clicking.
+      2. If Playwright's click STILL refuses with "outside of the
+         viewport", fall back to a JS `el.click()` — that synthesizes
+         the click without requiring the mouse coordinate to land in
+         the visible area. Lightning's onClick handlers fire on
+         synthetic clicks just like on real ones."""
     def diag(msg: str) -> None:
         if on_status:
             on_status(msg)
 
+    name_cell = row.locator("td").nth(name_idx)
+
+    # Step 1: scroll the name cell into view via JS. Handles both
+    # vertical and horizontal scroll within the data table's
+    # scrollable container.
     try:
-        row.scroll_into_view_if_needed(timeout=3000)
+        name_cell.evaluate(
+            "el => el.scrollIntoView({block: 'center', inline: 'center'})"
+        )
     except Exception:
         pass
 
-    name_cell = row.locator("td").nth(name_idx)
     for sub_locator in (
         name_cell.locator("a").filter(has_text=name),
         name_cell.locator("span").filter(has_text=name),
@@ -371,8 +383,17 @@ def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
         try:
             if sub_locator.count() == 0:
                 continue
-            sub_locator.first.click()
-            return True
+            # Step 2a: try Playwright click first (gets event
+            # propagation right, triggers Lightning handlers
+            # reliably).
+            try:
+                sub_locator.first.click(force=True)
+                return True
+            except Exception as inner:
+                # Step 2b: fall back to JS click — bypasses the
+                # viewport requirement entirely.
+                sub_locator.first.evaluate("el => el.click()")
+                return True
         except Exception as e:
             diag(f"  [search] click attempt failed: {e}")
             continue

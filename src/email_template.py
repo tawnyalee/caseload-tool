@@ -65,6 +65,49 @@ def render(
     return _VAR_RE.sub(replace, template_text)
 
 
+# Human-readable labels for known variables, shown in the
+# template-preview email so the user can see at a glance what each
+# `{{var}}` would be replaced with. Anything not in this dict falls
+# back to UPPER_SNAKE_CASE → "UPPER SNAKE CASE".
+PLACEHOLDER_LABELS = {
+    "first_name": "STUDENT FIRST NAME",
+    "last_name": "STUDENT LAST NAME",
+    "full_name": "STUDENT FULL NAME",
+    "student_email": "STUDENT EMAIL",
+    "student_id": "STUDENT ID",
+    "course_code": "COURSE CODE",
+    "program_name": "PROGRAM NAME",
+    "pm_name": "PROGRAM MENTOR NAME",
+    "pm_email": "PROGRAM MENTOR EMAIL",
+    "user_name": "YOUR NAME",
+    "user_email": "YOUR EMAIL",
+}
+
+
+def _placeholder_label(var: str) -> str:
+    if var in PLACEHOLDER_LABELS:
+        return PLACEHOLDER_LABELS[var]
+    return var.replace("_", " ").upper()
+
+
+def render_with_placeholders(template_text: str) -> str:
+    """Render the HTML body for the batch template-preview email.
+    Replaces `{{var}}` with `&lt;LABEL&gt;` (HTML-escaped) so the
+    angle brackets appear LITERALLY in Outlook rather than being
+    interpreted as HTML tags."""
+    def replace(match: re.Match) -> str:
+        return f"&lt;{_placeholder_label(match.group(1))}&gt;"
+    return _VAR_RE.sub(replace, template_text)
+
+
+def render_plain_with_placeholders(template_text: str) -> str:
+    """Like render_with_placeholders, but for plain-text fields
+    (subject, To, CC) where angle brackets render as-is."""
+    def replace(match: re.Match) -> str:
+        return f"<{_placeholder_label(match.group(1))}>"
+    return _VAR_RE.sub(replace, template_text)
+
+
 def render_plain(template_text: str, variables: dict) -> str:
     """Same as render() but with NO HTML escaping. Use for fields
     whose output is plain text (email subject, To/CC addresses) —

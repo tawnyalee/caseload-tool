@@ -27,3 +27,6 @@ CaseloadNotes-*.zip
 
 # Per-user session log (created at runtime in dev mode).
 note_log.csv
+
+# Cached caseload export — student PII, FERPA, never commit.
+caseload.csv

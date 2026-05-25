@@ -51,10 +51,18 @@ class EmailConfig:
     empty, the email goes to `{{student_email}}` from the caseload
     row. Otherwise the string is rendered with the same variables as
     the subject/body — useful for test mode, e.g.
-    `to: "test{{first_name}}{{last_name}}@wgu.edu"`."""
+    `to: "test{{first_name}}{{last_name}}@wgu.edu"`.
+
+    `signature_file` is the filename stem (no `.htm`) of one of the
+    user's Outlook signatures, used for **auto-sent batch emails**
+    only (the interactive Display() flow captures the signature via
+    Outlook directly). If empty, the launcher falls back to the
+    user's default new-mail signature; if none can be detected,
+    auto-sent emails go without a signature."""
     subject: str = ""
     body_html_file: str = ""
     to: str = ""
+    signature_file: str = ""
     inline_images: list[str] = field(default_factory=list)
     cc_pm: bool = False
 
@@ -104,6 +112,7 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
         subject=d.get("subject", ""),
         body_html_file=d.get("body_html_file", ""),
         to=d.get("to", ""),
+        signature_file=d.get("signature_file", ""),
         inline_images=list(d.get("inline_images") or []),
         cc_pm=bool(d.get("cc_pm", False)),
     )
