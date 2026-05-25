@@ -2928,6 +2928,36 @@ class App:
             )}
             for f in scenario.batch.filters
         ]
+
+        # Safety check: filters referencing columns that aren't in
+        # the current CSV are silently mis-evaluated by the engine.
+        # Most ops just match nothing (annoying but safe), BUT
+        # `is empty` and `is not …` would match EVERYONE — the worst
+        # kind of batch bug. Refuse to run until the user fixes the
+        # view + refreshes.
+        missing = [
+            f.get("column", "")
+            for f in filters
+            if f.get("column") and f.get("column") not in csv_headers
+        ]
+        if missing:
+            self._append_log(
+                f"Batch aborted: filter column(s) not in current Caseload "
+                f"export: {', '.join(repr(c) for c in missing)}."
+            )
+            messagebox.showerror(
+                "Filter column(s) not in Caseload view",
+                f"This scenario filters on column(s) that aren't in your "
+                f"current Caseload export:\n\n  • " +
+                "\n  • ".join(missing) +
+                "\n\n"
+                "Add those columns to your Caseload list view in "
+                "Salesforce, then click ↻ Caseload (or ↻ Refresh "
+                "columns in the editor) to refresh the cache. Then "
+                "try again.",
+            )
+            return
+
         matched = caseload_filter.apply_filters(filters, rows)
         if not matched:
             messagebox.showinfo(
