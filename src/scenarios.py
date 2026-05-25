@@ -39,6 +39,24 @@ def combine_with_clipboard(body: str, clipboard: str) -> tuple[str, bool]:
 
 
 @dataclass
+class Prompt:
+    """One at-fire-time input. The user is asked for a value when
+    the scenario fires; the value is then bound to `{{var}}` in
+    every email and note body / subject / to-field that references
+    it. Generalizes the per-note `enter_additional_text` checkbox
+    for cases where the same input should reach multiple destinations
+    (e.g. a call summary that lands in both the email body and the
+    Salesforce note).
+
+    For batch scenarios, prompts are asked ONCE before the loop and
+    the same value is applied to every student in the batch."""
+    var: str
+    label: str = ""
+    multiline: bool = True
+    prefill: str = ""
+
+
+@dataclass
 class EmailConfig:
     """Outlook email step config for a scenario.
 
@@ -88,6 +106,7 @@ class ScenarioConfig:
     find_first: bool = False
     email: Optional[EmailConfig] = None
     batch: Optional[BatchConfig] = None
+    prompts: list[Prompt] = field(default_factory=list)
     notes: list[NoteData] = field(default_factory=list)
 
 
@@ -127,6 +146,25 @@ def _batch_from_dict(d: Optional[dict]) -> Optional[BatchConfig]:
     )
 
 
+def _prompts_from_list(items: Optional[list]) -> list[Prompt]:
+    if not items:
+        return []
+    out: list[Prompt] = []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        var = str(d.get("var", "")).strip()
+        if not var:
+            continue
+        out.append(Prompt(
+            var=var,
+            label=str(d.get("label", "") or var),
+            multiline=bool(d.get("multiline", True)),
+            prefill=str(d.get("prefill", "")),
+        ))
+    return out
+
+
 def load_scenarios(path: Path = NOTES_YAML) -> dict[str, ScenarioConfig]:
     """Load all scenarios from notes.yaml, keyed by name."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -147,9 +185,27 @@ def load_scenarios(path: Path = NOTES_YAML) -> dict[str, ScenarioConfig]:
             find_first=bool(cfg.get("find_first", False)),
             email=_email_from_dict(cfg.get("email")),
             batch=_batch_from_dict(cfg.get("batch")),
+            prompts=_prompts_from_list(cfg.get("prompts")),
             notes=notes,
         )
     return out
+
+
+def _substitute_vars(text: str, variables: Optional[dict]) -> str:
+    """Plain-text `{{var}}` substitution for note bodies. No HTML
+    escaping (note bodies go into Salesforce's editor as text).
+    Unknown placeholders are left in place. Returns input unchanged
+    if variables is None/empty."""
+    if not variables or not text:
+        return text
+    import re
+    pat = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+    def replace(m):
+        name = m.group(1)
+        if name in variables:
+            return str(variables[name] or "")
+        return m.group(0)
+    return pat.sub(replace, text)
 
 
 def run_scenario(
@@ -158,6 +214,7 @@ def run_scenario(
     course_code: str,
     clipboard: str = "",
     custom_bodies: Optional[dict[int, str]] = None,
+    prompt_vars: Optional[dict[str, str]] = None,
     on_status: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Fill (and optionally submit) every note in the scenario against
@@ -166,6 +223,10 @@ def run_scenario(
     - `custom_bodies` maps note-index -> body text. When present, that
       body replaces the template's body for that note (the user
       supplied it via the 'Enter additional text' dialog at fire time).
+    - `prompt_vars` is the dict of `{{var}}` substitutions from the
+      scenario's `prompts:` block (collected on the main thread at
+      fire time). Applied to note bodies AFTER any custom_bodies
+      replacement so placeholders inside custom text get resolved too.
     - `clipboard` is appended after the body for any note that has
       append_clipboard=True.
     - The size cap (MAX_BODY_LINES / MAX_BODY_CHARS) applies whenever
@@ -178,6 +239,9 @@ def run_scenario(
     custom_bodies = custom_bodies or {}
     for i, template in enumerate(scenario.notes):
         base_body = custom_bodies.get(i, template.body)
+        # Substitute prompt vars (e.g. {{summary}}) — applies whether
+        # the body came from the template OR from custom_bodies.
+        base_body = _substitute_vars(base_body, prompt_vars)
         will_append_clip = template.append_clipboard and clipboard
         is_custom = i in custom_bodies
         if will_append_clip or is_custom:
@@ -191,7 +255,7 @@ def run_scenario(
                 )
             note = replace(template, course_code=course_code, body=combined)
         else:
-            note = replace(template, course_code=course_code)
+            note = replace(template, course_code=course_code, body=base_body)
         fill_note(target, note)
         if not template.submit:
             all_submitted = False

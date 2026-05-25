@@ -189,16 +189,18 @@ class BrowserWorker:
         course_code_override: str,
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
+        prompt_vars: Optional[dict[str, str]] = None,
         on_done: Optional[Callable[[bool], None]] = None,
     ) -> None:
         """Queue a scenario for the worker to fill notes against the
-        active student. `on_done(success)` is called from the worker
-        thread when the run finishes; `success` is True iff the run
-        completed without errors (used by the batch loop to track
-        processed-vs-skipped honestly)."""
+        active student. `prompt_vars` carries the user-typed values
+        for any `prompts:` block in the scenario; they're substituted
+        into note bodies (and email body / subject / to, handled on
+        the main thread before queueing). `on_done(success)` is
+        called from the worker thread when the run finishes."""
         self.q.put((
             "RUN", scenario, course_code_override, clipboard,
-            custom_bodies or {}, on_done,
+            custom_bodies or {}, prompt_vars or {}, on_done,
         ))
 
     def submit_find_student(self, query: str) -> None:
@@ -355,12 +357,13 @@ class BrowserWorker:
         a partial failure doesn't leave the main thread waiting on a
         wait_variable forever."""
         if cmd[0] == "RUN":
-            _, scenario, override, clipboard, custom_bodies, on_done = cmd
+            _, scenario, override, clipboard, custom_bodies, prompt_vars, on_done = cmd
             success = False
             try:
                 success = self._handle_run(
                     ctx, scenario, override, clipboard,
                     custom_bodies=custom_bodies,
+                    prompt_vars=prompt_vars,
                 )
             finally:
                 if on_done is not None:
@@ -1052,6 +1055,7 @@ class BrowserWorker:
         self, ctx, scenario: ScenarioConfig, override: str,
         clipboard: str = "",
         custom_bodies: Optional[dict[int, str]] = None,
+        prompt_vars: Optional[dict[str, str]] = None,
     ) -> bool:
         """Return True iff the note ran without errors (regardless of
         whether all sub-notes were auto-submitted). The batch driver
@@ -1108,6 +1112,7 @@ class BrowserWorker:
             all_submitted = run_scenario(
                 target, scenario, course_code,
                 clipboard=clipboard, custom_bodies=custom_bodies,
+                prompt_vars=prompt_vars,
                 on_status=self.on_status,
             )
             tail = "" if all_submitted else "  (left open — submit unchecked)"
@@ -1916,6 +1921,10 @@ class ScenarioEditor:
         # `email` is now fully exposed via the editor; `batch.preview`
         # still rides as a passive round-trip field for now.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
+        # Passive round-trip of the `prompts:` block until the editor
+        # exposes a UI for it. Same pattern we used for email/batch
+        # initially — keeps hand-edited YAML safe across Saves.
+        self._prompts_passthrough = list(scenario.prompts)
         self.capture_handler = capture_handler  # callable(on_done)
         # Caseload-column hooks for the Filters section. `get_columns`
         # returns whatever's cached now; `refresh_columns` triggers a
@@ -2275,6 +2284,7 @@ class ScenarioEditor:
         self.find_first_var.set(scenario.find_first)
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
+        self._prompts_passthrough = list(scenario.prompts)
         for r in list(self.filter_rows):
             try: r.frame.destroy()
             except Exception: pass
@@ -2338,6 +2348,18 @@ class ScenarioEditor:
                 "filters": [r.serialize() for r in self.filter_rows],
                 "preview": self._batch_preview,
             }
+        if self._prompts_passthrough:
+            # Round-trip the prompts: block until the editor exposes
+            # a UI for it. Pure read-back from EmailConfig.* fields.
+            out["prompts"] = [
+                {
+                    "var": p.var,
+                    "label": p.label,
+                    "multiline": p.multiline,
+                    "prefill": p.prefill,
+                }
+                for p in self._prompts_passthrough
+            ]
         return out
 
 
@@ -2842,6 +2864,25 @@ class App:
         finally:
             self._set_idle()
 
+    def _collect_prompt_vars(
+        self, scenario: ScenarioConfig,
+    ) -> Optional[dict[str, str]]:
+        """Pop a prompt dialog for each entry in scenario.prompts and
+        return `{var: value}`. Returns None if the user cancelled any
+        prompt — caller should abort the fire."""
+        prompt_vars: dict[str, str] = {}
+        for p in scenario.prompts:
+            value = prompt_additional_text(
+                self.root, p.label or p.var, p.prefill,
+            )
+            if value is None:
+                self._append_log(
+                    f"Prompt {p.var!r} cancelled; scenario not fired."
+                )
+                return None
+            prompt_vars[p.var] = value
+        return prompt_vars
+
     def _fire_per_student(self, scenario: ScenarioConfig, override: str) -> None:
         """Per-student (non-batch) scenario fire — wraps the original
         in-line `_fire` body so we can sandwich it between _set_busy
@@ -2864,7 +2905,15 @@ class App:
                 return
             chosen_name = chosen
 
-        # Step 2: body edits. The user is committed to a student now,
+        # Step 2: prompts (scenario-level, feed {{var}} into emails
+        # and note bodies). Collect BEFORE per-note custom edits so
+        # `{{var}}` placeholders inside a custom-edited body get
+        # substituted too.
+        prompt_vars = self._collect_prompt_vars(scenario)
+        if prompt_vars is None:
+            return  # user cancelled a prompt
+
+        # Step 3: body edits. The user is committed to a student now,
         # so the dialogs are filled with the right context in mind.
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
@@ -2877,14 +2926,16 @@ class App:
                 return
             custom_bodies[i] = edited
 
-        # Step 3: clipboard (main-thread read; Tk + PIL aren't thread-safe).
+        # Step 4: clipboard (main-thread read; Tk + PIL aren't thread-safe).
         clipboard = ""
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
-        # Step 4: email (if scenario has one). Opens an Outlook draft for
+        # Step 5: email (if scenario has one). Opens an Outlook draft for
         # FERPA review; user reviews + sends from Outlook, then confirms
-        # before the note fires. Cancelling here aborts the whole fire.
+        # before the note fires. Prompt vars merge into the student
+        # context so {{summary}}-style placeholders in the email body
+        # / subject / to-field resolve correctly.
         if scenario.email is not None:
             student_ctx = self._get_student_context_blocking(name_hint=chosen_name)
             if student_ctx is None:
@@ -2892,6 +2943,7 @@ class App:
                     "Couldn't read student context for email; scenario not fired."
                 )
                 return
+            student_ctx = {**student_ctx, **prompt_vars}
             if not self._send_scenario_email(scenario.email, student_ctx):
                 self._append_log("Email step aborted; note not filed.")
                 return
@@ -2899,6 +2951,7 @@ class App:
         self.worker.submit_scenario(
             scenario, override, clipboard,
             custom_bodies=custom_bodies,
+            prompt_vars=prompt_vars,
         )
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
@@ -3004,10 +3057,14 @@ class App:
         else:
             confirmed = matched
 
-        # Step 5: one-time per-batch prompts — `enter_additional_text`
-        # on any note prompts once and applies the same text to every
-        # student in the batch. Per-call summaries are inappropriate
-        # for batch; this is for generic add-ons (e.g. a one-time PS).
+        # Step 5: one-time per-batch prompts — both the new
+        # `prompts:` schema (which feeds {{var}} into bodies) and
+        # the legacy per-note `enter_additional_text` checkbox.
+        # Each input is asked ONCE before the loop and the same
+        # value is applied to every student in the batch.
+        prompt_vars = self._collect_prompt_vars(scenario)
+        if prompt_vars is None:
+            return  # user cancelled a prompt
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
             if not n.enter_additional_text:
@@ -3061,6 +3118,9 @@ class App:
 
             # 7b. Auto-send email (if configured). Failure skips the
             # note for this student but doesn't halt the batch.
+            # Prompt vars merge into student_ctx so {{summary}}-
+            # style placeholders in the email body / subject / to
+            # resolve against the batch-wide prompt input.
             if has_email:
                 ctx_info = self._get_student_context_blocking(
                     name_hint=student_name,
@@ -3071,6 +3131,7 @@ class App:
                     )
                     skipped.append((student_name, "no context"))
                     continue
+                ctx_info = {**ctx_info, **prompt_vars}
                 if not self._send_scenario_email(
                     scenario.email, ctx_info, auto_send=True,
                 ):
@@ -3082,6 +3143,7 @@ class App:
             # errors; only count those as truly processed.
             if self._submit_scenario_blocking(
                 scenario, override, clipboard, custom_bodies,
+                prompt_vars=prompt_vars,
             ):
                 processed += 1
             else:
@@ -3251,6 +3313,7 @@ class App:
     def _submit_scenario_blocking(
         self, scenario: ScenarioConfig, override: str,
         clipboard: str, custom_bodies: dict[int, str],
+        prompt_vars: Optional[dict[str, str]] = None,
     ) -> bool:
         """Queue a scenario RUN and block until the worker reports
         completion. Returns True iff the run completed without
@@ -3271,7 +3334,9 @@ class App:
 
         self.worker.submit_scenario(
             scenario, override, clipboard,
-            custom_bodies=custom_bodies, on_done=on_done,
+            custom_bodies=custom_bodies,
+            prompt_vars=prompt_vars,
+            on_done=on_done,
         )
         self.root.wait_variable(done_var)
         return holder["success"]
