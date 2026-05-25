@@ -1782,6 +1782,58 @@ class FilterRow:
         }
 
 
+class PromptRow:
+    """One prompt in a scenario's prompts: list. Editable row with
+    var name, label text, multiline checkbox, and delete button.
+    `prefill` is carried through save/load as an attribute so hand-
+    edited YAML survives — we don't expose it in the UI yet because
+    most users don't need it."""
+
+    def __init__(
+        self, parent, on_delete: Callable, prefill: str = "",
+    ):
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.frame.grid_columnconfigure(1, weight=1)
+        self._prefill = prefill
+
+        self.var_entry = ctk.CTkEntry(
+            self.frame, placeholder_text="var (e.g. summary)", width=140,
+        )
+        self.var_entry.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
+        self.label_entry = ctk.CTkEntry(
+            self.frame, placeholder_text="dialog label",
+        )
+        self.label_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4), pady=2)
+        self.multiline_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            self.frame, text="multiline", variable=self.multiline_var, width=100,
+        ).grid(row=0, column=2, sticky="w", padx=(0, 4), pady=2)
+        ctk.CTkButton(
+            self.frame, text="✕", width=28, height=28,
+            fg_color="transparent", border_width=1,
+            command=lambda: on_delete(self),
+        ).grid(row=0, column=3, padx=(4, 0), pady=2)
+
+    def load(self, prompt) -> None:
+        """Populate widgets from a `scenarios.Prompt` dataclass."""
+        self.var_entry.delete(0, "end")
+        self.var_entry.insert(0, prompt.var)
+        self.label_entry.delete(0, "end")
+        self.label_entry.insert(0, prompt.label or "")
+        self.multiline_var.set(prompt.multiline)
+        self._prefill = prompt.prefill
+
+    def serialize(self) -> dict:
+        out = {
+            "var": self.var_entry.get().strip(),
+            "label": self.label_entry.get(),
+            "multiline": self.multiline_var.get(),
+        }
+        if self._prefill:
+            out["prefill"] = self._prefill
+        return out
+
+
 class NoteEditor:
     """Widgets for editing a single note. Mirrors the Caseload form:
     Interaction Format, Interaction Type, Academic Activities, Body.
@@ -1987,10 +2039,6 @@ class ScenarioEditor:
         # `email` is now fully exposed via the editor; `batch.preview`
         # still rides as a passive round-trip field for now.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
-        # Passive round-trip of the `prompts:` block until the editor
-        # exposes a UI for it. Same pattern we used for email/batch
-        # initially — keeps hand-edited YAML safe across Saves.
-        self._prompts_passthrough = list(scenario.prompts)
         self.capture_handler = capture_handler  # callable(on_done)
         # Caseload-column hooks for the Filters section. `get_columns`
         # returns whatever's cached now; `refresh_columns` triggers a
@@ -2074,6 +2122,12 @@ class ScenarioEditor:
         self._email_section_row = row
         self._build_email_section()
         # Visibility set by load() based on scenario.email != None.
+
+        # Prompts section — at-fire-time inputs. Always visible (no
+        # toggle) since an empty row list is the natural "no prompts"
+        # state. Section header + container + Add button.
+        row += 1
+        self._build_prompts_section(row)
 
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
@@ -2188,6 +2242,53 @@ class ScenarioEditor:
                 row=self._find_first_row, column=0,
                 sticky="w", padx=8, pady=(0, 8),
             )
+
+    # ----- Prompts section -----
+
+    def _build_prompts_section(self, row: int) -> None:
+        """Inline `Prompts` section: header + dynamic row container +
+        add button. Each row is a PromptRow widget tuple. Empty list
+        renders as just the section header + 'Add prompt' button,
+        which acts as the off state — no toggle needed."""
+        frame = ctk.CTkFrame(self.frame, fg_color=("gray92", "gray18"))
+        frame.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 4))
+        frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            frame, text="Prompts (at-fire-time inputs)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        self.prompts_container = ctk.CTkFrame(frame, fg_color="transparent")
+        self.prompts_container.grid(
+            row=1, column=0, sticky="ew", padx=4, pady=(0, 4),
+        )
+        self.prompts_container.grid_columnconfigure(0, weight=1)
+        self.prompt_rows: list[PromptRow] = []
+        ctk.CTkButton(
+            frame, text="+ Add prompt", width=120,
+            command=self._add_prompt_row,
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 6))
+
+    def _add_prompt_row(self, prefilled=None) -> PromptRow:
+        row = PromptRow(
+            self.prompts_container,
+            on_delete=self._delete_prompt_row,
+            prefill=getattr(prefilled, "prefill", "") if prefilled else "",
+        )
+        row.frame.pack(fill="x", padx=4, pady=2)
+        if prefilled is not None:
+            row.load(prefilled)
+        self.prompt_rows.append(row)
+        return row
+
+    def _delete_prompt_row(self, row: PromptRow) -> None:
+        try:
+            self.prompt_rows.remove(row)
+        except ValueError:
+            return
+        try:
+            row.frame.destroy()
+        except Exception:
+            pass
 
     # ----- Email section -----
 
@@ -2350,7 +2451,13 @@ class ScenarioEditor:
         self.find_first_var.set(scenario.find_first)
         # Batch config — populate filter rows + visibility.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
-        self._prompts_passthrough = list(scenario.prompts)
+        # Rebuild prompt rows fresh from the scenario.
+        for pr in list(self.prompt_rows):
+            try: pr.frame.destroy()
+            except Exception: pass
+        self.prompt_rows = []
+        for p in scenario.prompts:
+            self._add_prompt_row(p)
         for r in list(self.filter_rows):
             try: r.frame.destroy()
             except Exception: pass
@@ -2414,18 +2521,12 @@ class ScenarioEditor:
                 "filters": [r.serialize() for r in self.filter_rows],
                 "preview": self._batch_preview,
             }
-        if self._prompts_passthrough:
-            # Round-trip the prompts: block until the editor exposes
-            # a UI for it. Pure read-back from EmailConfig.* fields.
-            out["prompts"] = [
-                {
-                    "var": p.var,
-                    "label": p.label,
-                    "multiline": p.multiline,
-                    "prefill": p.prefill,
-                }
-                for p in self._prompts_passthrough
-            ]
+        prompts_out = [r.serialize() for r in self.prompt_rows]
+        # Drop rows with empty `var` — they're not addressable from
+        # YAML/templates and would just be noise in the saved file.
+        prompts_out = [p for p in prompts_out if p.get("var")]
+        if prompts_out:
+            out["prompts"] = prompts_out
         return out
 
 
