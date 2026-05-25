@@ -42,6 +42,7 @@ from src.config import (
     CASELOAD_CSV_PATH, CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR,
     USER_CONFIG_DIR,
 )
+from src.version import __version__
 from src.note_form import NoteData
 from src.scenarios import (
     NOTES_YAML, BatchConfig, EmailConfig, ScenarioConfig,
@@ -2557,7 +2558,7 @@ class App:
         self._busy_spinner_index = 0
 
         self.root = ctk.CTk()
-        self.root.title("Caseload Note Automation")
+        self.root.title(f"Caseload Note Automation — v{__version__}")
         self.root.geometry("900x600")
         self.root.minsize(420, 520)
         self.root.grid_columnconfigure(0, weight=1)
