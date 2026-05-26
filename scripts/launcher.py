@@ -1902,6 +1902,69 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
     return result["value"]
 
 
+def ask_yes_no_topmost(
+    parent, title: str, message: str,
+    yes_label: str = "Yes", no_label: str = "No",
+) -> bool:
+    """Topmost Yes/No modal. Use AFTER Outlook (or any other window)
+    has stolen focus — tkinter's stock messagebox.askyesno doesn't
+    have topmost / focus-force handling, so its dialog can open
+    BEHIND Outlook and look like the app hung (the user can't see
+    where the question is waiting). This variant uses the same
+    pattern as `prompt_additional_text` — CTkToplevel + topmost +
+    repeated focus_force calls — so the question always lands in
+    front of the user.
+
+    Returns True for Yes, False for No / window-close / Esc."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    result = {"value": False}
+
+    ctk.CTkLabel(
+        dialog, text=message, justify="left", wraplength=460,
+    ).pack(padx=16, pady=(14, 8), anchor="w")
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=16, pady=(4, 14))
+
+    def _close(value: bool) -> None:
+        result["value"] = value
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    yes_btn = ctk.CTkButton(
+        btn_row, text=yes_label, width=100,
+        command=lambda: _close(True),
+    )
+    yes_btn.pack(side="left", padx=4)
+    ctk.CTkButton(
+        btn_row, text=no_label, width=100,
+        command=lambda: _close(False),
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="left", padx=4)
+
+    dialog.bind("<Return>", lambda _e: _close(True))
+    dialog.bind("<Escape>", lambda _e: _close(False))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
+
+    # Outlook may steal focus right after compose_email returns;
+    # claw it back aggressively. The two .after() retries handle the
+    # case where Outlook fully renders ~100-500ms after Display().
+    dialog.lift()
+    dialog.focus_force()
+    yes_btn.focus_set()
+    dialog.after(100, lambda: (dialog.lift(), dialog.focus_force()))
+    dialog.after(500, lambda: (dialog.lift(), dialog.focus_force()))
+
+    parent.wait_window(dialog)
+    return result["value"]
+
+
 def prompt_batch_review(
     parent,
     scenario_name: str,
@@ -4389,14 +4452,20 @@ class App:
             )
         except Exception as e:
             self._append_log(f"Outlook compose failed: {e}")
-            return messagebox.askyesno(
-                "Email failed",
+            # Use topmost dialog: Outlook may have partially opened
+            # before failing and could still own focus.
+            return ask_yes_no_topmost(
+                self.root, "Email failed",
                 f"Couldn't open the email in Outlook:\n\n{e}\n\n"
                 "Proceed with the note only?",
             )
 
-        return messagebox.askyesno(
-            "Done with the email?",
+        # Topmost confirm (NOT messagebox.askyesno) — Outlook just
+        # stole focus to show the compose window, and stock tkinter
+        # modals can open BEHIND it. The user would then see what
+        # looks like a hung app waiting on a question they can't see.
+        return ask_yes_no_topmost(
+            self.root, "Done with the email?",
             f"A draft is now open in Outlook for {full_name}.\n\n"
             "▸ Send the email yourself from Outlook (or discard it).\n"
             "▸ Then click Yes to file the Salesforce note.\n\n"
