@@ -1470,7 +1470,7 @@ def prompt_html_template_editor(
     )
     if custom_var_names:
         _make_row(
-            "Prompts:",
+            "Variables:",
             [(v, v) for v in custom_var_names],
             highlight=True,
         )
@@ -2158,9 +2158,17 @@ class NoteEditor:
     Interaction Format, Interaction Type, Academic Activities, Body.
     Collapsible via the ▼/▶ header button."""
 
-    def __init__(self, parent, index: int, on_delete: Optional[Callable] = None):
+    def __init__(
+        self, parent, index: int,
+        on_delete: Optional[Callable] = None,
+        get_scenario_vars: Optional[Callable[[], list[str]]] = None,
+    ):
         self.index = index
         self._collapsed = False
+        # Callable returning the live list of `var` names from the
+        # ScenarioEditor's variable rows — refreshed each time the
+        # body field gets focus so freshly-added variables show up.
+        self._get_scenario_vars = get_scenario_vars
         self.frame = ctk.CTkFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
 
@@ -2243,9 +2251,21 @@ class NoteEditor:
         ctk.CTkLabel(content, text="Body").grid(
             row=row, column=0, sticky="w", padx=8, pady=(8, 0)
         )
+        # Variable-insert toolbar above the body. Buttons drop
+        # `{{var_name}}` at the cursor. Standard vars first, then
+        # scenario-defined vars highlighted in yellow. Rebuilt on
+        # FocusIn so newly-defined variables show up without needing
+        # to close and reopen the editor.
+        row += 1
+        self._var_buttons_row = ctk.CTkFrame(content, fg_color="transparent")
+        self._var_buttons_row.grid(
+            row=row, column=0, sticky="ew", padx=8, pady=(2, 2),
+        )
         row += 1
         self.body_text = ctk.CTkTextbox(content, height=80, wrap="word")
         self.body_text.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.body_text.bind("<FocusIn>", lambda _e: self._build_var_buttons())
+        self._build_var_buttons()
 
         # Prompt-for-extra-text toggle. When on, firing the scenario
         # pops a dialog pre-filled with this body so the user can edit
@@ -2295,6 +2315,50 @@ class NoteEditor:
         else:
             self.content.grid()
         self.toggle_btn.configure(text=self._header_text())
+
+    def _insert_var_in_body(self, var: str) -> None:
+        """Drop `{{var}}` at the body's current insert cursor."""
+        self.body_text.insert("insert", f"{{{{{var}}}}}")
+        self.body_text.focus_force()
+
+    def _build_var_buttons(self) -> None:
+        """(Re)build the variable-insert buttons above the body.
+        Idempotent — destroys existing children before laying out the
+        current set. Called once at init and on every FocusIn of the
+        body so scenario-variable additions show up without a tab
+        reload. Grid layout wraps to 8 buttons per row."""
+        for w in list(self._var_buttons_row.winfo_children()):
+            try: w.destroy()
+            except Exception: pass
+
+        ctk.CTkLabel(
+            self._var_buttons_row, text="Insert:", anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=1)
+
+        def make_btn(display: str, var: str, slot: int, highlight: bool = False):
+            kw = dict(SECONDARY_BTN_KWARGS)
+            if highlight:
+                kw["fg_color"] = ("#fff3c4", "#5a4500")
+                kw["text_color"] = ("gray10", "gray95")
+            r, c = divmod(slot, 8)
+            ctk.CTkButton(
+                self._var_buttons_row, text=display, width=82, height=22,
+                command=lambda v=var: self._insert_var_in_body(v),
+                font=ctk.CTkFont(size=10),
+                **kw,
+            ).grid(row=r, column=c + 1, padx=1, pady=1, sticky="w")
+
+        slot = 0
+        for display, var in (_TEMPLATE_INSERT_VARS_STUDENT
+                             + _TEMPLATE_INSERT_VARS_PM
+                             + _TEMPLATE_INSERT_VARS_USER):
+            make_btn(display, var, slot)
+            slot += 1
+        custom = self._get_scenario_vars() if self._get_scenario_vars else []
+        for var in custom:
+            make_btn(var, var, slot, highlight=True)
+            slot += 1
 
     def _on_format_change(self) -> None:
         fmt = self.format_var.get()
@@ -2397,6 +2461,25 @@ class ScenarioEditor:
             hotkey_row, text="Press to set", width=110, command=self._start_capture,
         ).pack(side="left", padx=(8, 0))
 
+        # Scenario variables — advanced, hidden by default. When on, a
+        # section appears below the toggle for defining {{var_name}}
+        # values that get asked at fire time and substituted into the
+        # email + every note body. Up here (not between email/notes)
+        # because conceptually the variables apply to BOTH sections
+        # below.
+        row += 1
+        self.use_vars_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Use scenario variables (advanced — applies to email + notes below)",
+            variable=self.use_vars_var,
+            command=self._on_use_vars_toggled,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(8, 4))
+        row += 1
+        self._vars_section_row = row
+        self._build_vars_section()
+        # Visibility set by load() based on scenario.prompts.
+
         # Batch-mode toggle. When on, find-first is hidden (mutually
         # exclusive) and the Filters section appears underneath.
         row += 1
@@ -2441,12 +2524,6 @@ class ScenarioEditor:
         self._email_section_row = row
         self._build_email_section()
         # Visibility set by load() based on scenario.email != None.
-
-        # Prompts section — at-fire-time inputs. Always visible (no
-        # toggle) since an empty row list is the natural "no prompts"
-        # state. Section header + container + Add button.
-        row += 1
-        self._build_prompts_section(row)
 
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
@@ -2562,30 +2639,53 @@ class ScenarioEditor:
                 sticky="w", padx=8, pady=(0, 8),
             )
 
-    # ----- Prompts section -----
+    # ----- Scenario variables section -----
 
-    def _build_prompts_section(self, row: int) -> None:
-        """Inline `Prompts` section: header + dynamic row container +
-        add button. Each row is a PromptRow widget tuple. Empty list
-        renders as just the section header + 'Add prompt' button,
-        which acts as the off state — no toggle needed."""
+    def _build_vars_section(self) -> None:
+        """Build the 'Scenario variables' section. Doesn't grid it —
+        visibility is controlled by `_on_use_vars_toggled`. Each row
+        is a PromptRow (internal class name kept as-is to avoid a
+        cross-cutting rename; the UI calls them 'variables')."""
         frame = ctk.CTkFrame(self.frame, fg_color=("gray92", "gray18"))
-        frame.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 4))
         frame.grid_columnconfigure(0, weight=1)
+        self._vars_section = frame
         ctk.CTkLabel(
-            frame, text="Prompts (at-fire-time inputs)",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            frame, text="Scenario variables",
+            font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        ctk.CTkLabel(
+            frame,
+            text=(
+                "Values you'll be asked for when this scenario fires. "
+                "Use {{var_name}} in the email subject/body and any note "
+                "body to drop the typed value in."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            wraplength=620, justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 4))
         self.prompts_container = ctk.CTkFrame(frame, fg_color="transparent")
         self.prompts_container.grid(
-            row=1, column=0, sticky="ew", padx=4, pady=(0, 4),
+            row=2, column=0, sticky="ew", padx=4, pady=(0, 4),
         )
         self.prompts_container.grid_columnconfigure(0, weight=1)
         self.prompt_rows: list[PromptRow] = []
         ctk.CTkButton(
-            frame, text="+ Add prompt", width=120,
+            frame, text="+ Add variable", width=130,
             command=self._add_prompt_row,
-        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 6))
+        ).grid(row=3, column=0, sticky="w", padx=8, pady=(0, 6))
+
+    def _on_use_vars_toggled(self) -> None:
+        """Show / hide the scenario-variables section based on the
+        toggle. Serialize-side gating in `serialize()` also keys off
+        this flag, so a hidden section's rows won't get saved."""
+        if self.use_vars_var.get():
+            self._vars_section.grid(
+                row=self._vars_section_row, column=0,
+                sticky="ew", padx=8, pady=(0, 6),
+            )
+        else:
+            self._vars_section.grid_remove()
 
     def _add_prompt_row(self, prefilled=None) -> PromptRow:
         row = PromptRow(
@@ -2861,6 +2961,7 @@ class ScenarioEditor:
             self.notes_container,
             index=len(self.note_editors),
             on_delete=self._delete_note,
+            get_scenario_vars=self._current_prompt_var_names,
         )
         ne.frame.pack(fill="x", padx=4, pady=4)
         ne.load(note_data)
@@ -2911,6 +3012,10 @@ class ScenarioEditor:
         self.prompt_rows = []
         for p in scenario.prompts:
             self._add_prompt_row(p)
+        # Toggle reflects whether the scenario has any defined vars —
+        # otherwise the section stays hidden as an "advanced" feature.
+        self.use_vars_var.set(bool(scenario.prompts))
+        self._on_use_vars_toggled()
         for r in list(self.filter_rows):
             try: r.frame.destroy()
             except Exception: pass
@@ -2974,12 +3079,13 @@ class ScenarioEditor:
                 "filters": [r.serialize() for r in self.filter_rows],
                 "preview": self._batch_preview,
             }
-        prompts_out = [r.serialize() for r in self.prompt_rows]
-        # Drop rows with empty `var` — they're not addressable from
-        # YAML/templates and would just be noise in the saved file.
-        prompts_out = [p for p in prompts_out if p.get("var")]
-        if prompts_out:
-            out["prompts"] = prompts_out
+        if self.use_vars_var.get():
+            prompts_out = [r.serialize() for r in self.prompt_rows]
+            # Drop rows with empty `var` — they're not addressable from
+            # YAML/templates and would just be noise in the saved file.
+            prompts_out = [p for p in prompts_out if p.get("var")]
+            if prompts_out:
+                out["prompts"] = prompts_out
         return out
 
 
