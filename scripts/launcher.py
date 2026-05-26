@@ -1362,6 +1362,12 @@ _DIALOG_DEFAULTS: dict[str, str] = {
 }
 
 
+# Sentinel shown in the "Email font" dropdown when no font is set —
+# meaning Outlook's compose default applies (no CSS injection). Kept
+# as a constant so the UI label and the serialize check stay in sync.
+EMAIL_FONT_DEFAULT_LABEL = "(Outlook default)"
+
+
 # Variables exposed in the in-app HTML editor's "Insert variable"
 # toolbar. Display label → variable name (so users see the friendly
 # name but the inserted `{{var}}` matches what the renderer accepts).
@@ -1429,9 +1435,12 @@ def prompt_html_template_editor(
     # Holders so closures can mutate. `current["path"]` lets Save-as
     # change which file subsequent Saves write to.
     saved = {"value": False}
+    # Editor font is Segoe UI (Windows system font, readable for
+    # prose + light HTML). Not user-configurable — fewer knobs to
+    # tune. The size is configurable for accessibility / quick zoom.
     current = {
         "path": Path(path),
-        "font_family": "Calibri",
+        "font_family": "Segoe UI",
         "font_size": 11,
     }
 
@@ -1475,13 +1484,13 @@ def prompt_html_template_editor(
             highlight=True,
         )
 
-    # Font row — family + size dropdowns. Affects the editor's text
-    # display ONLY; the rendered email uses whatever CSS lives in the
-    # HTML (or Outlook's defaults if none).
-    font_row = ctk.CTkFrame(toolbar, fg_color="transparent")
-    font_row.pack(fill="x", pady=(6, 2))
+    # View-size row. EDITOR VIEW ONLY — the sent email's font/size is
+    # set per-scenario in the email section of the editor (so it
+    # applies to every fire), not here.
+    size_row = ctk.CTkFrame(toolbar, fg_color="transparent")
+    size_row.pack(fill="x", pady=(6, 2))
     ctk.CTkLabel(
-        font_row, text="View font:", width=70, anchor="w",
+        size_row, text="View size:", width=70, anchor="w",
         font=ctk.CTkFont(size=11, weight="bold"),
     ).pack(side="left", padx=(0, 4))
 
@@ -1494,10 +1503,6 @@ def prompt_html_template_editor(
         except Exception:
             pass
 
-    def on_family_change(value: str) -> None:
-        current["font_family"] = value
-        apply_font()
-
     def on_size_change(value: str) -> None:
         try:
             current["font_size"] = max(8, min(40, int(value)))
@@ -1505,25 +1510,16 @@ def prompt_html_template_editor(
             return
         apply_font()
 
-    family_combo = ctk.CTkComboBox(
-        font_row,
-        values=[
-            "Calibri", "Arial", "Segoe UI",
-            "Times New Roman", "Georgia", "Verdana",
-            "Consolas", "Courier New",
-        ],
-        width=160, command=on_family_change,
-    )
-    family_combo.set("Calibri")
-    family_combo.pack(side="left", padx=(0, 6))
     size_combo = ctk.CTkComboBox(
-        font_row, values=["8", "9", "10", "11", "12", "14", "16", "18", "22"],
+        size_row, values=["8", "9", "10", "11", "12", "14", "16", "18", "22"],
         width=70, command=on_size_change,
     )
     size_combo.set("11")
     size_combo.pack(side="left")
     ctk.CTkLabel(
-        font_row, text="(editor view only — emails use the HTML's own styling)",
+        size_row,
+        text="(editor view only — set the sent email's font in the "
+             "scenario's email section)",
         font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
     ).pack(side="left", padx=(10, 0))
 
@@ -2790,12 +2786,47 @@ class ScenarioEditor:
         )
         self.email_images_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(4, 0))
 
+        # Sent-email font + size. "(Outlook default)" leaves no inline
+        # CSS so Outlook applies whatever the user configured under
+        # File > Options > Mail > Stationery and Fonts. Picking any
+        # named font wraps the rendered HTML body in a styled div
+        # before Send/Display.
+        ctk.CTkLabel(frame, text="Email font").grid(
+            row=5, column=0, sticky="w", padx=8, pady=(4, 0),
+        )
+        font_row = ctk.CTkFrame(frame, fg_color="transparent")
+        font_row.grid(row=5, column=1, sticky="ew", padx=8, pady=(4, 0))
+        self.email_font_family_combo = ctk.CTkComboBox(
+            font_row,
+            values=[
+                EMAIL_FONT_DEFAULT_LABEL,
+                "Calibri", "Arial", "Segoe UI",
+                "Times New Roman", "Georgia", "Verdana",
+            ],
+            width=200,
+        )
+        self.email_font_family_combo.set(EMAIL_FONT_DEFAULT_LABEL)
+        self.email_font_family_combo.pack(side="left")
+        ctk.CTkLabel(font_row, text="Size").pack(side="left", padx=(10, 4))
+        self.email_font_size_combo = ctk.CTkComboBox(
+            font_row, values=["", "9", "10", "11", "12", "14", "16"],
+            width=70,
+        )
+        self.email_font_size_combo.set("")
+        self.email_font_size_combo.pack(side="left")
+        ctk.CTkLabel(
+            font_row,
+            text="(blank size + 'Outlook default' = use whatever "
+                 "Outlook is set to)",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
+        ).pack(side="left", padx=(10, 0))
+
         # CC Program Mentor
         self.email_cc_pm_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             frame, text="CC Program Mentor",
             variable=self.email_cc_pm_var,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 8))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 8))
 
     @staticmethod
     def _available_template_files() -> list[str]:
@@ -3040,6 +3071,10 @@ class ScenarioEditor:
             self.email_images_entry.delete(0, "end")
             self.email_images_entry.insert(0, ", ".join(scenario.email.inline_images))
             self.email_cc_pm_var.set(scenario.email.cc_pm)
+            ff = (scenario.email.font_family or "").strip()
+            self.email_font_family_combo.set(ff if ff else EMAIL_FONT_DEFAULT_LABEL)
+            fs = scenario.email.font_size or 0
+            self.email_font_size_combo.set(str(fs) if fs > 0 else "")
         else:
             # Clear out so an old scenario's leftover values don't show.
             self.email_subject_entry.delete(0, "end")
@@ -3047,6 +3082,8 @@ class ScenarioEditor:
             self.email_signature_combo.set("")
             self.email_images_entry.delete(0, "end")
             self.email_cc_pm_var.set(False)
+            self.email_font_family_combo.set(EMAIL_FONT_DEFAULT_LABEL)
+            self.email_font_size_combo.set("")
         self._on_send_email_toggled()
         for ne, note in zip(self.note_editors, scenario.notes):
             ne.load(note)
@@ -3074,6 +3111,18 @@ class ScenarioEditor:
                 "inline_images": inline_images,
                 "cc_pm": self.email_cc_pm_var.get(),
             }
+            # Only write font fields when the user has set them away
+            # from the "Outlook default" sentinel — keeps the YAML
+            # uncluttered for scenarios that don't override the font.
+            ff = self.email_font_family_combo.get().strip()
+            if ff and ff != EMAIL_FONT_DEFAULT_LABEL:
+                out["email"]["font_family"] = ff
+            try:
+                fs = int(self.email_font_size_combo.get().strip() or 0)
+            except ValueError:
+                fs = 0
+            if fs > 0:
+                out["email"]["font_size"] = fs
         if self.batch_mode_var.get():
             out["batch"] = {
                 "filters": [r.serialize() for r in self.filter_rows],
@@ -4104,6 +4153,11 @@ class App:
         try:
             template_html = email_template.load_template(template_path)
             preview_body = email_template.render_with_placeholders(template_html)
+            # Mirror the runtime path so the preview reflects the
+            # scenario's chosen font.
+            preview_body = email_template.wrap_with_font(
+                preview_body, email_cfg.font_family, email_cfg.font_size,
+            )
             preview_subject = email_template.render_plain_with_placeholders(
                 email_cfg.subject,
             )
@@ -4196,6 +4250,13 @@ class App:
         try:
             template_html = email_template.load_template(template_path)
             body_html = email_template.render(template_html, student_ctx)
+            # If the scenario pins a font, wrap the body in an inline-
+            # styled div so Outlook honors it. Otherwise (default) the
+            # HTML goes through untouched and Outlook applies the
+            # user's compose default.
+            body_html = email_template.wrap_with_font(
+                body_html, email_cfg.font_family, email_cfg.font_size,
+            )
             # Subject and addresses are plain text — never HTML-escape.
             subject = email_template.render_plain(
                 email_cfg.subject, student_ctx,

@@ -125,6 +125,28 @@ def render_plain(template_text: str, variables: dict) -> str:
     return _VAR_RE.sub(replace, template_text)
 
 
+def wrap_with_font(html: str, font_family: str, font_size: int) -> str:
+    """Wrap `html` in an outer <div> with inline font-family +
+    font-size CSS. Outlook honors inline styles in HTMLBody, so this
+    is how we pin the sent email's font. Returns the html unchanged
+    when family is empty or size <= 0 — caller's signal to "use
+    Outlook's compose default" (no CSS injection means Outlook
+    applies whatever the user has set in Mail > Stationery and Fonts)."""
+    family = (font_family or "").strip()
+    try:
+        size = int(font_size or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if not family or size <= 0:
+        return html
+    # Quote family so multi-word names (e.g. "Times New Roman") survive.
+    # Add a generic fallback so missing fonts on the recipient's side
+    # still render readably.
+    quoted = f'"{family}"' if " " in family else family
+    style = f"font-family: {quoted}, sans-serif; font-size: {size}pt"
+    return f'<div style="{style}">{html}</div>'
+
+
 def load_template(path: Path) -> str:
     """Read a UTF-8 template file."""
     return Path(path).read_text(encoding="utf-8")

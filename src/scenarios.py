@@ -83,6 +83,12 @@ class EmailConfig:
     signature_file: str = ""
     inline_images: list[str] = field(default_factory=list)
     cc_pm: bool = False
+    # Font of the SENT message. Empty family or size=0 means "use
+    # Outlook's compose default" (no CSS injection). When both are
+    # set, the rendered HTML body is wrapped in an inline-styled div
+    # before going to Outlook.
+    font_family: str = ""
+    font_size: int = 0
 
 
 @dataclass
@@ -127,6 +133,10 @@ def _note_from_dict(d: dict) -> NoteData:
 def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
     if not d:
         return None
+    try:
+        font_size = int(d.get("font_size", 0) or 0)
+    except (TypeError, ValueError):
+        font_size = 0
     return EmailConfig(
         subject=d.get("subject", ""),
         body_html_file=d.get("body_html_file", ""),
@@ -134,6 +144,8 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
         signature_file=d.get("signature_file", ""),
         inline_images=list(d.get("inline_images") or []),
         cc_pm=bool(d.get("cc_pm", False)),
+        font_family=str(d.get("font_family", "") or ""),
+        font_size=font_size,
     )
 
 
