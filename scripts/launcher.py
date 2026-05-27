@@ -14,12 +14,15 @@ Usage:
     python -m scripts.launcher
 """
 import csv
+import html
 import os
 import queue
+import re
 import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -1586,12 +1589,11 @@ _HTML_HIGHLIGHT_COLORS: dict[str, dict[str, str]] = {
 # Comments come first (multi-line, can swallow `<`); tag pattern is
 # non-greedy and matches up to the next `>`; var pattern matches
 # `{{ name }}` with optional whitespace.
-import re as _re_html
-_HTML_HIGHLIGHT_PATTERNS: dict[str, "_re_html.Pattern"] = {
-    "comment": _re_html.compile(r"<!--[\s\S]*?-->"),
-    "tag":     _re_html.compile(r"</?[a-zA-Z][^>]*?>", _re_html.DOTALL),
-    "var":     _re_html.compile(r"\{\{\s*\w+\s*\}\}"),
-    "value":   _re_html.compile(r'"[^"]*"'),
+_HTML_HIGHLIGHT_PATTERNS: dict[str, re.Pattern] = {
+    "comment": re.compile(r"<!--[\s\S]*?-->"),
+    "tag":     re.compile(r"</?[a-zA-Z][^>]*?>", re.DOTALL),
+    "var":     re.compile(r"\{\{\s*\w+\s*\}\}"),
+    "value":   re.compile(r'"[^"]*"'),
 }
 
 
@@ -2590,6 +2592,630 @@ def ask_yes_no_topmost(
 
     parent.wait_window(dialog)
     return result["value"]
+
+
+class _HTMLToTkRenderer(HTMLParser):
+    """Render simplified HTML into a Tk Text widget using tag-based
+    formatting. Goal: legible to non-technical reviewers (FERPA), not
+    pixel-perfect. Output handles paragraphs, links, basic
+    formatting, lists, headings, and images-as-placeholders.
+
+    Highlights any `{{var}}` placeholder that survived rendering in
+    red — those are the FERPA risk (template variable referenced
+    that didn't get a value)."""
+
+    _SKIP_CONTENT = {"style", "script", "head", "title", "meta", "link"}
+
+    def __init__(self, text_widget, unresolved_var_set: Optional[set] = None):
+        super().__init__()
+        self.text = text_widget
+        # `unresolved_vars` is populated as we find any leftover
+        # `{{name}}` in the rendered HTML — caller uses it to
+        # populate the "issues" badge on the row.
+        self.unresolved_vars: set[str] = (
+            unresolved_var_set if unresolved_var_set is not None else set()
+        )
+        self._format_stack: list[str] = []
+        self._link_href = ""
+        self._list_stack: list[dict] = []
+        self._skip_depth = 0
+        self._first_block = True
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP_CONTENT:
+            self._skip_depth += 1
+            return
+        if self._skip_depth > 0:
+            return
+        d = dict(attrs)
+
+        if tag == "p":
+            self._paragraph_break()
+        elif tag == "br":
+            self.text.insert("end", "\n")
+        elif tag in ("strong", "b"):
+            self._format_stack.append("bold")
+        elif tag in ("em", "i"):
+            self._format_stack.append("italic")
+        elif tag == "u":
+            self._format_stack.append("underline")
+        elif tag == "a":
+            self._format_stack.append("link")
+            self._link_href = d.get("href", "")
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._paragraph_break()
+            self._format_stack.append("heading")
+        elif tag == "ol":
+            self._list_stack.append({"type": "ol", "n": 0})
+            self._paragraph_break()
+        elif tag == "ul":
+            self._list_stack.append({"type": "ul", "n": 0})
+            self._paragraph_break()
+        elif tag == "li":
+            self.text.insert("end", "\n")
+            depth = max(0, len(self._list_stack) - 1)
+            self.text.insert("end", "    " * depth)
+            if self._list_stack and self._list_stack[-1]["type"] == "ol":
+                self._list_stack[-1]["n"] += 1
+                self.text.insert("end", f"{self._list_stack[-1]['n']}. ")
+            else:
+                self.text.insert("end", "• ")
+        elif tag == "img":
+            src = d.get("src", "")
+            alt = (d.get("alt", "") or "").strip()
+            # cid:STEM is what the live email uses; show the stem
+            # so the reviewer can see the file being referenced.
+            if src.startswith("cid:"):
+                label = src[4:]
+            else:
+                label = src.rsplit("/", 1)[-1] or src
+            marker = f"[Image: {label}"
+            if alt:
+                marker += f"  ⇨  {alt}"
+            marker += "]"
+            self._paragraph_break()
+            self._insert_tagged(marker, "image")
+            self.text.insert("end", "\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP_CONTENT:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth > 0:
+            return
+
+        if tag in ("strong", "b"):
+            self._pop_format("bold")
+        elif tag in ("em", "i"):
+            self._pop_format("italic")
+        elif tag == "u":
+            self._pop_format("underline")
+        elif tag == "a":
+            self._pop_format("link")
+            href = self._link_href
+            self._link_href = ""
+            # Show the URL in dim text after the link so reviewers
+            # can verify what the click goes to. Trim mailto: prefix
+            # to keep it tidy.
+            if href:
+                disp = href[7:] if href.startswith("mailto:") else href
+                self._insert_tagged(f"  ({disp})", "url_hint")
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._pop_format("heading")
+            self.text.insert("end", "\n")
+        elif tag in ("ol", "ul"):
+            if self._list_stack:
+                self._list_stack.pop()
+            self.text.insert("end", "\n")
+
+    def handle_data(self, data):
+        if self._skip_depth > 0:
+            return
+        # Collapse runs of whitespace (HTML semantics) but preserve
+        # one separator between words.
+        collapsed = re.sub(r"\s+", " ", data)
+        if not collapsed:
+            return
+        # Detect any leftover {{var}} placeholders — these mean the
+        # template referenced a variable that didn't get a value,
+        # which is the kind of leak FERPA review needs to catch.
+        var_re = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+        idx = 0
+        for m in var_re.finditer(collapsed):
+            if m.start() > idx:
+                self._insert_tagged(
+                    collapsed[idx:m.start()], *self._format_stack,
+                )
+            self._insert_tagged(m.group(0), "unresolved_var")
+            self.unresolved_vars.add(m.group(1))
+            idx = m.end()
+        if idx < len(collapsed):
+            self._insert_tagged(
+                collapsed[idx:], *self._format_stack,
+            )
+
+    def handle_entityref(self, name):
+        if self._skip_depth > 0:
+            return
+        ch = html.unescape(f"&{name};")
+        self._insert_tagged(ch, *self._format_stack)
+
+    def handle_charref(self, name):
+        if self._skip_depth > 0:
+            return
+        ch = html.unescape(f"&#{name};")
+        self._insert_tagged(ch, *self._format_stack)
+
+    def _pop_format(self, name):
+        # Pop the rightmost matching entry (handles nested tags).
+        for i in range(len(self._format_stack) - 1, -1, -1):
+            if self._format_stack[i] == name:
+                del self._format_stack[i]
+                return
+
+    def _paragraph_break(self):
+        if self._first_block:
+            self._first_block = False
+            return
+        # Avoid stacking multiple blank lines if the previous block
+        # already ended with one.
+        tail = self.text.get("end-3c", "end-1c")
+        if tail.endswith("\n\n"):
+            return
+        if tail.endswith("\n"):
+            self.text.insert("end", "\n")
+            return
+        self.text.insert("end", "\n\n")
+
+    def _insert_tagged(self, text, *tags):
+        if not text:
+            return
+        start = self.text.index("end-1c")
+        self.text.insert("end", text)
+        end = self.text.index("end-1c")
+        for tag in tags:
+            self.text.tag_add(tag, start, end)
+
+
+def _configure_email_preview_tags(text_widget) -> None:
+    """Set up the tag styles used by `_HTMLToTkRenderer`. Colors
+    adapt to the current ctk appearance mode so the preview is
+    readable on both light and dark themes."""
+    mode = ctk.get_appearance_mode()
+    is_dark = mode == "Dark"
+    text_widget.tag_configure(
+        "bold", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    )
+    text_widget.tag_configure(
+        "italic", font=ctk.CTkFont(family="Segoe UI", size=12, slant="italic"),
+    )
+    text_widget.tag_configure("underline", underline=True)
+    text_widget.tag_configure(
+        "link",
+        foreground="#79b8ff" if is_dark else "#1a73e8",
+        underline=True,
+    )
+    text_widget.tag_configure(
+        "url_hint",
+        foreground="#888888" if is_dark else "#666666",
+        font=ctk.CTkFont(family="Segoe UI", size=10),
+    )
+    text_widget.tag_configure(
+        "heading", font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+    )
+    text_widget.tag_configure(
+        "image",
+        foreground="#5a4500" if not is_dark else "#ffd966",
+        background="#fff3c4" if not is_dark else "#3a3520",
+        font=ctk.CTkFont(family="Segoe UI", size=11, slant="italic"),
+    )
+    text_widget.tag_configure(
+        "unresolved_var",
+        foreground="#ffffff",
+        background="#cc0000",
+        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    )
+
+
+def prompt_batch_email_review(
+    parent,
+    scenario_name: str,
+    rendered: list[dict],
+    filter_summary: str = "",
+) -> Optional[list[int]]:
+    """Modal reviewer for batch emails. Returns the list of indices
+    (into `rendered`) the user wants to send to, or None on cancel.
+
+    Each entry in `rendered` is a dict with keys:
+        name              — student display name
+        student_id        — for sub-label
+        course_code       — for sub-label
+        to                — recipient address (empty if missing)
+        cc                — CC address (empty if not CC'ing PM)
+        cc_is_self        — bool; show "(you, auto-CC'd as PM)" hint
+        subject           — rendered subject line
+        body_html         — rendered email body (full HTML)
+        issues            — list of strings; common: 'no_email',
+                            'render_error: …'
+
+    Rows with `'no_email' in issues` come up unchecked by default
+    so the FERPA reviewer has to consciously include them; other
+    rows are checked by default. Unresolved `{{var}}` placeholders
+    in the body are highlighted in red by the HTML renderer."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(f"Review emails — {scenario_name}")
+    dialog.geometry("1100x720")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+
+    # Topmost claw-back. Same dance as ask_yes_no_topmost since the
+    # Outlook template-preview path used to lose focus to Outlook;
+    # the new flow never opens Outlook for review but staying topmost
+    # keeps the modal in front of anything else the user clicks.
+    dialog.lift()
+    dialog.focus_force()
+    dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
+
+    selected_vars: list[ctk.BooleanVar] = []
+    # Default: every row checked, UNLESS the row has an issue (no
+    # email, render error). Those start unchecked — FERPA-friendly
+    # default since you have to consciously opt them in.
+    for entry in rendered:
+        v = ctk.BooleanVar(value=not bool(entry.get("issues")))
+        selected_vars.append(v)
+
+    state = {"current": 0}
+
+    # ---- Top banner: filter summary + count. ----
+    banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
+    banner.pack(fill="x", padx=8, pady=(8, 0))
+    title_line = ctk.CTkLabel(
+        banner, text=f"Review batch: {scenario_name}",
+        font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+    )
+    title_line.pack(fill="x", padx=10, pady=(8, 0))
+    if filter_summary:
+        ctk.CTkLabel(
+            banner,
+            text=f"Matched by: {filter_summary}",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray70"),
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 2))
+    selection_label = ctk.CTkLabel(
+        banner, text="", font=ctk.CTkFont(size=11),
+        text_color=("gray35", "gray70"), anchor="w",
+    )
+    selection_label.pack(fill="x", padx=10, pady=(0, 8))
+
+    # ---- Main split: student list (left) + preview (right). ----
+    body = ctk.CTkFrame(dialog, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=8, pady=8)
+    body.grid_columnconfigure(0, weight=0, minsize=300)
+    body.grid_columnconfigure(1, weight=1)
+    body.grid_rowconfigure(0, weight=1)
+
+    # Left: scrollable student list with checkboxes.
+    list_frame = ctk.CTkScrollableFrame(
+        body, fg_color=("gray95", "gray16"), corner_radius=6,
+        label_text=f"Students ({len(rendered)})",
+    )
+    list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+    # Right: preview pane.
+    preview_frame = ctk.CTkFrame(body, fg_color=("gray95", "gray16"), corner_radius=6)
+    preview_frame.grid(row=0, column=1, sticky="nsew")
+    preview_frame.grid_columnconfigure(0, weight=1)
+    preview_frame.grid_rowconfigure(2, weight=1)
+
+    # Header area (issue banner + To/Cc/Subject lines).
+    issue_banner = ctk.CTkLabel(
+        preview_frame, text="", anchor="w", justify="left",
+        font=ctk.CTkFont(size=11, weight="bold"),
+        text_color=("#990000", "#ffcccc"),
+        fg_color=("#ffe0e0", "#4a1a1a"), corner_radius=4,
+    )
+    # Pack/forget toggled per-row when issues exist.
+    header_block = ctk.CTkFrame(preview_frame, fg_color="transparent")
+    header_block.grid(row=1, column=0, sticky="ew", padx=8, pady=(8, 4))
+    header_block.grid_columnconfigure(1, weight=1)
+    to_label = ctk.CTkLabel(header_block, text="To:", width=64, anchor="w",
+                             font=ctk.CTkFont(size=12, weight="bold"))
+    to_label.grid(row=0, column=0, sticky="w")
+    to_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
+    to_value.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+    cc_label = ctk.CTkLabel(header_block, text="Cc:", width=64, anchor="w",
+                             font=ctk.CTkFont(size=12, weight="bold"))
+    cc_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
+    subj_label = ctk.CTkLabel(header_block, text="Subject:", width=64, anchor="w",
+                               font=ctk.CTkFont(size=12, weight="bold"))
+    subj_label.grid(row=2, column=0, sticky="w")
+    subj_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left",
+                               font=ctk.CTkFont(size=12, weight="bold"))
+    subj_value.grid(row=2, column=1, sticky="ew", padx=(2, 0))
+
+    # Separator + body text.
+    sep = ctk.CTkFrame(preview_frame, height=1, fg_color=("gray70", "gray35"))
+    sep.grid(row=2, column=0, sticky="new", padx=8, pady=(2, 4))
+    body_text = ctk.CTkTextbox(
+        preview_frame, wrap="word",
+        font=ctk.CTkFont(family="Segoe UI", size=12),
+    )
+    body_text.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    preview_frame.grid_rowconfigure(3, weight=1)
+    _configure_email_preview_tags(body_text._textbox)
+    # Disable typing — preview is read-only.
+    body_text.configure(state="disabled")
+
+    # ---- Build row widgets in the list. ----
+    row_buttons: list[ctk.CTkButton] = []
+
+    def _row_label(entry: dict, idx: int) -> str:
+        parts = [entry["name"]]
+        sub = []
+        sid = entry.get("student_id", "")
+        cc = entry.get("course_code", "")
+        if sid:
+            sub.append(sid)
+        if cc:
+            sub.append(cc)
+        if sub:
+            parts.append("  " + " · ".join(sub))
+        if entry.get("issues"):
+            parts.append("  (!)")
+        return "".join(parts)
+
+    def _update_selection_label() -> None:
+        n_checked = sum(1 for v in selected_vars if v.get())
+        selection_label.configure(
+            text=f"{n_checked} of {len(rendered)} selected · "
+                 f"showing {state['current'] + 1} of {len(rendered)}"
+        )
+        send_btn.configure(
+            text=f"Send to {n_checked} students"
+            if n_checked != 1 else "Send to 1 student"
+        )
+        send_btn.configure(state=("normal" if n_checked > 0 else "disabled"))
+
+    def _show(idx: int) -> None:
+        if not (0 <= idx < len(rendered)):
+            return
+        state["current"] = idx
+        entry = rendered[idx]
+        # Highlight the active row (border or fg change).
+        for i, b in enumerate(row_buttons):
+            if i == idx:
+                b.configure(border_width=2,
+                             border_color=("#1a73e8", "#79b8ff"))
+            else:
+                b.configure(border_width=1,
+                             border_color=("gray70", "gray35"))
+        # Issue banner.
+        issues = entry.get("issues", [])
+        if issues:
+            issue_banner.configure(
+                text="⚠  " + "  ·  ".join(issues),
+            )
+            issue_banner.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
+        else:
+            issue_banner.grid_remove()
+        # To.
+        to = entry.get("to", "") or "(missing — will be looked up at send)"
+        to_value.configure(
+            text=to,
+            text_color=(("gray45", "gray60") if not entry.get("to")
+                        else ("gray10", "gray90")),
+        )
+        # Cc — hide row if no CC configured for this scenario at all.
+        if entry.get("cc") or entry.get("cc_configured"):
+            cc_label.grid(row=1, column=0, sticky="w")
+            cc_value.grid(row=1, column=1, sticky="ew", padx=(2, 0))
+            cc = entry.get("cc", "") or "(missing — will be looked up at send)"
+            hint = "  (you, auto-CC'd as PM)" if entry.get("cc_is_self") else ""
+            cc_value.configure(text=cc + hint)
+        else:
+            cc_label.grid_remove()
+            cc_value.grid_remove()
+        # Subject.
+        subj_value.configure(text=entry.get("subject", ""))
+        # Body render.
+        body_text.configure(state="normal")
+        body_text.delete("1.0", "end")
+        if entry.get("render_error"):
+            body_text.insert("1.0", f"Render error:\n\n{entry['render_error']}")
+        else:
+            try:
+                renderer = _HTMLToTkRenderer(body_text._textbox)
+                renderer.feed(entry.get("body_html", ""))
+                renderer.close()
+            except Exception as e:
+                body_text.insert("1.0", f"(Preview render failed: {e})\n\n")
+                body_text.insert("end", entry.get("body_html", ""))
+        body_text.configure(state="disabled")
+        _update_selection_label()
+
+    def _on_row_click(idx: int) -> None:
+        _show(idx)
+
+    def _on_checkbox_toggle() -> None:
+        _update_selection_label()
+
+    for i, entry in enumerate(rendered):
+        row_wrap = ctk.CTkFrame(list_frame, fg_color="transparent")
+        row_wrap.pack(fill="x", pady=2)
+        cb = ctk.CTkCheckBox(
+            row_wrap, text="", variable=selected_vars[i],
+            command=_on_checkbox_toggle, width=20,
+        )
+        cb.pack(side="left", padx=(2, 4))
+        # Reuse the same SECONDARY_BTN_KWARGS palette, but make the
+        # button look like a list row — left-aligned text, click
+        # selects this row for preview.
+        b_kwargs = dict(SECONDARY_BTN_KWARGS)
+        if entry.get("issues"):
+            # Red-tint the row to flag the issue at-a-glance.
+            b_kwargs["fg_color"] = ("#ffe0e0", "#4a1a1a")
+            b_kwargs["text_color"] = ("#990000", "#ffcccc")
+        btn = ctk.CTkButton(
+            row_wrap, text=_row_label(entry, i), anchor="w",
+            height=36, command=lambda idx=i: _on_row_click(idx),
+            font=ctk.CTkFont(size=12),
+            **b_kwargs,
+        )
+        btn.pack(side="left", fill="x", expand=True)
+        row_buttons.append(btn)
+        if entry.get("issues"):
+            issue_sub = ctk.CTkLabel(
+                list_frame,
+                text="    ↳ " + "  ·  ".join(entry["issues"]),
+                font=ctk.CTkFont(size=10),
+                text_color=("#990000", "#ffcccc"),
+                anchor="w", justify="left",
+            )
+            issue_sub.pack(fill="x", padx=4, pady=(0, 2))
+
+    # ---- List-level action buttons (select all / none). ----
+    list_actions = ctk.CTkFrame(list_frame, fg_color="transparent")
+    list_actions.pack(fill="x", pady=(8, 0))
+
+    def _select_all() -> None:
+        for v in selected_vars:
+            v.set(True)
+        _update_selection_label()
+
+    def _select_none() -> None:
+        for v in selected_vars:
+            v.set(False)
+        _update_selection_label()
+
+    ctk.CTkButton(
+        list_actions, text="Select all", height=24,
+        command=_select_all, **SECONDARY_BTN_KWARGS,
+        font=ctk.CTkFont(size=11),
+    ).pack(side="left", padx=2)
+    ctk.CTkButton(
+        list_actions, text="None", height=24,
+        command=_select_none, **SECONDARY_BTN_KWARGS,
+        font=ctk.CTkFont(size=11),
+    ).pack(side="left", padx=2)
+
+    # ---- Bottom action row: prev/next, edge, send, cancel. ----
+    bottom = ctk.CTkFrame(dialog, fg_color="transparent")
+    bottom.pack(fill="x", padx=8, pady=(0, 8))
+
+    def _prev() -> None:
+        if state["current"] > 0:
+            _show(state["current"] - 1)
+
+    def _next() -> None:
+        if state["current"] < len(rendered) - 1:
+            _show(state["current"] + 1)
+
+    def _skip_and_next() -> None:
+        # Uncheck current + advance.
+        selected_vars[state["current"]].set(False)
+        _update_selection_label()
+        _next()
+
+    def _view_current_in_edge() -> None:
+        # Reuse the same _preview.html mechanism as the template
+        # editor's Preview button so we don't keep accumulating
+        # temp files. cid: references get rewritten to local
+        # filenames so the browser can resolve them.
+        entry = rendered[state["current"]]
+        body_html = entry.get("body_html", "")
+
+        def _fix_cid(m):
+            stem = m.group(1)
+            for f in sorted(TEMPLATES_DIR.glob(f"{stem}.*")):
+                if f.suffix.lower() != ".html":
+                    return f'src="{f.name}"'
+            return m.group(0)
+        body_html = re.sub(r'src="cid:([^"]+)"', _fix_cid, body_html)
+
+        shell = (
+            '<!DOCTYPE html>\n<html><head>'
+            '<meta charset="utf-8"><title>Email preview</title>'
+            '<style>body { max-width: 720px; margin: 24px auto; '
+            'padding: 0 24px; font-family: Segoe UI, sans-serif; }'
+            '.preview-banner { background:#fff3c4; color:#5a4500; '
+            'padding:8px 12px; border-radius:6px; margin-bottom:16px; '
+            'font-size:12px; }</style></head><body>'
+            '<div class="preview-banner">Email preview for '
+            f'<b>{html.escape(entry.get("name", ""))}</b> · To: '
+            f'{html.escape(entry.get("to") or "(missing)")} · Cc: '
+            f'{html.escape(entry.get("cc") or "(none)")} · Subject: '
+            f'{html.escape(entry.get("subject", ""))}</div>\n'
+            + body_html + '\n</body></html>'
+        )
+        preview_path = TEMPLATES_DIR / "_preview.html"
+        try:
+            TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+            preview_path.write_text(shell, encoding="utf-8")
+        except Exception:
+            return
+        uri = preview_path.as_uri()
+        # Module-level _open_in_edge — explicit reference to avoid
+        # shadowing by this closure's earlier name (which I renamed
+        # to _view_current_in_edge).
+        if not _open_in_edge(uri):
+            import webbrowser
+            webbrowser.open(uri, new=2)
+
+    nav_l = ctk.CTkFrame(bottom, fg_color="transparent")
+    nav_l.pack(side="left")
+    ctk.CTkButton(nav_l, text="◀ Prev", width=80, command=_prev,
+                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
+    ctk.CTkButton(nav_l, text="Next ▶", width=80, command=_next,
+                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
+    ctk.CTkButton(nav_l, text="Skip & next", width=110,
+                   command=_skip_and_next,
+                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
+    ctk.CTkButton(nav_l, text="Open this one in Edge", width=180,
+                   command=_view_current_in_edge,
+                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
+
+    nav_r = ctk.CTkFrame(bottom, fg_color="transparent")
+    nav_r.pack(side="right")
+    result_box = {"value": None}
+
+    def _do_send() -> None:
+        selected = [i for i, v in enumerate(selected_vars) if v.get()]
+        if not selected:
+            return
+        result_box["value"] = selected
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def _do_cancel() -> None:
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    send_btn = ctk.CTkButton(
+        nav_r, text="Send", width=180, command=_do_send,
+    )
+    ctk.CTkButton(
+        nav_r, text="Cancel", width=90, command=_do_cancel,
+        **SECONDARY_BTN_KWARGS,
+    ).pack(side="right", padx=2)
+    send_btn.pack(side="right", padx=2)
+
+    dialog.bind("<Escape>", lambda _e: _do_cancel())
+    dialog.bind("<Left>",   lambda _e: _prev())
+    dialog.bind("<Right>",  lambda _e: _next())
+    dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
+
+    # Initial display.
+    if rendered:
+        _show(0)
+
+    parent.wait_window(dialog)
+    return result_box["value"]
 
 
 def prompt_batch_review(
@@ -4613,8 +5239,50 @@ class App:
             if col and col not in display_columns:
                 display_columns.append(col)
 
-        # Step 4: review-and-confirm dialog (unless preview is off).
-        if scenario.batch.preview:
+        # Step 4: prompts FIRST (the new email review modal renders
+        # each student's email with these substitutions in place, so
+        # they must be collected before review).
+        prompt_vars = self._collect_prompt_vars(scenario)
+        if prompt_vars is None:
+            return  # user cancelled a prompt
+
+        # Step 5: review-and-confirm — combined per-student email
+        # preview when the scenario has an email step (FERPA-quality
+        # review of every outgoing message); column-based filter
+        # review otherwise.
+        has_email = scenario.email is not None
+        if has_email:
+            from src import outlook_email
+            user_info = outlook_email.get_user_info()
+            self._append_log(
+                f"Rendering {len(matched)} email previews for review…"
+            )
+            rendered = [
+                self._build_email_preview_data(
+                    scenario, row, prompt_vars, user_info,
+                )
+                for row in matched
+            ]
+            filter_summary = ", ".join(
+                f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
+                for f in scenario.batch.filters
+                if f.get("column")
+            )
+            selected = prompt_batch_email_review(
+                self.root, scenario.name, rendered, filter_summary,
+            )
+            if selected is None:
+                self._append_log("Batch cancelled at email review.")
+                return
+            if not selected:
+                self._append_log("Batch: no students selected; nothing to do.")
+                return
+            confirmed = [matched[i] for i in selected]
+            self._append_log(
+                f"Email review confirmed: sending to {len(confirmed)} of "
+                f"{len(matched)} students."
+            )
+        elif scenario.batch.preview:
             confirmed = prompt_batch_review(
                 self.root, scenario.name, matched, display_columns,
             )
@@ -4627,14 +5295,9 @@ class App:
         else:
             confirmed = matched
 
-        # Step 5: one-time per-batch prompts — both the new
-        # `prompts:` schema (which feeds {{var}} into bodies) and
-        # the legacy per-note `enter_additional_text` checkbox.
-        # Each input is asked ONCE before the loop and the same
-        # value is applied to every student in the batch.
-        prompt_vars = self._collect_prompt_vars(scenario)
-        if prompt_vars is None:
-            return  # user cancelled a prompt
+        # Step 6: per-note custom-body prompts and clipboard read.
+        # Same deferral as before — gathered AFTER confirmation so
+        # cancelled batches don't waste the user's typing.
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
             if not n.enter_additional_text:
@@ -4652,16 +5315,7 @@ class App:
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
 
-        # Step 6: template preview (only if an email is configured).
-        # One placeholder-rendered draft opens in Outlook; the user
-        # reviews + clicks Yes/No. Yes proceeds to the loop with
-        # auto-send for everyone; No aborts the whole batch.
         total = len(confirmed)
-        has_email = scenario.email is not None
-        if has_email:
-            if not self._show_template_preview(scenario.email, total):
-                self._append_log("Batch aborted at template preview.")
-                return
 
         # Step 7: loop. For each student: fast-find → auto-send
         # email (if configured) → file note. Everyone is treated
@@ -4854,6 +5508,105 @@ class App:
         )
         self.root.wait_variable(done_var)
         return holder["success"], holder["info"]
+
+    def _build_email_preview_data(
+        self,
+        scenario: ScenarioConfig,
+        row: dict,
+        prompt_vars: dict,
+        user_info: dict,
+    ) -> dict:
+        """Render one student's email for the batch review modal.
+        Returns the dict shape `prompt_batch_email_review` consumes.
+
+        Renders against CSV row data + the launcher user's Outlook
+        identity — NOT against the per-student DOM scrape (which
+        requires navigation we haven't done yet at review time).
+        Missing addresses are surfaced as 'no_email' issues so the
+        reviewer sees them at a glance; the actual send-time path
+        still tries the mailto + contact-card scrape to fill the
+        gaps before composing.
+
+        `user_info` is the cached Outlook CurrentUser dict passed in
+        by the caller — avoids re-dispatching COM per student."""
+        email_cfg = scenario.email
+        # Base context from the CSV row, augmented with Outlook user
+        # identity (so {{user_name}} / {{user_email}} resolve) and
+        # the batch-wide prompts (so {{summary}} et al. resolve).
+        ctx = self._ctx_from_csv_row(row)
+        ctx["user_name"] = user_info.get("name", "")
+        ctx["user_email"] = user_info.get("email", "")
+        ctx = {**ctx, **prompt_vars}
+
+        # PM email self-fallback — same logic as _send_scenario_email,
+        # mirrored here so the review shows what the send will use.
+        cc_is_self = False
+        if (email_cfg.cc_pm
+                and not ctx.get("pm_email")
+                and ctx.get("pm_name")
+                and user_info.get("email")
+                and _names_loosely_match(
+                    ctx.get("pm_name", ""), user_info.get("name", "")
+                )):
+            ctx["pm_email"] = user_info["email"]
+            cc_is_self = True
+        elif email_cfg.cc_pm and ctx.get("pm_email") and user_info.get("email"):
+            # Even if pm_email came from CSV, flag self-CC for the hint.
+            if ctx["pm_email"].strip().lower() == user_info["email"].strip().lower():
+                cc_is_self = True
+
+        # Render the template. Captures any render error so the
+        # reviewer sees it instead of silently dropping that row.
+        render_error = ""
+        body_html = ""
+        subject = ""
+        to = ""
+        cc = ""
+        try:
+            template_path = TEMPLATES_DIR / email_cfg.body_html_file
+            template_html = email_template.load_template(template_path)
+            body_html = email_template.render(template_html, ctx)
+            body_html = email_template.wrap_with_font(
+                body_html, email_cfg.font_family, email_cfg.font_size,
+            )
+            subject = email_template.render_plain(email_cfg.subject, ctx)
+            if email_cfg.to:
+                to = email_template.render_plain(email_cfg.to, ctx).strip()
+            else:
+                to = ctx.get("student_email", "") or ""
+            if email_cfg.cc_pm:
+                cc = ctx.get("pm_email", "") or ""
+        except Exception as e:
+            render_error = f"{type(e).__name__}: {e}"
+
+        issues: list[str] = []
+        if render_error:
+            issues.append(f"render error: {render_error}")
+        if not render_error and not to:
+            issues.append(
+                "no student email (will look up from Salesforce at send time)"
+            )
+        # Detect unresolved {{var}} survivors in body or subject.
+        leftover = re.findall(r"\{\{\s*(\w+)\s*\}\}", body_html + " " + subject)
+        if leftover:
+            unique = sorted(set(leftover))
+            issues.append(
+                f"unresolved variable(s): " + ", ".join(unique)
+            )
+
+        return {
+            "name": ctx.get("full_name", "") or row.get("Name", ""),
+            "student_id": ctx.get("student_id", ""),
+            "course_code": ctx.get("course_code", ""),
+            "to": to,
+            "cc": cc,
+            "cc_is_self": cc_is_self,
+            "cc_configured": bool(email_cfg.cc_pm),
+            "subject": subject,
+            "body_html": body_html,
+            "render_error": render_error,
+            "issues": issues,
+        }
 
     def _ctx_from_csv_row(self, row: dict) -> dict:
         """Build the variable dict an email/note render needs, sourced
