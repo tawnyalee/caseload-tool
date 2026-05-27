@@ -55,6 +55,8 @@ from src.student_lookup import (
     gather_fuzzy_caseload_matches,
     get_active_student_name,
     lookup_caseload_student,
+    _parse_mailto,
+    _extract_wgu_email,
 )
 
 
@@ -268,14 +270,20 @@ class BrowserWorker:
     def submit_click_match_by_filter(
         self,
         query: str,
-        on_done: Callable[[bool], None],
+        on_done: Callable[[bool, dict], None],
         expected_name: str = "",
     ) -> None:
         """Fast batch click: type `query` into Salesforce's row filter,
         wait for the table to narrow, then click the single matching
         row. If `expected_name` is set and the filter returns more
         than one row, only clicks if that name matches one — otherwise
-        aborts. ~1.5s per call vs ~25s for the full DOM scan."""
+        aborts. ~1.5s per call vs ~25s for the full DOM scan.
+
+        on_done receives `(success, row_info)` where row_info carries
+        `student_email` and `pm_email` scraped from the row's
+        `mailto:` action link BEFORE the click (and the contact card
+        AFTER the click as a fallback). Either field can be empty if
+        the page didn't surface it."""
         self.q.put((
             "CLICK_MATCH_BY_FILTER", query, expected_name, on_done,
         ))
@@ -436,8 +444,9 @@ class BrowserWorker:
         elif cmd[0] == "CLICK_MATCH_BY_FILTER":
             _, query, expected_name, on_done = cmd
             success = False
+            row_info: dict = {"pm_email": "", "student_email": ""}
             try:
-                success = self._click_match_by_filter(
+                success, row_info = self._click_match_by_filter(
                     ctx, query, expected_name=expected_name,
                 )
                 if success:
@@ -448,7 +457,7 @@ class BrowserWorker:
                         except Exception:
                             pass
             finally:
-                on_done(success)
+                on_done(success, row_info)
         elif cmd[0] == "DOWNLOAD_CASELOAD_CSV":
             _, save_path, on_done = cmd
             success, message = False, ""
@@ -707,14 +716,25 @@ class BrowserWorker:
 
     def _click_match_by_filter(
         self, ctx, query: str, expected_name: str = "",
-    ) -> bool:
+    ) -> tuple[bool, dict]:
         """Skip the slow full-table DOM scan: type `query` into
         Salesforce's row filter, wait, then click the (one) result.
         For batches with known-unique Student IDs this is ~10x faster
-        than _list_matches + _click_match_by_name."""
+        than _list_matches + _click_match_by_name.
+
+        Returns (success, row_info). When the click lands cleanly,
+        row_info is `{"pm_email": …, "student_email": …}` extracted
+        from the row's `mailto:` action link BEFORE the click (so
+        we can populate the email step in batch mode without the
+        user having to add email columns to their Caseload view in
+        Salesforce). After the click we additionally try the contact
+        card via `_extract_wgu_email` as a second source for the
+        student address. Any field we couldn't read comes back as
+        an empty string."""
+        row_info: dict = {"pm_email": "", "student_email": ""}
         target, table = self._open_caseload_table(ctx)
         if table is None:
-            return False
+            return False, row_info
         self.on_status(f"Fast-find: filtering Caseload by {query!r}...")
         try:
             filter_input = target.locator(
@@ -722,7 +742,7 @@ class BrowserWorker:
             ).filter(visible=True).first
             if filter_input.count() == 0:
                 self.on_status("No row filter input; can't fast-find.")
-                return False
+                return False, row_info
             # focus() instead of click() — when the user's Caseload
             # view has many columns the search input scrolls off the
             # viewport horizontally; click() refuses (requires viewport
@@ -734,7 +754,7 @@ class BrowserWorker:
             target.wait_for_timeout(800)
         except Exception as e:
             self.on_status(f"Fast-find filter failed for {query!r}: {e}")
-            return False
+            return False, row_info
 
         # Resolve Name column index on the filtered table.
         headers_raw = table.locator("th").all_text_contents()
@@ -752,7 +772,7 @@ class BrowserWorker:
             )
         if name_idx is None:
             self.on_status("Fast-find: no Name column found.")
-            return False
+            return False, row_info
 
         # Collect matching rows from the filtered table.
         rows_loc = table.locator("tr")
@@ -772,7 +792,7 @@ class BrowserWorker:
 
         if not candidates:
             self.on_status(f"Fast-find: {query!r} returned 0 rows.")
-            return False
+            return False, row_info
 
         # Disambiguate via expected_name (the row we matched in main).
         if expected_name:
@@ -784,23 +804,60 @@ class BrowserWorker:
                     f"Fast-find {query!r}: {len(candidates)} rows but "
                     f"none named {expected_name!r}; skipping."
                 )
-                return False
+                return False, row_info
         elif len(candidates) > 1:
             names = ", ".join(c[1] for c in candidates)
             self.on_status(
                 f"Fast-find {query!r}: {len(candidates)} ambiguous rows "
                 f"({names}); skipping (no expected_name to disambiguate)."
             )
-            return False
+            return False, row_info
         else:
             chosen = candidates[0]
 
         row, cname, name_idx = chosen
-        if click_caseload_row(row, cname, name_idx, on_status=self.on_status):
-            self.on_status(f"Fast-find navigated to {cname!r}.")
-            return True
-        self.on_status(f"Fast-find: click on {cname!r} failed.")
-        return False
+
+        # BEFORE clicking: scrape the row's "Email Student" mailto
+        # link. Historically Salesforce puts the PM as primary and
+        # the student as CC in that link, so we can capture both for
+        # free here — much more reliable than re-scraping after we've
+        # navigated away from Caseload. Best-effort: failure here
+        # doesn't block the click; the batch can still proceed with
+        # whatever the CSV row provided.
+        try:
+            mailtos = row.locator('a[href^="mailto:"]')
+            if mailtos.count() > 0:
+                href = mailtos.first.get_attribute("href") or ""
+                primary, cc = _parse_mailto(href)
+                if "@" in primary:
+                    row_info["pm_email"] = primary
+                if "@" in cc:
+                    row_info["student_email"] = cc
+        except Exception:
+            pass
+
+        if not click_caseload_row(row, cname, name_idx, on_status=self.on_status):
+            self.on_status(f"Fast-find: click on {cname!r} failed.")
+            return False, row_info
+        self.on_status(f"Fast-find navigated to {cname!r}.")
+
+        # AFTER clicking: when the row's mailto didn't carry the
+        # student address (some Salesforce configs only put the PM
+        # there), try the contact card on the student's record page
+        # via _extract_wgu_email. The 2s wait downstream in the
+        # dispatch loop is the page-settling cue; this just runs as
+        # an opportunistic second pass.
+        if not row_info["student_email"]:
+            try:
+                tgt = self._active_page(ctx)
+                if tgt is not None:
+                    found = _extract_wgu_email(tgt)
+                    if found:
+                        row_info["student_email"] = found
+            except Exception:
+                pass
+
+        return True, row_info
 
     def _read_student_context(self, ctx, name_hint: str = "") -> Optional[dict]:
         """Build the variable dict used to render emails and notes.
@@ -4542,10 +4599,14 @@ class App:
             )
 
             # 7a. Fast-find: row filter on Student ID, then click.
+            # The worker also scrapes mailto: emails off the row
+            # BEFORE clicking + the contact card AFTER, so we can
+            # fill in addresses the CSV view didn't include.
             query = student_id or student_name
-            if not self._click_match_by_filter_blocking(
+            click_ok, row_emails = self._click_match_by_filter_blocking(
                 query, expected_name=student_name,
-            ):
+            )
+            if not click_ok:
                 self._append_log(
                     f"Skipping {student_name!r}: fast-find failed."
                 )
@@ -4558,36 +4619,40 @@ class App:
             # style placeholders in the email body / subject / to
             # resolve against the batch-wide prompt input.
             if has_email:
-                # Build context from the CSV row directly. The earlier
-                # _get_student_context_blocking path scraped the
-                # Caseload table in the DOM — but after fast-find
-                # we're on the student's record page, that table
-                # isn't there, so the scrape always returned empty
-                # emails. The CSV has everything we need.
+                # Build context from the CSV row, then fill any gaps
+                # from the row-level mailto + contact-card scrape we
+                # did during fast-find. The two sources together
+                # mean a user whose Caseload view doesn't include
+                # email columns still gets working batch emails —
+                # mailto carries the PM, the contact card surfaces
+                # the student, the CSV provides everything else.
                 ctx_info = self._ctx_from_csv_row(row)
-                # One-time diagnostic the first time emails are
-                # missing: list what email-looking columns ARE in the
-                # CSV. Helps the user add the right column name to
-                # their Caseload list view in Salesforce.
-                if not ctx_info["student_email"] and not self._email_diag_logged:
+                if not ctx_info["student_email"] and row_emails.get("student_email"):
+                    ctx_info["student_email"] = row_emails["student_email"]
+                if not ctx_info["pm_email"] and row_emails.get("pm_email"):
+                    ctx_info["pm_email"] = row_emails["pm_email"]
+                # One-time diagnostic only if BOTH sources came back
+                # empty — that points at a Salesforce config issue
+                # the user has to fix in their list view.
+                if (not ctx_info["student_email"]
+                        and not self._email_diag_logged):
                     self._email_diag_logged = True
                     present = _email_columns_present(row)
                     if present:
                         self._append_log(
                             "CSV email columns found but not recognized: "
                             + ", ".join(repr(c) for c in present) + ". "
-                            "Tell the launcher dev to add these names to "
-                            "the known list, or rename your Caseload view "
-                            "columns to one of: Student Email / "
-                            "Mentor Email."
+                            "Either rename your Caseload-view columns to "
+                            "'Student Email' / 'Mentor Email', or tell the "
+                            "launcher dev to add these names to the alias "
+                            "list."
                         )
                     else:
                         self._append_log(
-                            "Your caseload CSV has no email columns. "
-                            "In Salesforce, add 'Student Email' and "
-                            "'Program Mentor Email' (or similar) columns "
-                            "to your Caseload list view, then click "
-                            "↻ Caseload to refresh."
+                            "Neither the CSV nor the row's Email-Student "
+                            "link surfaced a student email. The PM "
+                            "scrape may still have succeeded — check the "
+                            "next attempt's log line."
                         )
                 ctx_info = {**ctx_info, **prompt_vars}
                 if not self._send_scenario_email(
@@ -4682,27 +4747,36 @@ class App:
 
     def _click_match_by_filter_blocking(
         self, query: str, expected_name: str = "",
-    ) -> bool:
+    ) -> tuple[bool, dict]:
         """Batch fast path: type the unique value into Caseload's row
-        filter and click the result. Returns True on success."""
+        filter and click the result. Returns `(success, row_info)`
+        where row_info carries `student_email` and `pm_email`
+        scraped from the row before the click (and the contact card
+        after). Either email can be empty if the page didn't surface
+        it; caller decides how to handle the gap."""
         done_var = tk.BooleanVar(value=False)
-        holder: dict = {"success": False}
+        holder: dict = {
+            "success": False,
+            "info": {"pm_email": "", "student_email": ""},
+        }
 
-        def on_done(success: bool) -> None:
+        def on_done(success: bool, info: dict) -> None:
             def set_main() -> None:
                 holder["success"] = success
+                holder["info"] = info or holder["info"]
                 done_var.set(True)
             try:
                 self.root.after(0, set_main)
             except Exception:
                 holder["success"] = success
+                holder["info"] = info or holder["info"]
                 done_var.set(True)
 
         self.worker.submit_click_match_by_filter(
             query, on_done, expected_name=expected_name,
         )
         self.root.wait_variable(done_var)
-        return holder["success"]
+        return holder["success"], holder["info"]
 
     def _ctx_from_csv_row(self, row: dict) -> dict:
         """Build the variable dict an email/note render needs, sourced
