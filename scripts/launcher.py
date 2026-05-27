@@ -1390,6 +1390,39 @@ _TEMPLATE_INSERT_VARS_USER = [
 ]
 
 
+# Per-appearance-mode color palette for the HTML editor's syntax
+# highlighter. Picked to read clearly on each background without
+# requiring an exact theme match; close to VS Code defaults.
+_HTML_HIGHLIGHT_COLORS: dict[str, dict[str, str]] = {
+    "Dark": {
+        "comment": "#6a9955",   # mossy green
+        "tag":     "#569cd6",   # sky blue
+        "value":   "#ce9178",   # warm orange
+        "var_fg":  "#ffd966",   # gold
+        "var_bg":  "#3a3520",   # dim amber
+    },
+    "Light": {
+        "comment": "#008000",   # green
+        "tag":     "#800080",   # purple — classic HTML-tag color
+        "value":   "#a31515",   # dark red
+        "var_fg":  "#0451a5",   # navy
+        "var_bg":  "#fff3c4",   # pale yellow
+    },
+}
+
+# Compiled regex patterns reused across every highlight pass.
+# Comments come first (multi-line, can swallow `<`); tag pattern is
+# non-greedy and matches up to the next `>`; var pattern matches
+# `{{ name }}` with optional whitespace.
+import re as _re_html
+_HTML_HIGHLIGHT_PATTERNS: dict[str, "_re_html.Pattern"] = {
+    "comment": _re_html.compile(r"<!--[\s\S]*?-->"),
+    "tag":     _re_html.compile(r"</?[a-zA-Z][^>]*?>", _re_html.DOTALL),
+    "var":     _re_html.compile(r"\{\{\s*\w+\s*\}\}"),
+    "value":   _re_html.compile(r'"[^"]*"'),
+}
+
+
 def _open_in_edge(uri: str) -> bool:
     """Launch Microsoft Edge with `uri`. If Edge is already running,
     the URL opens as a new tab (standard Edge behavior on Windows);
@@ -1822,6 +1855,92 @@ def prompt_html_template_editor(
     text_box.insert("1.0", content)
     text_box.focus_force()
     text_box.mark_set("insert", "1.0")
+
+    # ---- Syntax highlighting. ----
+    # CTkTextbox wraps a tk.Text — its tag system handles colored
+    # ranges. We do a full re-tag on every edit (debounced ~120ms)
+    # rather than incremental scanning; for template-sized buffers
+    # this is well under a millisecond per pass and avoids tricky
+    # boundary bookkeeping when text is inserted via the variable
+    # buttons.
+    inner_text = text_box._textbox
+    highlight_after = {"id": None}
+
+    def apply_highlighting() -> None:
+        mode = ctk.get_appearance_mode()
+        colors = _HTML_HIGHLIGHT_COLORS.get(
+            mode, _HTML_HIGHLIGHT_COLORS["Light"],
+        )
+        # tag_configure is idempotent; re-applying same color is fine
+        # and lets us pick up appearance-mode changes for free.
+        inner_text.tag_configure("html_comment", foreground=colors["comment"])
+        inner_text.tag_configure("html_tag",     foreground=colors["tag"])
+        inner_text.tag_configure("html_value",   foreground=colors["value"])
+        inner_text.tag_configure(
+            "html_var",
+            foreground=colors["var_fg"], background=colors["var_bg"],
+        )
+        for tag in ("html_comment", "html_tag", "html_value", "html_var"):
+            inner_text.tag_remove(tag, "1.0", "end")
+
+        buf = inner_text.get("1.0", "end-1c")
+        if not buf:
+            return
+
+        def _idx(off: int) -> str:
+            return inner_text.index(f"1.0 + {off} chars")
+
+        # Pass 1 — comments. Done first because they can legally
+        # contain `<` / `>` / `{{` and shouldn't be re-colored by
+        # later passes.
+        comment_ranges: list[tuple[int, int]] = []
+        for m in _HTML_HIGHLIGHT_PATTERNS["comment"].finditer(buf):
+            comment_ranges.append((m.start(), m.end()))
+            inner_text.tag_add("html_comment", _idx(m.start()), _idx(m.end()))
+
+        def _in_comment(pos: int) -> bool:
+            return any(a <= pos < b for a, b in comment_ranges)
+
+        # Pass 2 — tags + their quoted attribute values. We do values
+        # nested per-tag-match so a stray `"…"` in body text doesn't
+        # get colored as if it were an attribute value.
+        for m in _HTML_HIGHLIGHT_PATTERNS["tag"].finditer(buf):
+            if _in_comment(m.start()):
+                continue
+            inner_text.tag_add("html_tag", _idx(m.start()), _idx(m.end()))
+            tag_text = m.group(0)
+            for vm in _HTML_HIGHLIGHT_PATTERNS["value"].finditer(tag_text):
+                inner_text.tag_add(
+                    "html_value",
+                    _idx(m.start() + vm.start()),
+                    _idx(m.start() + vm.end()),
+                )
+
+        # Pass 3 — template variables.
+        for m in _HTML_HIGHLIGHT_PATTERNS["var"].finditer(buf):
+            if _in_comment(m.start()):
+                continue
+            inner_text.tag_add("html_var", _idx(m.start()), _idx(m.end()))
+
+    def on_text_modified(_event=None) -> None:
+        # Tk fires <<Modified>> exactly once when the modified flag
+        # flips from False → True. Reset it here so subsequent edits
+        # fire again. Debounce so a long paste doesn't trigger N
+        # re-passes mid-paste.
+        if not inner_text.edit_modified():
+            return
+        inner_text.edit_modified(False)
+        aid = highlight_after["id"]
+        if aid is not None:
+            try: text_box.after_cancel(aid)
+            except Exception: pass
+        highlight_after["id"] = text_box.after(120, apply_highlighting)
+
+    inner_text.bind("<<Modified>>", on_text_modified)
+    # Initial pass — the loaded buffer needs coloring before the user
+    # types anything. Run after a 0ms tick so the textbox is fully
+    # laid out (tag_add can no-op against a not-yet-laid-out widget).
+    text_box.after(0, apply_highlighting)
 
     # Ctrl+MouseWheel and Ctrl+= / Ctrl+- to zoom the editor view.
     def zoom(delta: int) -> str:
