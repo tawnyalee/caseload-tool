@@ -3350,8 +3350,10 @@ class ScenarioEditor:
             **SECONDARY_BTN_KWARGS,
         ).grid(row=0, column=3, padx=(4, 0))
 
-        # To override (variable substitution allowed)
-        ctk.CTkLabel(frame, text="To override").grid(
+        # Email override — the To: field on the outgoing message
+        # (variable substitution allowed). Empty falls back to
+        # {{student_email}} from the caseload row.
+        ctk.CTkLabel(frame, text="Email override").grid(
             row=2, column=0, sticky="w", padx=8, pady=(4, 0),
         )
         self.email_to_entry = ctk.CTkEntry(
@@ -3840,7 +3842,7 @@ class App:
         cc_frame = ctk.CTkFrame(pane)
         cc_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
         cc_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(cc_frame, text="Course code:").grid(row=0, column=0, padx=8, pady=8)
+        ctk.CTkLabel(cc_frame, text="Override Course Code:").grid(row=0, column=0, padx=8, pady=8)
         self.course_var = ctk.StringVar()
         ctk.CTkEntry(
             cc_frame, textvariable=self.course_var,
