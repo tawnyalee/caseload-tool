@@ -3417,12 +3417,16 @@ class FilterRow:
 
         if op in date_ops:
             self.value_combo.configure(state="normal", values=[
-                "today", "today-7d", "today-30d",
-                "today+7d", "today+30d",
+                "today",
+                "today-7d", "today-14d", "today-30d",
+                "today-60d", "today-90d",
+                "today+7d", "today+14d", "today+30d",
+                "today+60d", "today+90d",
             ])
             self.hint_label.configure(
-                text="Date — pick a relative shorthand from the dropdown, "
-                     "or type 2026-05-21 / 5/21/2026.",
+                text="Date — pick a preset from the dropdown OR type any "
+                     "offset like today-21d / today+45d, or an absolute "
+                     "date like 2026-05-21 / 5/21/2026.",
             )
         elif op == "is within":
             self.value_combo.configure(
@@ -4834,8 +4838,14 @@ class App:
         except Exception as e:
             self._append_log(f"Could not save new scenario: {e}")
             return
+        # Defer the tab switch one mainloop tick. Without this the
+        # set() runs before CTkTabview has finished laying out the
+        # freshly-built tab content; the user sees an empty pane
+        # until they click another tab + back. `after(0, …)` lets
+        # the pending geometry events flush first so the new tab
+        # is fully drawn before we switch to it.
         try:
-            self.tabview.set(name)
+            self.root.after(0, lambda: self.tabview.set(name))
         except Exception:
             pass
 
