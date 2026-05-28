@@ -1238,40 +1238,115 @@ class BrowserWorker:
         target.wait_for_timeout(800)
 
         # ---- Step 3: type the new list view name. ----
+        # After 'Save As New List View' is clicked, the popup
+        # transforms to show a "New List View Name" input. Wait for
+        # it to render, then scope to the visible modal first so
+        # generic input selectors don't accidentally match form
+        # elements elsewhere on the page.
         self.on_status("Setup [3/8]: typing 'Caseload Tool' as view name…")
-        name_selectors = [
-            'input[name="newListViewName"]',
-            'input[placeholder*="List View Name"]',
-            # Generic — input nearest a "List View Name" label.
-            'input[aria-label*="List View Name"]',
-            'input[aria-label*="Name"]',
-        ]
-        filled = False
-        for sel in name_selectors:
+        target.wait_for_timeout(1000)
+        modal = None
+        for msel in (
+            'section[role="dialog"]',
+            'div.slds-modal',
+            'div[role="dialog"]',
+            'div.modal-container',
+        ):
             try:
-                inp = target.locator(sel).filter(visible=True).first
-                if inp.count() > 0:
-                    inp.fill("Caseload Tool", timeout=3000)
-                    filled = True
-                    self.on_status(f"  ✓ filled via selector: {sel}")
+                m = target.locator(msel).filter(visible=True).first
+                if m.count() > 0:
+                    modal = m
+                    self.on_status(f"  → modal scope: {msel}")
                     break
             except Exception:
                 continue
-        if not filled:
+
+        name_input = None
+        # Try label-based discovery first (most robust against
+        # Salesforce class-name changes).
+        if modal is not None:
+            for label_text in (
+                "New List View Name", "List View Name",
+                "List Name", "Name",
+            ):
+                try:
+                    inp = modal.get_by_label(
+                        label_text, exact=False,
+                    ).filter(visible=True).first
+                    if inp.count() > 0:
+                        name_input = inp
+                        self.on_status(f"  → label: {label_text!r}")
+                        break
+                except Exception:
+                    continue
+        # Fall back: any visible text-ish input inside the modal.
+        if name_input is None and modal is not None:
+            for sel in (
+                'input[type="text"]',
+                'lightning-input input',
+                'input:not([type])',
+            ):
+                try:
+                    inp = modal.locator(sel).filter(visible=True).first
+                    if inp.count() > 0:
+                        name_input = inp
+                        self.on_status(f"  → fallback: {sel}")
+                        break
+                except Exception:
+                    continue
+        # Last resort: page-wide label lookup.
+        if name_input is None:
+            try:
+                inp = target.get_by_label(
+                    "New List View Name", exact=False,
+                ).filter(visible=True).first
+                if inp.count() > 0:
+                    name_input = inp
+                    self.on_status("  → page-wide label fallback")
+            except Exception:
+                pass
+
+        if name_input is None or name_input.count() == 0:
             return False, (
-                "couldn't find the new-view name input. Tried selectors: "
-                + ", ".join(repr(s) for s in name_selectors)
+                "couldn't find the new-view name input. The 'Save As "
+                "New List View' popup may use a non-standard input — "
+                "look at the actual DOM and tell me the input's "
+                "aria-label, name, or placeholder."
             )
 
+        try:
+            name_input.click(timeout=3000)
+            name_input.fill("")  # clear any pre-fill
+            name_input.fill("Caseload Tool", timeout=3000)
+            self.on_status("  ✓ typed 'Caseload Tool'")
+        except Exception as e:
+            return False, f"couldn't type into name field: {e}"
+
         # ---- Step 4: click Save to create the view. ----
+        # Scope to the modal so we don't grab a stale Save button
+        # from earlier in the page. Falls back to page-wide if the
+        # modal scope didn't resolve.
         self.on_status("Setup [4/8]: clicking Save (create view)…")
         try:
-            # The Save button in the modal — typically the only
-            # primary-styled button visible. Take the last in case
-            # we're matching across stale modals.
-            save_btn = target.get_by_role(
-                "button", name="Save",
-            ).filter(visible=True).last
+            save_btn = None
+            if modal is not None:
+                save_btn = modal.get_by_role(
+                    "button", name="Save",
+                ).filter(visible=True).first
+                if save_btn.count() == 0:
+                    # Common variants
+                    for sel in (
+                        'button:has-text("Save")',
+                        'button[title="Save"]',
+                    ):
+                        b = modal.locator(sel).filter(visible=True).first
+                        if b.count() > 0:
+                            save_btn = b
+                            break
+            if save_btn is None or save_btn.count() == 0:
+                save_btn = target.get_by_role(
+                    "button", name="Save",
+                ).filter(visible=True).last
             save_btn.click(timeout=5000)
         except Exception as e:
             return False, f"couldn't click Save (create view): {e}"
@@ -1310,54 +1385,105 @@ class BrowserWorker:
                 )
         target.wait_for_timeout(800)
 
-        # ---- Step 6: select Email in Available, move to Selected. ----
-        self.on_status("Setup [6/8]: finding Email row in Available list…")
-        try:
-            # Available column is the left listbox. Try a few patterns.
+        # ---- Step 6a: check whether Email is already in Selected. ----
+        # Save As inherits all columns from the parent view. If the
+        # user's default view already had Email as a visible column,
+        # the new view will have it too — no need to move it. Skip
+        # straight to Save in that case.
+        self.on_status("Setup [6/8]: checking column picker state…")
+        selected_box = None
+        for sel in (
+            '[role="listbox"][aria-label*="Selected" i]',
+            '[role="listbox"][aria-label*="Visible" i]',
+            'div[aria-label*="Selected Columns" i]',
+            'ul[aria-label*="Selected" i]',
+            'ul[aria-label*="Visible" i]',
+        ):
+            try:
+                box = target.locator(sel).filter(visible=True).first
+                if box.count() > 0:
+                    selected_box = box
+                    self.on_status(f"  → Selected list: {sel}")
+                    break
+            except Exception:
+                continue
+
+        email_already_selected = False
+        if selected_box is not None:
+            try:
+                already = selected_box.get_by_text(
+                    "Email", exact=True,
+                ).filter(visible=True)
+                if already.count() > 0:
+                    email_already_selected = True
+                    self.on_status(
+                        "  ✓ 'Email' is already in Selected — no move needed"
+                    )
+            except Exception:
+                pass
+
+        # ---- Step 6b: if not already selected, find + move it. ----
+        if not email_already_selected:
+            self.on_status("Setup [6/8]: looking for Email in Available list…")
             available_box = None
             for sel in (
                 '[role="listbox"][aria-label*="Available" i]',
                 'div[aria-label*="Available Columns" i]',
                 'ul[aria-label*="Available" i]',
             ):
-                box = target.locator(sel).filter(visible=True).first
-                if box.count() > 0:
-                    available_box = box
-                    break
+                try:
+                    box = target.locator(sel).filter(visible=True).first
+                    if box.count() > 0:
+                        available_box = box
+                        self.on_status(f"  → Available list: {sel}")
+                        break
+                except Exception:
+                    continue
             if available_box is None:
-                return False, "couldn't find the Available Columns list"
-            # Click the row whose text is exactly "Email".
-            email_row = available_box.get_by_text("Email", exact=True).first
-            email_row.click(timeout=3000)
-            self.on_status("  ✓ selected 'Email' row")
-        except Exception as e:
-            return False, f"couldn't select Email row: {e}"
+                return False, (
+                    "couldn't find the Available Columns list — and "
+                    "Email isn't in Selected either. The column picker "
+                    "may use a non-standard structure."
+                )
+            try:
+                email_row = available_box.get_by_text(
+                    "Email", exact=True,
+                ).filter(visible=True).first
+                if email_row.count() == 0:
+                    return False, (
+                        "couldn't find an 'Email' row in Available "
+                        "Columns. Your Salesforce org may use a "
+                        "different label — check Available and tell me "
+                        "the exact column name."
+                    )
+                email_row.click(timeout=3000)
+                self.on_status("  ✓ selected 'Email' row in Available")
+            except Exception as e:
+                return False, f"couldn't select Email row: {e}"
 
-        self.on_status("Setup [6/8]: clicking ► to move Email to Selected…")
-        try:
-            # The move-right button — most likely a button with a title
-            # like "Add" / "Move selection to chosen list".
-            move_btn = None
-            for sel in (
-                'button[title*="Move selection to" i]',
-                'button[title*="Add" i][title*="Visible" i]',
-                'button[title*="Add" i][title*="Selected" i]',
-                'lightning-button-icon[title*="Add" i]',
-                'button[title="Add"]',
-                # Generic right-arrow / chevron-right icons.
-                'button:has(lightning-primitive-icon[icon-name*="right"])',
-            ):
-                btn = target.locator(sel).filter(visible=True).first
-                if btn.count() > 0:
-                    move_btn = btn
-                    break
-            if move_btn is None:
-                return False, "couldn't find the ► (move right) button"
-            move_btn.click(timeout=3000)
-            self.on_status("  ✓ Email moved to Selected")
-        except Exception as e:
-            return False, f"couldn't click ► to move Email: {e}"
-        target.wait_for_timeout(500)
+            self.on_status("Setup [6/8]: clicking ► to move Email to Selected…")
+            try:
+                move_btn = None
+                for sel in (
+                    'button[title*="Move selection to" i]',
+                    'button[title*="Add" i][title*="Visible" i]',
+                    'button[title*="Add" i][title*="Selected" i]',
+                    'lightning-button-icon[title*="Add" i]',
+                    'button[title="Add"]',
+                    'button:has(lightning-primitive-icon[icon-name*="right"])',
+                ):
+                    btn = target.locator(sel).filter(visible=True).first
+                    if btn.count() > 0:
+                        move_btn = btn
+                        self.on_status(f"  → move button: {sel}")
+                        break
+                if move_btn is None:
+                    return False, "couldn't find the ► (move right) button"
+                move_btn.click(timeout=3000)
+                self.on_status("  ✓ Email moved to Selected")
+            except Exception as e:
+                return False, f"couldn't click ► to move Email: {e}"
+            target.wait_for_timeout(500)
 
         # ---- Step 7: save the column picker. ----
         self.on_status("Setup [7/8]: clicking Save (column picker)…")
