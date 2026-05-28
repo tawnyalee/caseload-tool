@@ -123,6 +123,11 @@ class Settings:
     "basic user" configuration — advanced features hidden until the
     user opts in via the Settings dialog."""
     advanced_mode: bool = False
+    # Set True once the user has been through the first-run setup
+    # (mode picker + Caseload Tool view introduction). When False on
+    # startup, the launcher pops the first-run welcome dialog before
+    # anything else happens.
+    first_run_complete: bool = False
 
 
 def load_settings() -> Settings:

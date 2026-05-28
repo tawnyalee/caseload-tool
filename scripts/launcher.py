@@ -1565,6 +1565,24 @@ def _email_columns_present(row: dict) -> list[str]:
     return [k for k in row.keys() if "email" in k.lower()]
 
 
+def _csv_has_student_email_column(rows: list[dict]) -> bool:
+    """Return True iff the cached caseload rows include any
+    student-email column the launcher knows how to read. Used by
+    the pre-batch warning to detect when the Caseload Tool view
+    hasn't been set up yet (and email lookup will have to fall
+    back to per-student row-mailto + contact-card scraping)."""
+    if not rows:
+        return False
+    headers = set(rows[0].keys())
+    for alias in _CSV_STUDENT_EMAIL_COLS:
+        if alias in headers:
+            return True
+    # Lowercase tolerance for orgs that use a non-standard casing
+    # of "Email" (just shows up as "Email" / "email").
+    lc = {h.lower() for h in headers}
+    return "email" in lc
+
+
 # Per-appearance-mode color palette for the HTML editor's syntax
 # highlighter. Picked to read clearly on each background without
 # requiring an exact theme match; close to VS Code defaults.
@@ -4918,6 +4936,14 @@ class App:
         # DOM-scroll scrape — slower but always works.
         self._caseload_rows: Optional[list[dict]] = None
         self._caseload_csv_mtime = None
+        # Updated by _reload_caseload_cache; True iff the cached CSV
+        # carries a student-email column the launcher recognizes.
+        # Drives the Settings status line + pre-batch warning when
+        # the Caseload Tool view hasn't been set up yet.
+        self._csv_has_student_email: bool = False
+        # Session latch: "Don't ask this session" choice from the
+        # pre-batch CSV-email warning. Reset every restart.
+        self._csv_email_warning_skipped: bool = False
         # Latch for the per-session CSV-email-columns diagnostic. We
         # log the helpful "your CSV doesn't have an email column we
         # recognize, here's what IS there" message once per session
@@ -4968,6 +4994,14 @@ class App:
         # so toolbar geometry events have flushed before we start
         # pack_forget-ing the Capture button.
         self.root.after(0, self._apply_advanced_mode)
+
+        # First-run popup: if the user hasn't been through the
+        # welcome flow yet, pop it after the main UI has settled.
+        # Deferred so the launcher window is visible behind it
+        # (popping before the main window paints makes the dialog
+        # look orphaned).
+        if not self.settings.first_run_complete:
+            self.root.after(400, self._show_first_run_setup)
 
         # Once the worker has the browser open, auto-refresh the
         # caseload CSV in the background so the first batch fire is
@@ -5632,6 +5666,18 @@ class App:
         if not self._confirm_submit_off_or_abort(scenario, batch=True):
             self._append_log(
                 f"Batch {scenario.name!r}: aborted at submit-unchecked warning."
+            )
+            return
+
+        # Pre-flight: CSV missing the student-email column. Warn ONCE
+        # per session (skip latch is honored on subsequent fires) so
+        # the user can opt to set up the Caseload Tool view, accept
+        # the slower fallback for now, or skip the question for the
+        # session.
+        if not self._confirm_csv_email_present_or_proceed(scenario):
+            self._append_log(
+                f"Batch {scenario.name!r}: aborted at "
+                "CSV-no-email warning."
             )
             return
 
@@ -6526,8 +6572,9 @@ class App:
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
 
     def _open_settings(self) -> None:
-        """Modal for user preferences. Currently just the advanced /
-        developer-mode toggle; designed to grow as new prefs land.
+        """Modal for user preferences. Currently the advanced /
+        developer-mode toggle + Caseload Tool view status. Designed
+        to grow as new prefs land.
 
         Topmost + grab so it can't get buried. Saves to settings.json
         and applies the change immediately (re-runs the visibility
@@ -6537,7 +6584,7 @@ class App:
         dialog.transient(self.root)
         dialog.attributes("-topmost", True)
         dialog.grab_set()
-        dialog.geometry("520x420")
+        dialog.geometry("560x560")
         dialog.lift()
         dialog.focus_force()
 
@@ -6567,10 +6614,10 @@ class App:
                 "  •  🔬 Capture button  (network traffic recording — "
                 "for REST API discovery)"
             ),
-            wraplength=470, justify="left",
+            wraplength=510, justify="left",
             text_color=("gray35", "gray70"),
             anchor="w",
-        ).pack(fill="x", padx=32, pady=(0, 14))
+        ).pack(fill="x", padx=32, pady=(0, 6))
 
         ctk.CTkLabel(
             dialog,
@@ -6579,11 +6626,45 @@ class App:
                 "fields stay visible regardless of this setting so you "
                 "can see and edit them."
             ),
-            wraplength=470, justify="left",
+            wraplength=510, justify="left",
             text_color=("gray45", "gray60"),
             font=ctk.CTkFont(size=11, slant="italic"),
             anchor="w",
         ).pack(fill="x", padx=32, pady=(0, 14))
+
+        # Caseload Tool view section — status + setup button.
+        # Separator
+        sep = ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35"))
+        sep.pack(fill="x", padx=20, pady=(2, 10))
+
+        ctk.CTkLabel(
+            dialog, text="Salesforce Caseload view",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 4))
+
+        if self._csv_has_student_email:
+            status_text = "✓  Student-email column detected in cached CSV."
+            status_color = ("#2d7d2d", "#7fd97f")
+        else:
+            status_text = (
+                "⚠  Cached CSV doesn't include a student-email column. "
+                "Batch emails will fall back to slower per-student "
+                "scraping at send time."
+            )
+            status_color = ("#7a4f00", "#ffd166")
+        ctk.CTkLabel(
+            dialog, text=status_text,
+            wraplength=510, justify="left",
+            text_color=status_color, anchor="w",
+            font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=32, pady=(0, 8))
+
+        ctk.CTkButton(
+            dialog, text="Set up / refresh Caseload Tool view",
+            command=lambda: self._setup_caseload_tool_view_with_help(dialog),
+            width=260,
+        ).pack(anchor="w", padx=32, pady=(0, 12))
 
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
@@ -6615,6 +6696,306 @@ class App:
         ).pack(side="left", padx=4)
         dialog.bind("<Escape>", lambda _e: _do_cancel())
         dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
+
+    def _setup_caseload_tool_view_with_help(self, parent_dialog=None) -> None:
+        """Entry point for the Caseload Tool view setup. For now,
+        this is a stub that just shows the manual setup instructions
+        (the actual Playwright automation lands in a follow-up
+        commit). Documented in the help dialog as a manual-walkthrough
+        flow so users aren't blocked while the automation is built."""
+        self._show_caseload_view_help(parent_dialog or self.root)
+
+    def _show_caseload_view_help(self, parent) -> None:
+        """Step-by-step manual setup instructions for creating the
+        'Caseload Tool' list view. Shipped as the first-iteration
+        flow AND as the fallback for when the automation can't
+        complete a step against an unfamiliar Salesforce UI."""
+        dialog = ctk.CTkToplevel(parent)
+        dialog.title("Set up Caseload Tool view")
+        dialog.transient(parent)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("640x600")
+        dialog.lift()
+        dialog.focus_force()
+
+        ctk.CTkLabel(
+            dialog,
+            text="Set up the Caseload Tool view (manual)",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(18, 4))
+
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "Automation is coming soon. For now, follow these steps "
+                "in Salesforce — one-time setup, ~3 minutes."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            wraplength=580, justify="left", anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 10))
+
+        instructions = (
+            "1. Open the Caseload page in Salesforce.\n\n"
+            "2. To the right of the List Views dropdown, click the\n"
+            "   small disk icon (it's next to the trash icon).\n\n"
+            "3. In the 'Update Existing List View' popup, click\n"
+            "   'Save As New List View ➕' (top right of the popup).\n\n"
+            "4. Type   Caseload Tool   as the name.\n\n"
+            "5. Permissions: leave as 'Myself' so only you see the view.\n\n"
+            "6. Click 'Save'. The view is created and selected.\n\n"
+            "7. Click the gear icon (or the 'Hidden Columns' link) to\n"
+            "   open the column picker.\n\n"
+            "8. In Available Columns, find any rows with 'Email' in\n"
+            "   the name (likely just 'Email'). For each:\n"
+            "     - click the row\n"
+            "     - click the ►  arrow to move it to Selected Columns\n\n"
+            "9. Click 'Save' on the column picker.\n\n"
+            "10. (Optional) If the view inherited a filter from your\n"
+            "    previous view (e.g., 'Term End Date =(This Month)'),\n"
+            "    open the filter editor and remove it so the launcher\n"
+            "    sees all your students.\n\n"
+            "11. Back in the launcher, click ↻ Caseload to download\n"
+            "    the new CSV with the email column.\n\n"
+            "Going forward, the launcher will use this view "
+            "automatically. The Settings dialog confirms when "
+            "Student Email is detected in the CSV."
+        )
+
+        text = ctk.CTkTextbox(
+            dialog, wrap="word",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+        )
+        text.pack(fill="both", expand=True, padx=20, pady=8)
+        text.insert("1.0", instructions)
+        text.configure(state="disabled")
+
+        ctk.CTkButton(
+            dialog, text="Close", command=lambda: dialog.destroy(),
+            width=120,
+        ).pack(pady=(0, 16))
+
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+    def _show_first_run_setup(self) -> None:
+        """Modal that pops on first launch (settings.first_run_complete
+        is False). Welcome message, mode picker, optional Caseload
+        Tool view setup. On Continue, sets first_run_complete=True
+        and applies the chosen mode. The dialog is mandatory — close
+        via Continue, no Cancel."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Welcome to Caseload Notes")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("600x600")
+        dialog.lift()
+        dialog.focus_force()
+        # Repeat focus claw-back so the dialog can't get buried
+        # under the launcher window during the first-show pass.
+        dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
+
+        ctk.CTkLabel(
+            dialog, text="Welcome to Caseload Notes",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(20, 4))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "A couple of choices to get you set up. You can change "
+                "either of these later from the ⚙ Settings dialog."
+            ),
+            font=ctk.CTkFont(size=12),
+            text_color=("gray35", "gray70"),
+            wraplength=540, justify="left", anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 16))
+
+        # --- Mode picker.
+        mode_frame = ctk.CTkFrame(
+            dialog, fg_color=("gray92", "gray18"), corner_radius=6,
+        )
+        mode_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(
+            mode_frame, text="1.  Editor mode",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 4))
+
+        mode_var = ctk.StringVar(
+            value="advanced" if self.settings.advanced_mode else "basic",
+        )
+
+        ctk.CTkRadioButton(
+            mode_frame, text="Simple   (recommended for most users)",
+            variable=mode_var, value="basic",
+        ).pack(anchor="w", padx=24, pady=(0, 2))
+        ctk.CTkLabel(
+            mode_frame,
+            text=(
+                "Hides advanced options (variables, inline images, "
+                "font overrides, network capture)."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            wraplength=480, justify="left",
+        ).pack(anchor="w", padx=44, pady=(0, 8))
+
+        ctk.CTkRadioButton(
+            mode_frame, text="Advanced",
+            variable=mode_var, value="advanced",
+        ).pack(anchor="w", padx=24, pady=(0, 2))
+        ctk.CTkLabel(
+            mode_frame,
+            text=(
+                "Shows scenario variables, email font overrides, the "
+                "🔬 Capture network-recording tool, etc."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            wraplength=480, justify="left",
+        ).pack(anchor="w", padx=44, pady=(0, 12))
+
+        # --- Caseload Tool view section.
+        view_frame = ctk.CTkFrame(
+            dialog, fg_color=("gray92", "gray18"), corner_radius=6,
+        )
+        view_frame.pack(fill="x", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(
+            view_frame, text="2.  Salesforce Caseload Tool view",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(
+            view_frame,
+            text=(
+                "A dedicated Salesforce list view with the columns this "
+                "launcher needs (notably Student Email). One-time setup; "
+                "the launcher downloads from it going forward, leaving "
+                "your normal views untouched. Recommended but not "
+                "required — batches still work without it (via slower "
+                "per-student email scraping at send time)."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            wraplength=540, justify="left", anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkButton(
+            view_frame, text="Set up Caseload Tool view now",
+            command=lambda: self._setup_caseload_tool_view_with_help(dialog),
+            width=260,
+        ).pack(anchor="w", padx=12, pady=(0, 12))
+
+        # --- Continue button.
+        def _continue() -> None:
+            self.settings.advanced_mode = (mode_var.get() == "advanced")
+            self.settings.first_run_complete = True
+            save_settings(self.settings)
+            self._apply_advanced_mode()
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
+        ctk.CTkButton(
+            btn_row, text="Continue", command=_continue, width=140,
+        ).pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", _continue)
+        # Don't bind Escape — this is the first-run welcome and
+        # should be saved-and-closed via the explicit button.
+
+    def _confirm_csv_email_present_or_proceed(
+        self, scenario: ScenarioConfig,
+    ) -> bool:
+        """Pre-batch check: when the scenario has an email step AND
+        the cached CSV doesn't have a student-email column, ask the
+        user whether to set up the view, proceed with the slower
+        fallback, or skip this question for the rest of the session.
+        Returns True to proceed with the batch, False to abort."""
+        if scenario.email is None:
+            return True  # no email step → CSV column doesn't matter
+        if self._csv_has_student_email:
+            return True
+        if self._csv_email_warning_skipped:
+            return True
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Caseload Tool view not set up")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("540x300")
+        dialog.lift()
+        dialog.focus_force()
+        result = {"value": False}
+
+        ctk.CTkLabel(
+            dialog, text="Caseload Tool view not detected",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(18, 6))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "Your caseload CSV doesn't include a student-email "
+                "column. The batch can still proceed — emails will be "
+                "looked up student-by-student from Salesforce at send "
+                "time, which is slower and less reliable.\n\n"
+                "Setting up the 'Caseload Tool' view in Salesforce "
+                "adds the Student Email column to the download and "
+                "fixes this permanently."
+            ),
+            wraplength=500, justify="left", anchor="w",
+            font=ctk.CTkFont(size=12),
+        ).pack(fill="x", padx=20, pady=(0, 14))
+
+        def _setup_now() -> None:
+            result["value"] = False
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+            self._setup_caseload_tool_view_with_help(self.root)
+
+        def _proceed() -> None:
+            result["value"] = True
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        def _skip_session() -> None:
+            self._csv_email_warning_skipped = True
+            result["value"] = True
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16), side="bottom")
+        ctk.CTkButton(
+            btn_row, text="Set up now", width=110, command=_setup_now,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Proceed anyway", width=130,
+            command=_proceed, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Skip this session", width=140,
+            command=_skip_session, **SECONDARY_BTN_KWARGS,
+        ).pack(side="right", padx=4)
+
+        dialog.protocol("WM_DELETE_WINDOW", _proceed)
+        self.root.wait_window(dialog)
+        return result["value"]
 
     def _apply_advanced_mode(self) -> None:
         """Show/hide advanced-only UI elements based on
@@ -6848,12 +7229,23 @@ class App:
             return False
         self._caseload_rows = rows
         self._caseload_csv_mtime = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
+        # Cache whether the CSV carries a student-email column so the
+        # pre-batch warning + Settings status line don't have to scan
+        # rows again. Refreshed on every cache reload — picks up the
+        # change immediately when the user adds the column.
+        self._csv_has_student_email = _csv_has_student_email_column(rows)
         if not silent:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
                 f"Caseload cache: {len(rows)} rows from "
                 f"{CASELOAD_CSV_PATH.name} ({age})"
             )
+            if not self._csv_has_student_email:
+                self._append_log(
+                    "  ↳  no student-email column detected — batch "
+                    "emails will use the slower per-student row scrape. "
+                    "Set up Caseload Tool view in ⚙ Settings to fix."
+                )
         return True
 
     def _read_clipboard_content(self) -> str:
