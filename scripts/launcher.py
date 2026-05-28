@@ -1177,6 +1177,28 @@ class BrowserWorker:
             return False, f"download save failed: {e}"
         return True, f"saved to {Path(save_path).name}"
 
+    def _highlight(self, target, locator, ms: int = 700) -> None:
+        """Briefly outline an element in red so the user can see
+        what's about to be clicked, then pause to give them time
+        to track it. Best-effort — highlight failures (element
+        evaporated, page navigated, etc.) silently fall through."""
+        try:
+            locator.evaluate("""el => {
+                el.style.outline = '3px solid #ff3333';
+                el.style.outlineOffset = '2px';
+                el.scrollIntoView({block: 'center'});
+            }""")
+            target.wait_for_timeout(ms)
+            try:
+                locator.evaluate("""el => {
+                    el.style.outline = '';
+                    el.style.outlineOffset = '';
+                }""")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _setup_caseload_tool_view(self, ctx) -> tuple[bool, str]:
         """Drive the Salesforce list-view UI to create a 'Caseload
         Tool' list view with the Student Email column included.
@@ -1184,7 +1206,9 @@ class BrowserWorker:
         Step-by-step Playwright flow matching the user's screenshots
         of the WGU Salesforce UI. Each step logs to on_status BEFORE
         attempting the click so a failure log line points directly
-        at the step that broke.
+        at the step that broke. Critical clicks are preceded by a
+        brief red-outline highlight so the user can visually track
+        which element the automation is touching.
 
         Returns (success, message). Message describes either the
         success outcome or the specific step that failed. On any
@@ -1322,120 +1346,88 @@ class BrowserWorker:
                 f"already on Create New): {e}"
             )
 
-        # ---- Step 3: type the new list view name. ----
-        # The 'Save As New List View' click might:
-        # (a) transform the existing popup with a new empty name
-        #     input, or
-        # (b) open a brand new modal, or
-        # (c) just enable an empty field that was previously hidden.
-        # Approach: wait, find ALL inputs in any visible modal, pick
-        # the first empty one as the name target. Last-ditch: try
-        # keyboard.type assuming Salesforce auto-focused the field.
-        self.on_status("Setup [3/8]: typing 'Caseload Tool' as view name…")
+        # ---- Step 3: find and focus the name input via JS, then type. ----
+        # Lightning Web Components use shadow DOM that Playwright's
+        # standard `.locator('input')` doesn't pierce. Use JS that
+        # walks shadow roots explicitly to find the empty visible
+        # input, focus it, then use keyboard.type for the value.
+        self.on_status("Setup [3/8]: finding name input via shadow-piercing JS…")
         target.wait_for_timeout(1500)
+        try:
+            result = target.evaluate(r"""
+                () => {
+                    const findInputs = (node, depth = 0) => {
+                        if (depth > 30) return [];
+                        const inputs = [];
+                        if (node.tagName === 'INPUT' ||
+                            node.tagName === 'TEXTAREA') {
+                            inputs.push(node);
+                        }
+                        if (node.shadowRoot) {
+                            for (const c of node.shadowRoot.children) {
+                                inputs.push(...findInputs(c, depth + 1));
+                            }
+                        }
+                        for (const c of (node.children || [])) {
+                            inputs.push(...findInputs(c, depth + 1));
+                        }
+                        return inputs;
+                    };
+                    const all = findInputs(document.body);
+                    const visible = all.filter(inp => {
+                        const r = inp.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const t = (inp.type || '').toLowerCase();
+                        if (['hidden','submit','checkbox','radio']
+                            .includes(t)) return false;
+                        return true;
+                    });
+                    const empty = visible.find(
+                        inp => (inp.value || '') === ''
+                    );
+                    if (empty) {
+                        empty.focus();
+                        empty.click();
+                        return {
+                            found: true,
+                            name: empty.name || '',
+                            placeholder: empty.placeholder || '',
+                            aria: empty.getAttribute('aria-label') || '',
+                            visible_total: visible.length,
+                        };
+                    }
+                    return {
+                        found: false,
+                        visible_total: visible.length,
+                        sample: visible.slice(0, 5).map(i => ({
+                            name: i.name || '',
+                            placeholder: i.placeholder || '',
+                            value: (i.value || '').substring(0, 20),
+                        })),
+                    };
+                }
+            """)
+        except Exception as e:
+            return _fail("name-input", f"JS evaluation failed: {e}")
 
-        # Find all visible modals — there might be more than one
-        # if the old "Update Existing List View" popup is still in
-        # the DOM tree.
-        modals = []
-        for msel in (
-            'section[role="dialog"]',
-            'div[role="dialog"]',
-            'div.slds-modal',
-            'div.modal-container',
-        ):
-            try:
-                ms = target.locator(msel).filter(visible=True)
-                count = ms.count()
-                for i in range(count):
-                    modals.append((msel, ms.nth(i)))
-            except Exception:
-                continue
-        self.on_status(f"  → found {len(modals)} visible modal(s)")
+        self.on_status(f"  → JS scan result: {result}")
+        if not result.get("found"):
+            return _fail("name-input", (
+                f"no empty input found via shadow-piercing JS. "
+                f"Scan saw {result.get('visible_total', 0)} visible "
+                f"inputs total. Inspect popup in DevTools and check "
+                f"what's there."
+            ))
 
-        # Strategy A: enumerate all visible inputs in each modal,
-        # pick the first empty text-ish one.
-        name_input = None
-        approach_used = ""
-        for msel, modal in modals:
-            try:
-                inputs = modal.locator(
-                    'input:not([type="hidden"])'
-                ).filter(visible=True)
-                n_inputs = inputs.count()
-                self.on_status(
-                    f"  → modal {msel!r}: {n_inputs} visible input(s)"
-                )
-                for i in range(n_inputs):
-                    inp = inputs.nth(i)
-                    try:
-                        val = (inp.input_value() or "").strip()
-                        itype = inp.get_attribute("type") or "text"
-                        # Skip clearly non-name inputs.
-                        if itype in ("checkbox", "radio", "submit"):
-                            continue
-                        if val == "":
-                            name_input = inp
-                            approach_used = (
-                                f"empty input #{i} in modal {msel!r}"
-                            )
-                            break
-                    except Exception:
-                        continue
-                if name_input is not None:
-                    break
-            except Exception:
-                continue
-
-        # Strategy B: page-wide label lookup.
-        if name_input is None:
-            try:
-                inp = target.get_by_label(
-                    "New List View Name", exact=False,
-                ).filter(visible=True).first
-                if inp.count() > 0:
-                    name_input = inp
-                    approach_used = "page-wide label 'New List View Name'"
-            except Exception:
-                pass
-
-        # Strategy C: blind keyboard input (Salesforce often
-        # auto-focuses the name field on popup open).
-        typed_via_keyboard = False
-        if name_input is None:
-            self.on_status(
-                "  → no input element matched; trying blind keyboard.type"
-            )
-            try:
-                target.keyboard.type("Caseload Tool", delay=40)
-                typed_via_keyboard = True
-                approach_used = "blind keyboard.type"
-            except Exception as e:
-                return _fail("name-input", (
-                    f"all approaches failed to type name. Last error: {e}. "
-                    "Inspect the input in Edge's DevTools (right-click → "
-                    "Inspect on the empty name field) and tell me its "
-                    "aria-label, name, placeholder, or any unique class."
-                ))
-
-        if not typed_via_keyboard and name_input is not None:
-            try:
-                self.on_status(f"  → using approach: {approach_used}")
-                name_input.click(timeout=3000)
-                name_input.fill("")
-                name_input.fill("Caseload Tool", timeout=3000)
-            except Exception as e:
-                # Last fallback: try keyboard after focusing.
-                try:
-                    name_input.click()
-                    target.keyboard.type("Caseload Tool", delay=40)
-                    approach_used += " + keyboard.type after focus"
-                except Exception as e2:
-                    return _fail("name-type", (
-                        f"found input but couldn't type. fill error: {e}. "
-                        f"keyboard fallback error: {e2}"
-                    ))
-        self.on_status(f"  ✓ typed 'Caseload Tool' via: {approach_used}")
+        # Input is focused. Clear any leftover state, then type.
+        target.wait_for_timeout(300)
+        try:
+            target.keyboard.press("Control+a")
+            target.keyboard.press("Delete")
+            target.keyboard.type("Caseload Tool", delay=40)
+        except Exception as e:
+            return _fail("name-type", f"keyboard.type failed: {e}")
+        self.on_status("  ✓ typed 'Caseload Tool' into focused input")
 
         # ---- Step 4: submit the form via Enter, fall back to Save
         # button if the modal stays open. ----
@@ -1468,29 +1460,50 @@ class BrowserWorker:
 
         if not modal_closed:
             self.on_status(
-                "  → modal still open after Enter; trying Save button"
+                "  → modal still open after Enter; finding Save via JS"
             )
-            # Fallback: try clicking a Save button. Prefer modal-
-            # scoped first, fall back to page-wide last.
+            # JS-based shadow-piercing Save button find. Same
+            # rationale as step 3: Playwright's selectors miss
+            # buttons inside Lightning's shadow DOM.
             try:
-                save_btn = None
-                if modal is not None:
-                    save_btn = modal.get_by_role(
-                        "button", name="Save",
-                    ).filter(visible=True).first
-                    if save_btn.count() == 0:
-                        save_btn = modal.locator(
-                            'button:has-text("Save")'
-                        ).filter(visible=True).first
-                if save_btn is None or save_btn.count() == 0:
-                    save_btn = target.get_by_role(
-                        "button", name="Save",
-                    ).filter(visible=True).last
-                save_btn.click(timeout=5000)
+                clicked = target.evaluate(r"""
+                    () => {
+                        const findButtons = (node, depth = 0) => {
+                            if (depth > 30) return [];
+                            const out = [];
+                            if (node.tagName === 'BUTTON') out.push(node);
+                            if (node.shadowRoot) {
+                                for (const c of node.shadowRoot.children) {
+                                    out.push(...findButtons(c, depth + 1));
+                                }
+                            }
+                            for (const c of (node.children || [])) {
+                                out.push(...findButtons(c, depth + 1));
+                            }
+                            return out;
+                        };
+                        const all = findButtons(document.body);
+                        const saves = all.filter(b => {
+                            const t = (b.textContent || '').trim().toLowerCase();
+                            if (t !== 'save') return false;
+                            const r = b.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        });
+                        if (saves.length === 0) return false;
+                        // Click the LAST visible Save — closest to
+                        // the bottom of the topmost modal.
+                        saves[saves.length - 1].click();
+                        return true;
+                    }
+                """)
+                if not clicked:
+                    return _fail("save-create-view", (
+                        "no visible Save button found via shadow-piercing JS"
+                    ))
                 target.wait_for_timeout(2500)
             except Exception as e:
                 return _fail("save-create-view", (
-                    f"Enter didn't close modal and Save button click "
+                    f"Enter didn't close modal and JS Save click "
                     f"failed: {e}"
                 ))
             # Re-check modal state.
@@ -1500,8 +1513,8 @@ class BrowserWorker:
                 ).filter(visible=True).count()
                 if still_open > 0:
                     return _fail("save-didnt-close", (
-                        "Save was triggered (Enter + button click) but "
-                        "the modal remained open. The new view may not "
+                        "Save was triggered (Enter + JS button click) "
+                        "but the modal remained open. The view may not "
                         "have been created — check Salesforce manually."
                     ))
             except Exception:
