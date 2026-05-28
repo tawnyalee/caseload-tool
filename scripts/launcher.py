@@ -310,6 +310,20 @@ class BrowserWorker:
         called from the worker thread when the export completes."""
         self.q.put(("DOWNLOAD_CASELOAD_CSV", save_path, on_done))
 
+    def submit_setup_caseload_tool_view(
+        self,
+        on_done: Callable[[bool, str], None],
+    ) -> None:
+        """Drive the Salesforce list-view UI to create a 'Caseload
+        Tool' view with the student-email column included. Idempotent
+        — if the view already exists and has the right columns, the
+        automation just verifies and returns success.
+
+        `on_done(success, message)` is called from the worker thread.
+        Detailed step-by-step progress logs flow through on_status so
+        the user sees exactly where the automation is at any moment."""
+        self.q.put(("SETUP_CASELOAD_TOOL_VIEW", on_done))
+
     def shutdown(self) -> None:
         self.q.put(self.SHUTDOWN)
 
@@ -474,6 +488,13 @@ class BrowserWorker:
                 success, message = self._download_caseload_csv(
                     ctx, save_path,
                 )
+            finally:
+                on_done(success, message)
+        elif cmd[0] == "SETUP_CASELOAD_TOOL_VIEW":
+            _, on_done = cmd
+            success, message = False, ""
+            try:
+                success, message = self._setup_caseload_tool_view(ctx)
             finally:
                 on_done(success, message)
 
@@ -1155,6 +1176,212 @@ class BrowserWorker:
         except Exception as e:
             return False, f"download save failed: {e}"
         return True, f"saved to {Path(save_path).name}"
+
+    def _setup_caseload_tool_view(self, ctx) -> tuple[bool, str]:
+        """Drive the Salesforce list-view UI to create a 'Caseload
+        Tool' list view with the Student Email column included.
+
+        Step-by-step Playwright flow matching the user's screenshots
+        of the WGU Salesforce UI. Each step logs to on_status BEFORE
+        attempting the click so a failure log line points directly
+        at the step that broke. Selectors are best-guess on first
+        pass; expect 1–2 iterations of selector tuning after we see
+        what actually breaks.
+
+        Returns (success, message). Message describes either the
+        success outcome or the specific step that failed."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return False, "caseload table didn't load"
+
+        # ---- Step 1: open the list-view controls (disk icon). ----
+        self.on_status("Setup [1/8]: clicking disk icon (List View Controls)…")
+        disk_selectors = [
+            # Most likely: the standard Lightning list view controls
+            # button. Title varies between orgs; try a few.
+            'button[title="List View Controls"]',
+            'button[title*="List View"]',
+            'button[name="saveListView"]',
+            'button[title="Save"]',
+            # Last resort: any button labelled with a save-y title
+            # near the list view dropdown.
+            'lightning-button-icon[title*="Save"]',
+        ]
+        clicked = False
+        for sel in disk_selectors:
+            try:
+                btn = target.locator(sel).filter(visible=True).first
+                if btn.count() > 0:
+                    btn.click(timeout=3000)
+                    clicked = True
+                    self.on_status(f"  ✓ clicked via selector: {sel}")
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            return False, (
+                "couldn't find the disk-icon button. Tried selectors: "
+                + ", ".join(repr(s) for s in disk_selectors)
+            )
+        target.wait_for_timeout(800)
+
+        # ---- Step 2: click 'Save As New List View' link in the popup. ----
+        self.on_status("Setup [2/8]: clicking 'Save As New List View'…")
+        try:
+            save_as_link = target.get_by_text(
+                "Save As New List View", exact=False,
+            ).filter(visible=True).first
+            save_as_link.wait_for(state="visible", timeout=5000)
+            save_as_link.click()
+        except Exception as e:
+            return False, f"couldn't find 'Save As New List View' link: {e}"
+        target.wait_for_timeout(800)
+
+        # ---- Step 3: type the new list view name. ----
+        self.on_status("Setup [3/8]: typing 'Caseload Tool' as view name…")
+        name_selectors = [
+            'input[name="newListViewName"]',
+            'input[placeholder*="List View Name"]',
+            # Generic — input nearest a "List View Name" label.
+            'input[aria-label*="List View Name"]',
+            'input[aria-label*="Name"]',
+        ]
+        filled = False
+        for sel in name_selectors:
+            try:
+                inp = target.locator(sel).filter(visible=True).first
+                if inp.count() > 0:
+                    inp.fill("Caseload Tool", timeout=3000)
+                    filled = True
+                    self.on_status(f"  ✓ filled via selector: {sel}")
+                    break
+            except Exception:
+                continue
+        if not filled:
+            return False, (
+                "couldn't find the new-view name input. Tried selectors: "
+                + ", ".join(repr(s) for s in name_selectors)
+            )
+
+        # ---- Step 4: click Save to create the view. ----
+        self.on_status("Setup [4/8]: clicking Save (create view)…")
+        try:
+            # The Save button in the modal — typically the only
+            # primary-styled button visible. Take the last in case
+            # we're matching across stale modals.
+            save_btn = target.get_by_role(
+                "button", name="Save",
+            ).filter(visible=True).last
+            save_btn.click(timeout=5000)
+        except Exception as e:
+            return False, f"couldn't click Save (create view): {e}"
+        target.wait_for_timeout(2500)
+
+        # ---- Step 5: open the column picker. ----
+        self.on_status("Setup [5/8]: opening column picker…")
+        # Try the gear icon first; fall back to "Hidden Columns" link.
+        column_picker_opened = False
+        for sel in (
+            'button[title*="column" i]',
+            'button[title*="Choose" i]',
+            'button[name="columnSelector"]',
+        ):
+            try:
+                btn = target.locator(sel).filter(visible=True).first
+                if btn.count() > 0:
+                    btn.click(timeout=3000)
+                    column_picker_opened = True
+                    self.on_status(f"  ✓ opened via selector: {sel}")
+                    break
+            except Exception:
+                continue
+        if not column_picker_opened:
+            try:
+                hidden_link = target.get_by_text(
+                    "Hidden Columns", exact=False,
+                ).filter(visible=True).first
+                hidden_link.click(timeout=3000)
+                column_picker_opened = True
+                self.on_status("  ✓ opened via 'Hidden Columns' link")
+            except Exception as e:
+                return False, (
+                    "couldn't open the column picker via gear icon or "
+                    f"'Hidden Columns' link: {e}"
+                )
+        target.wait_for_timeout(800)
+
+        # ---- Step 6: select Email in Available, move to Selected. ----
+        self.on_status("Setup [6/8]: finding Email row in Available list…")
+        try:
+            # Available column is the left listbox. Try a few patterns.
+            available_box = None
+            for sel in (
+                '[role="listbox"][aria-label*="Available" i]',
+                'div[aria-label*="Available Columns" i]',
+                'ul[aria-label*="Available" i]',
+            ):
+                box = target.locator(sel).filter(visible=True).first
+                if box.count() > 0:
+                    available_box = box
+                    break
+            if available_box is None:
+                return False, "couldn't find the Available Columns list"
+            # Click the row whose text is exactly "Email".
+            email_row = available_box.get_by_text("Email", exact=True).first
+            email_row.click(timeout=3000)
+            self.on_status("  ✓ selected 'Email' row")
+        except Exception as e:
+            return False, f"couldn't select Email row: {e}"
+
+        self.on_status("Setup [6/8]: clicking ► to move Email to Selected…")
+        try:
+            # The move-right button — most likely a button with a title
+            # like "Add" / "Move selection to chosen list".
+            move_btn = None
+            for sel in (
+                'button[title*="Move selection to" i]',
+                'button[title*="Add" i][title*="Visible" i]',
+                'button[title*="Add" i][title*="Selected" i]',
+                'lightning-button-icon[title*="Add" i]',
+                'button[title="Add"]',
+                # Generic right-arrow / chevron-right icons.
+                'button:has(lightning-primitive-icon[icon-name*="right"])',
+            ):
+                btn = target.locator(sel).filter(visible=True).first
+                if btn.count() > 0:
+                    move_btn = btn
+                    break
+            if move_btn is None:
+                return False, "couldn't find the ► (move right) button"
+            move_btn.click(timeout=3000)
+            self.on_status("  ✓ Email moved to Selected")
+        except Exception as e:
+            return False, f"couldn't click ► to move Email: {e}"
+        target.wait_for_timeout(500)
+
+        # ---- Step 7: save the column picker. ----
+        self.on_status("Setup [7/8]: clicking Save (column picker)…")
+        try:
+            save_btn2 = target.get_by_role(
+                "button", name="Save",
+            ).filter(visible=True).last
+            save_btn2.click(timeout=5000)
+        except Exception as e:
+            return False, f"couldn't click Save (column picker): {e}"
+        target.wait_for_timeout(2500)
+
+        # ---- Step 8: reload page so the table picks up the new columns. ----
+        self.on_status("Setup [8/8]: reloading Caseload table…")
+        try:
+            target.reload()
+            target.wait_for_timeout(2500)
+            # Wait for the table to re-render.
+            self._open_caseload_table(ctx)
+        except Exception as e:
+            # Non-fatal — the next CSV refresh will reload anyway.
+            self.on_status(f"  ⚠ reload warning (non-fatal): {e}")
+
+        return True, "Caseload Tool view created and Email column added"
 
     def _read_all_caseload_rows(
         self, ctx,
@@ -6698,12 +6925,73 @@ class App:
         dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
 
     def _setup_caseload_tool_view_with_help(self, parent_dialog=None) -> None:
-        """Entry point for the Caseload Tool view setup. For now,
-        this is a stub that just shows the manual setup instructions
-        (the actual Playwright automation lands in a follow-up
-        commit). Documented in the help dialog as a manual-walkthrough
-        flow so users aren't blocked while the automation is built."""
-        self._show_caseload_view_help(parent_dialog or self.root)
+        """Entry point for the Caseload Tool view setup. Tries the
+        Playwright automation first; on failure, opens the manual
+        walkthrough so the user is never stuck. After a successful
+        automated run, triggers a CSV refresh so the green ✓ shows
+        up in Settings on next open."""
+        if self._is_busy:
+            self._append_log(
+                "Already working on something — wait for the current "
+                "task to finish before setting up the Caseload Tool view."
+            )
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log(
+                "Browser not ready yet — wait a few seconds and try again."
+            )
+            return
+        self._set_busy("Setting up Caseload Tool view…")
+        self._append_log("Setting up Caseload Tool view…")
+        try:
+            success, message = self._setup_caseload_tool_view_blocking()
+        finally:
+            self._set_idle()
+        if success:
+            self._append_log(f"  ✓ {message}")
+            self._append_log("Now refreshing CSV with the new column list…")
+            # Run the refresh inline so the green ✓ status in Settings
+            # is accurate the moment the user reopens it.
+            self._set_busy("Refreshing caseload CSV…")
+            try:
+                refresh_ok, refresh_msg = self._download_caseload_csv_blocking()
+                if refresh_ok:
+                    self._append_log(f"  ✓ {refresh_msg}")
+                else:
+                    self._append_log(
+                        f"  ⚠ View created but CSV refresh failed: "
+                        f"{refresh_msg}. Click ↻ Caseload manually."
+                    )
+            finally:
+                self._set_idle()
+        else:
+            self._append_log(f"  ✗ Automation failed: {message}")
+            # Failure → show the manual walkthrough as fallback.
+            self._show_caseload_view_help(parent_dialog or self.root)
+
+    def _setup_caseload_tool_view_blocking(self) -> tuple[bool, str]:
+        """Block on the worker until the setup automation completes.
+        Returns (success, message). Uses the same wait_variable
+        pattern as the other blocking worker calls so the activity
+        log stays responsive while we wait."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"success": False, "message": ""}
+
+        def on_done(success: bool, message: str) -> None:
+            def set_main() -> None:
+                holder["success"] = success
+                holder["message"] = message
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["success"] = success
+                holder["message"] = message
+                done_var.set(True)
+
+        self.worker.submit_setup_caseload_tool_view(on_done)
+        self.root.wait_variable(done_var)
+        return holder["success"], holder["message"]
 
     def _show_caseload_view_help(self, parent) -> None:
         """Step-by-step manual setup instructions for creating the
