@@ -3781,9 +3781,27 @@ class NoteEditor:
         self.content = content
 
         row = 0
+        # Override course code — per-note. Empty falls back to the
+        # auto-detected course code at fire time. Pin a value here
+        # when this note needs to file against a specific course
+        # different from whatever the active record is. (Replaces
+        # the old main-window "Override Course Code" field.)
+        cc_row = ctk.CTkFrame(content, fg_color="transparent")
+        cc_row.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 0))
+        cc_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            cc_row, text="Override course code:", width=180, anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.course_code_override_entry = ctk.CTkEntry(
+            cc_row, placeholder_text="(empty = auto-detect from active record)",
+            width=240,
+        )
+        self.course_code_override_entry.grid(row=0, column=1, sticky="w")
+        row += 1
+
         # Interaction Format
         ctk.CTkLabel(content, text="Interaction Format").grid(
-            row=row, column=0, sticky="w", padx=8, pady=(4, 0)
+            row=row, column=0, sticky="w", padx=8, pady=(8, 0)
         )
         row += 1
         self.format_var = ctk.StringVar(value="Single Interaction")
@@ -3971,6 +3989,11 @@ class NoteEditor:
         self.submit_var.set(note.submit)
         self.append_clipboard_var.set(note.append_clipboard)
         self.enter_additional_text_var.set(note.enter_additional_text)
+        # Course code override (per-note, replaces the old main-window
+        # global field). Empty = auto-detect at fire time.
+        self.course_code_override_entry.delete(0, "end")
+        if note.course_code_override:
+            self.course_code_override_entry.insert(0, note.course_code_override)
         self._update_activity_state()
 
     def apply_advanced_visibility(self, advanced: bool) -> None:
@@ -3987,7 +4010,7 @@ class NoteEditor:
             pass
 
     def serialize(self) -> dict:
-        return {
+        out: dict = {
             "interaction_format": self.format_var.get(),
             "interaction_type": self.type_combo.get(),
             "body": self.body_text.get("1.0", "end-1c"),
@@ -3998,6 +4021,12 @@ class NoteEditor:
             "append_clipboard": self.append_clipboard_var.get(),
             "enter_additional_text": self.enter_additional_text_var.get(),
         }
+        # Only emit the override key when non-empty so notes.yaml
+        # stays clean for the (common) auto-detect case.
+        cc_override = self.course_code_override_entry.get().strip()
+        if cc_override:
+            out["course_code_override"] = cc_override
+        return out
 
 
 # ============================================================
@@ -4944,16 +4973,13 @@ class App:
             find_frame, text="Find", width=70, command=self._find_student,
         ).grid(row=0, column=2, padx=(0, 8), pady=8)
 
-        # Course code (override for auto-detect)
-        cc_frame = ctk.CTkFrame(pane)
-        cc_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
-        cc_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(cc_frame, text="Override Course Code:").grid(row=0, column=0, padx=8, pady=8)
-        self.course_var = ctk.StringVar()
-        ctk.CTkEntry(
-            cc_frame, textvariable=self.course_var,
-            placeholder_text="(empty = auto-detect)", width=180,
-        ).grid(row=0, column=1, sticky="w", padx=(0, 8), pady=8)
+        # Course-code override moved to per-note in v0.4.x — each
+        # NoteEditor carries its own "Override course code" field, so
+        # a scenario filing notes against multiple courses can pin
+        # each note independently. `course_var` is kept around as an
+        # empty StringVar so any leftover call sites (fire flow) read
+        # "" and fall through to auto-detect or the per-note override.
+        self.course_var = ctk.StringVar(value="")
 
         # Scenario buttons
         self.button_frame = ctk.CTkFrame(pane)

@@ -121,6 +121,7 @@ def _note_from_dict(d: dict) -> NoteData:
         interaction_format=d.get("interaction_format", "Single Interaction"),
         interaction_type=d.get("interaction_type", ""),
         course_code="",  # supplied at runtime
+        course_code_override=str(d.get("course_code_override", "") or "").strip(),
         subject=d.get("subject", ""),
         academic_activities=list(d.get("academic_activities", [])),
         body=d.get("body", ""),
@@ -254,6 +255,11 @@ def run_scenario(
         # Substitute prompt vars (e.g. {{summary}}) — applies whether
         # the body came from the template OR from custom_bodies.
         base_body = _substitute_vars(base_body, prompt_vars)
+        # Per-note course-code override wins over the auto-detected
+        # value when set. Falls back to the detected code otherwise.
+        # Lets a single scenario file notes against multiple courses
+        # by pinning each note to its own.
+        per_note_code = template.course_code_override or course_code
         will_append_clip = template.append_clipboard and clipboard
         is_custom = i in custom_bodies
         if will_append_clip or is_custom:
@@ -265,9 +271,9 @@ def run_scenario(
                     f"Note body trimmed (max {MAX_BODY_LINES} lines / "
                     f"{MAX_BODY_CHARS} chars)."
                 )
-            note = replace(template, course_code=course_code, body=combined)
+            note = replace(template, course_code=per_note_code, body=combined)
         else:
-            note = replace(template, course_code=course_code, body=base_body)
+            note = replace(template, course_code=per_note_code, body=base_body)
         fill_note(target, note)
         if not template.submit:
             all_submitted = False

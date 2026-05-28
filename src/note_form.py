@@ -23,7 +23,8 @@ InteractionFormat = Literal["Single Interaction", "Multiple Interactions"]
 class NoteData:
     interaction_format: InteractionFormat = "Single Interaction"
     interaction_type: str = ""             # exact <option> text in noteType select; "" = skip
-    course_code: str = ""                  # text into Enter Course Code; "" = skip
+    course_code: str = ""                  # text into Enter Course Code; "" = skip (set at runtime)
+    course_code_override: str = ""         # persisted; overrides auto-detect for this note only
     subject: str = ""                      # text into Subject; "" = skip (form will reject)
     academic_activities: list[str] = field(default_factory=list)  # checkbox labels to tick
     body: str = ""                         # rich-text body; "" = skip
