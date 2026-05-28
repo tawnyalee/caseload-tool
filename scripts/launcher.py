@@ -43,7 +43,7 @@ from src import caseload_csv, caseload_filter, email_template
 from src.browser import persistent_context
 from src.config import (
     CASELOAD_CSV_PATH, CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR,
-    USER_CONFIG_DIR,
+    USER_CONFIG_DIR, Settings, load_settings, save_settings,
 )
 from src.version import __version__
 from src.note_form import NoteData
@@ -4442,6 +4442,19 @@ class ScenarioEditor:
                 out.append(v)
         return out
 
+    def apply_advanced_visibility(self, advanced: bool) -> None:
+        """Show / hide advanced-only rows based on the global mode.
+        Rule of thumb: each advanced row stays visible if EITHER
+        the global mode is on, OR the scenario already has data in
+        that row (so users don't lose access to configured fields
+        on a basic-mode profile).
+
+        Stub for commit 1 of the settings rollout; commit 2 fills
+        in per-row visibility decisions. Currently a no-op so the
+        App can call this without crashing while the rest of the
+        UI changes are being staged."""
+        pass
+
     def _selected_template_path(self) -> Optional[Path]:
         """Return the absolute path of the currently-selected body
         template, or None if the dropdown is empty / pointing at the
@@ -4742,6 +4755,10 @@ class App:
         ctk.set_default_color_theme("blue")
 
         self.scenarios = load_scenarios()
+        # User preferences (advanced/dev mode toggle + future settings).
+        # Loaded once at startup; saved via the Settings dialog when
+        # the user toggles. Default state hides advanced features.
+        self.settings: Settings = load_settings()
 
         # In-memory caseload cache populated from CASELOAD_CSV_PATH.
         # Set by _reload_caseload_cache() (called on startup and via
@@ -4793,6 +4810,12 @@ class App:
         self._start_hotkeys()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Apply the saved advanced/basic mode preference once the UI
+        # has finished its first layout pass. Deferred via after(0)
+        # so toolbar geometry events have flushed before we start
+        # pack_forget-ing the Capture button.
+        self.root.after(0, self._apply_advanced_mode)
 
         # Once the worker has the browser open, auto-refresh the
         # caseload CSV in the background so the first batch fire is
@@ -4865,10 +4888,18 @@ class App:
             width=110, command=self._on_open_templates_folder,
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
+        # Settings button — opens a small modal for user preferences.
+        # Currently just the advanced-mode toggle; designed to grow.
+        ctk.CTkButton(
+            toggle_frame, text="⚙ Settings",
+            width=110, command=self._open_settings,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
         # Discovery: capture Salesforce's note-submission network
         # traffic so we can later replay it via REST API instead of
         # driving the UI. One-click toggle; on stop, writes the
         # captured requests to a JSON file in the user config dir.
+        # Advanced-only: hidden in basic mode via _apply_advanced_mode.
         self._capture_active = False
         self.capture_btn = ctk.CTkButton(
             toggle_frame, text="🔬 Capture",
@@ -4979,6 +5010,16 @@ class App:
             )
             editor.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
             self.scenario_editors[name] = editor
+        # Each fresh ScenarioEditor builds every row visible by
+        # default. Push the current advanced-mode preference in so
+        # the right rows hide on first show.
+        if hasattr(self, "settings"):
+            try:
+                advanced = self.settings.advanced_mode
+                for ed in self.scenario_editors.values():
+                    ed.apply_advanced_visibility(advanced)
+            except Exception:
+                pass
 
     def _toggle_editor(self) -> None:
         if self._editor_visible:
@@ -6242,6 +6283,127 @@ class App:
                 pass
 
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
+
+    def _open_settings(self) -> None:
+        """Modal for user preferences. Currently just the advanced /
+        developer-mode toggle; designed to grow as new prefs land.
+
+        Topmost + grab so it can't get buried. Saves to settings.json
+        and applies the change immediately (re-runs the visibility
+        pass over the toolbar + open scenario editor tabs)."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Settings")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("520x420")
+        dialog.lift()
+        dialog.focus_force()
+
+        advanced_var = ctk.BooleanVar(value=self.settings.advanced_mode)
+        ctk.CTkLabel(
+            dialog, text="Settings",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(16, 4))
+
+        ctk.CTkCheckBox(
+            dialog,
+            text="Advanced / developer mode",
+            variable=advanced_var,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=20, pady=(8, 4))
+
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "Shows additional features most users don't need:\n\n"
+                "  •  Scenario variables  (advanced template substitution)\n"
+                "  •  Inline images  (per-scenario email attachments)\n"
+                "  •  Email font / size override  (per-scenario)\n"
+                "  •  Email override  (To: redirect, for testing)\n"
+                "  •  Append clipboard contents  (per-note toggle)\n"
+                "  •  🔬 Capture button  (network traffic recording — "
+                "for REST API discovery)"
+            ),
+            wraplength=470, justify="left",
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        ).pack(fill="x", padx=32, pady=(0, 14))
+
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "If a scenario already uses any of these features, those "
+                "fields stay visible regardless of this setting so you "
+                "can see and edit them."
+            ),
+            wraplength=470, justify="left",
+            text_color=("gray45", "gray60"),
+            font=ctk.CTkFont(size=11, slant="italic"),
+            anchor="w",
+        ).pack(fill="x", padx=32, pady=(0, 14))
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
+
+        def _do_save() -> None:
+            new_mode = advanced_var.get()
+            changed = (new_mode != self.settings.advanced_mode)
+            self.settings.advanced_mode = new_mode
+            save_settings(self.settings)
+            if changed:
+                self._apply_advanced_mode()
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        def _do_cancel() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        ctk.CTkButton(
+            btn_row, text="Save", width=100, command=_do_save,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Cancel", width=100, command=_do_cancel,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=4)
+        dialog.bind("<Escape>", lambda _e: _do_cancel())
+        dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
+
+    def _apply_advanced_mode(self) -> None:
+        """Show/hide advanced-only UI elements based on
+        `self.settings.advanced_mode`. Called once after startup
+        (so the launcher boots into the right state) and again
+        whenever the user toggles the setting.
+
+        Per-scenario fields are handled inside ScenarioEditor's own
+        `apply_advanced_visibility` method, which respects the "show
+        if already configured" rule (a scenario with variables
+        defined keeps the section visible in basic mode so the user
+        can see and edit them)."""
+        advanced = self.settings.advanced_mode
+
+        # Toolbar 🔬 Capture button — pure dev tool, no use case for
+        # basic users. Hide entirely in basic mode.
+        try:
+            if advanced:
+                self.capture_btn.pack(side="left", padx=(8, 0))
+            else:
+                self.capture_btn.pack_forget()
+        except Exception:
+            pass
+
+        # Push the new visibility into every open scenario tab.
+        try:
+            for editor in self.scenario_editors.values():
+                editor.apply_advanced_visibility(advanced)
+        except Exception:
+            pass
 
     def _on_capture_toggle(self) -> None:
         """Toggle network capture for Salesforce REST-API discovery.

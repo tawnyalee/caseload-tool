@@ -5,8 +5,10 @@ live in the project root. When running from a packaged PyInstaller exe,
 they live in `%APPDATA%\\caseload-notes\\` so the install dir can stay
 read-only and the app works across user accounts.
 """
+import json
 import os
 import sys
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -103,3 +105,55 @@ def _seed_user_templates() -> None:
 
 _seed_user_notes_yaml()
 _seed_user_templates()
+
+
+# ===== Settings (user-toggleable preferences) =====
+#
+# A small JSON file alongside notes.yaml in USER_CONFIG_DIR. Currently
+# only carries the advanced-mode toggle, but designed to grow — future
+# preferences (auto-refresh intervals, default themes, etc.) get added
+# as fields on the Settings dataclass without needing migration code.
+
+SETTINGS_PATH = USER_CONFIG_DIR / "settings.json"
+
+
+@dataclass
+class Settings:
+    """User preferences persisted across sessions. Defaults are the
+    "basic user" configuration — advanced features hidden until the
+    user opts in via the Settings dialog."""
+    advanced_mode: bool = False
+
+
+def load_settings() -> Settings:
+    """Read settings.json. Unknown keys are dropped (forwards-compat
+    against settings written by a newer launcher), missing keys fall
+    back to the dataclass defaults. Any failure returns a default
+    Settings so the launcher never bricks on a corrupt file."""
+    if not SETTINGS_PATH.exists():
+        return Settings()
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return Settings()
+    if not isinstance(data, dict):
+        return Settings()
+    valid = {f.name for f in fields(Settings)}
+    filtered = {k: v for k, v in data.items() if k in valid}
+    try:
+        return Settings(**filtered)
+    except Exception:
+        return Settings()
+
+
+def save_settings(settings: Settings) -> None:
+    """Persist `settings` to disk. Best-effort — a failure to write
+    just means the toggle won't survive the next restart."""
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(
+            json.dumps(asdict(settings), indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
