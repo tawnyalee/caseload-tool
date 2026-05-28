@@ -1455,105 +1455,115 @@ class BrowserWorker:
             ))
 
         # Input is focused. Clear leftover state, then type.
+        # IMPORTANT: do NOT press Enter — in Salesforce Lightning
+        # forms Enter inserts a newline into the input, not a
+        # submit. Tab commits the value and moves focus to the next
+        # field (which we want as a side-effect: clean focus state
+        # before clicking Save in step 4).
         target.wait_for_timeout(300)
         try:
             target.keyboard.press("Control+a")
             target.keyboard.press("Delete")
             target.keyboard.type("Caseload Tool", delay=40)
+            target.keyboard.press("Tab")  # commit + leave the input
         except Exception as e:
             return _fail("name-type", f"keyboard.type failed: {e}")
-        self.on_status("  ✓ typed 'Caseload Tool' into focused input")
+        self.on_status("  ✓ typed 'Caseload Tool' + Tab to commit")
 
-        # ---- Step 4: submit the form via Enter, fall back to Save
-        # button if the modal stays open. ----
-        # The keyboard.type in step 3 proved focus is inside the
-        # modal's name input. Salesforce forms submit on Enter when
-        # focus is on a text input — that's more reliable than
-        # trying to find a Save button in Lightning's shadow DOM
-        # (which is why the previous attempt left the modal open
-        # and blocked step 5).
-        self.on_status("Setup [4/8]: pressing Enter to save the new view…")
+        # ---- Step 4: click Save button via shadow-piercing JS. ----
+        # IMPORTANT: don't press Enter to submit — Lightning forms
+        # treat Enter as a literal newline character inside the
+        # input (confirmed in user testing). Find the Save button
+        # via JS that walks shadow DOM (same approach as step 3),
+        # scoped to inputs inside a modal so we don't accidentally
+        # click an unrelated Save elsewhere on the page.
+        self.on_status("Setup [4/8]: clicking Save via shadow-piercing JS…")
+        target.wait_for_timeout(500)
         try:
-            target.keyboard.press("Enter")
-        except Exception as e:
-            return _fail("save-create-view", f"couldn't press Enter: {e}")
-
-        # Wait for the modal to actually close — if it stays open,
-        # Enter didn't submit (focus may have moved off the input).
-        modal_closed = False
-        for _ in range(5):
-            target.wait_for_timeout(1000)
-            try:
-                still_open = target.locator(
-                    'section[role="dialog"], div.slds-modal'
-                ).filter(visible=True).count()
-                if still_open == 0:
-                    modal_closed = True
-                    break
-            except Exception:
-                continue
-
-        if not modal_closed:
-            self.on_status(
-                "  → modal still open after Enter; finding Save via JS"
-            )
-            # JS-based shadow-piercing Save button find. Same
-            # rationale as step 3: Playwright's selectors miss
-            # buttons inside Lightning's shadow DOM.
-            try:
-                clicked = target.evaluate(r"""
-                    () => {
-                        const findButtons = (node, depth = 0) => {
-                            if (depth > 30) return [];
-                            const out = [];
-                            if (node.tagName === 'BUTTON') out.push(node);
-                            if (node.shadowRoot) {
-                                for (const c of node.shadowRoot.children) {
-                                    out.push(...findButtons(c, depth + 1));
-                                }
-                            }
-                            for (const c of (node.children || [])) {
+            click_result = target.evaluate(r"""
+                () => {
+                    const findButtons = (root, depth = 0) => {
+                        if (depth > 30) return [];
+                        const out = [];
+                        if (root.tagName === 'BUTTON') out.push(root);
+                        if (root.shadowRoot) {
+                            for (const c of root.shadowRoot.children) {
                                 out.push(...findButtons(c, depth + 1));
                             }
-                            return out;
+                        }
+                        for (const c of (root.children || [])) {
+                            out.push(...findButtons(c, depth + 1));
+                        }
+                        return out;
+                    };
+                    const isInModal = (el) => {
+                        let n = el;
+                        for (let i = 0; i < 50 && n; i++) {
+                            if (n.nodeType === 1 && n.matches) {
+                                if (n.matches(
+                                    'section[role="dialog"], ' +
+                                    'div[role="dialog"], ' +
+                                    '.slds-modal, .modal-container'
+                                )) return true;
+                            }
+                            if (n.parentElement) {
+                                n = n.parentElement;
+                            } else {
+                                const root = n.getRootNode();
+                                n = root && root.host ? root.host : null;
+                            }
+                        }
+                        return false;
+                    };
+                    const all = findButtons(document.body);
+                    const inModal = all.filter(isInModal);
+                    const saves = inModal.filter(b => {
+                        const t = (b.textContent || '').trim().toLowerCase();
+                        if (t !== 'save') return false;
+                        const r = b.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                    if (saves.length === 0) {
+                        return {
+                            found: false,
+                            all_buttons: all.length,
+                            in_modal: inModal.length,
+                            modal_button_texts: inModal.slice(0, 15).map(
+                                b => (b.textContent || '').trim().substring(0, 30)
+                            ),
                         };
-                        const all = findButtons(document.body);
-                        const saves = all.filter(b => {
-                            const t = (b.textContent || '').trim().toLowerCase();
-                            if (t !== 'save') return false;
-                            const r = b.getBoundingClientRect();
-                            return r.width > 0 && r.height > 0;
-                        });
-                        if (saves.length === 0) return false;
-                        // Click the LAST visible Save — closest to
-                        // the bottom of the topmost modal.
-                        saves[saves.length - 1].click();
-                        return true;
                     }
-                """)
-                if not clicked:
-                    return _fail("save-create-view", (
-                        "no visible Save button found via shadow-piercing JS"
-                    ))
-                target.wait_for_timeout(2500)
-            except Exception as e:
+                    saves[saves.length - 1].click();
+                    return { found: true, count: saves.length };
+                }
+            """)
+            self.on_status(f"  → Save click result: {click_result}")
+            if not click_result.get("found"):
                 return _fail("save-create-view", (
-                    f"Enter didn't close modal and JS Save click "
-                    f"failed: {e}"
+                    f"no Save button found in modal. "
+                    f"all_buttons={click_result.get('all_buttons')}, "
+                    f"in_modal={click_result.get('in_modal')}, "
+                    f"texts={click_result.get('modal_button_texts')}"
                 ))
-            # Re-check modal state.
-            try:
-                still_open = target.locator(
-                    'section[role="dialog"], div.slds-modal'
-                ).filter(visible=True).count()
-                if still_open > 0:
-                    return _fail("save-didnt-close", (
-                        "Save was triggered (Enter + JS button click) "
-                        "but the modal remained open. The view may not "
-                        "have been created — check Salesforce manually."
-                    ))
-            except Exception:
-                pass
+        except Exception as e:
+            return _fail("save-create-view", f"JS Save click failed: {e}")
+
+        # Wait for modal to actually close.
+        target.wait_for_timeout(2500)
+        try:
+            still_open = target.locator(
+                'section[role="dialog"], div.slds-modal'
+            ).filter(visible=True).count()
+            if still_open > 0:
+                return _fail("save-didnt-close", (
+                    "Save was clicked but modal stayed open. The view "
+                    "may have failed validation — possible causes: "
+                    "duplicate name (delete any 'Caseload Tool' view "
+                    "in Salesforce first), missing required field, or "
+                    "the click hit a non-submit Save button."
+                ))
+        except Exception:
+            pass
         self.on_status("  ✓ modal closed; new view created")
 
         # ---- Step 5: open the column picker. ----
