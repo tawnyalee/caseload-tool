@@ -128,6 +128,15 @@ class Settings:
     # startup, the launcher pops the first-run welcome dialog before
     # anything else happens.
     first_run_complete: bool = False
+    # Window geometry "WxH+X+Y" and the x-position of the main
+    # left/right divider, persisted on close and restored on launch
+    # (only when the saved window would still be mostly on-screen).
+    # Empty / 0 means "use the built-in default".
+    window_geometry: str = ""
+    main_sash: int = 0
+    # "normal" or "zoomed" (maximized). When zoomed, window_geometry
+    # holds the last *normal* size to fall back to on un-maximize.
+    window_state: str = "normal"
 
 
 def load_settings() -> Settings:

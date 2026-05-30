@@ -4133,7 +4133,8 @@ class NoteEditor:
 
 
 # ============================================================
-# Scenario editor — one tab in the editor's tabview.
+# Scenario editor — one per scenario, swapped into the editor pane's
+# shared content frame by the stacked group tab-strips.
 # ============================================================
 
 class ScenarioEditor:
@@ -5016,11 +5017,24 @@ class App:
 
         self.root = ctk.CTk()
         self.root.title(f"Caseload Note Automation — v{__version__}")
-        self.root.geometry("900x600")
         self.root.minsize(420, 520)
+        # Restore the saved window size/position if it's still sane and
+        # on-screen; otherwise fall back to the default.
+        self._restore_window_geometry()
         self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=2)
         self.root.grid_rowconfigure(0, weight=1)
+
+        # Horizontal split between the main (left) pane and the editor
+        # (right) pane, joined by a draggable vertical sash line.
+        msash_bg = "#555555" if ctk.get_appearance_mode() == "Dark" else "#a0a0a0"
+        self.main_paned = tk.PanedWindow(
+            self.root, orient="horizontal", bd=0,
+            sashwidth=4, sashrelief="flat", bg=msash_bg,
+        )
+        # The 8px inset goes on the PanedWindow (shows the theme bg);
+        # panes themselves add with no padding so the only gray the
+        # PanedWindow paints is the thin sash line between them.
+        self.main_paned.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
         self._editor_visible = True
         # Per-(course,scenario) tabs in the log area + flat list of all
@@ -5030,6 +5044,10 @@ class App:
         self.note_tabs: dict[str, dict] = {}  # tab_key -> {frame, list_frame}
         self._build_main_pane()
         self._build_editor_pane()
+
+        # Place the left/right divider at its saved spot once the panes
+        # have a real laid-out width.
+        self.root.after(0, self._restore_main_sash)
 
         self.worker = BrowserWorker(
             on_status=self._post_status,
@@ -5067,10 +5085,10 @@ class App:
     # ----- Main (left) pane -----
 
     def _build_main_pane(self) -> None:
-        pane = ctk.CTkFrame(self.root)
-        pane.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        pane = ctk.CTkFrame(self.main_paned)
         pane.grid_columnconfigure(0, weight=1)
         self.main_pane = pane
+        self.main_paned.add(pane, minsize=260, stretch="always")
 
         # Status
         self.status_var = ctk.StringVar(value="Launching browser...")
@@ -5122,18 +5140,20 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.caseload_refresh_btn.pack(side="left", padx=(8, 0))
-        ctk.CTkButton(
+        self._btn_templates = ctk.CTkButton(
             toggle_frame, text="📁 Templates",
             width=110, command=self._on_open_templates_folder,
             **SECONDARY_BTN_KWARGS,
-        ).pack(side="left", padx=(8, 0))
+        )
+        self._btn_templates.pack(side="left", padx=(8, 0))
         # Settings button — opens a small modal for user preferences.
         # Currently just the advanced-mode toggle; designed to grow.
-        ctk.CTkButton(
+        self._btn_settings = ctk.CTkButton(
             toggle_frame, text="⚙ Settings",
             width=110, command=self._open_settings,
             **SECONDARY_BTN_KWARGS,
-        ).pack(side="left", padx=(8, 0))
+        )
+        self._btn_settings.pack(side="left", padx=(8, 0))
         # Discovery: capture Salesforce's note-submission network
         # traffic so we can later replay it via REST API instead of
         # driving the UI. One-click toggle; on stop, writes the
@@ -5157,6 +5177,11 @@ class App:
             corner_radius=6,
         )
         self.busy_label.pack(side="right", padx=(8, 0), fill="x", expand=True)
+        # Collapse the rightmost toolbar buttons to emoji-only when the
+        # bar gets too narrow (they're the first to clip).
+        self._toggle_row_frame = toggle_frame
+        self._toggle_row_mode = None
+        toggle_frame.bind("<Configure>", self._relayout_toggle_row)
 
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
@@ -5169,18 +5194,72 @@ class App:
         self.log.configure(state="disabled")
         pane.grid_rowconfigure(5, weight=1)
 
-        # Bottom row
+        # Bottom row. Quit is packed first (side=right) so it always
+        # reserves its slot and stays visible; the other two collapse to
+        # short labels when the row is too narrow.
         bottom = ctk.CTkFrame(pane, fg_color="transparent")
         bottom.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 8))
         ctk.CTkButton(
-            bottom, text="Hide to taskbar", width=120, command=self._hide,
-        ).pack(side="left")
-        ctk.CTkButton(
-            bottom, text="Open log", width=90, command=self._open_log_file,
-        ).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(
             bottom, text="Quit", width=80, command=self._on_close,
         ).pack(side="right")
+        self._btn_hide_taskbar = ctk.CTkButton(
+            bottom, text="Hide to taskbar", width=120, command=self._hide,
+        )
+        self._btn_hide_taskbar.pack(side="left")
+        self._btn_open_log = ctk.CTkButton(
+            bottom, text="Open log", width=90, command=self._open_log_file,
+        )
+        self._btn_open_log.pack(side="left", padx=(8, 0))
+        self._bottom_row_frame = bottom
+        self._bottom_row_mode = None
+        bottom.bind("<Configure>", self._relayout_bottom_row)
+
+    def _relayout_toggle_row(self, event=None) -> None:
+        """Collapse the rightmost toolbar buttons (Templates/Settings/
+        Capture) to emoji-only when the bar is too narrow, full labels
+        when there's room. Hide-editor and Caseload (leftmost) keep
+        their labels."""
+        try:
+            w = (event.width if event is not None
+                 else self._toggle_row_frame.winfo_width())
+        except Exception:
+            return
+        if w <= 1:
+            return
+        mode = "wide" if w >= 540 else "narrow"
+        if mode == self._toggle_row_mode:
+            return
+        self._toggle_row_mode = mode
+        if mode == "wide":
+            self._btn_templates.configure(text="📁 Templates", width=110)
+            self._btn_settings.configure(text="⚙ Settings", width=110)
+            self.capture_btn.configure(text="🔬 Capture", width=100)
+        else:
+            self._btn_templates.configure(text="📁", width=40)
+            self._btn_settings.configure(text="⚙", width=40)
+            self.capture_btn.configure(text="🔬", width=40)
+
+    def _relayout_bottom_row(self, event=None) -> None:
+        """Shrink 'Hide to taskbar'/'Open log' to short labels when the
+        bottom row is narrow so the (right-pinned) Quit button always
+        stays visible."""
+        try:
+            w = (event.width if event is not None
+                 else self._bottom_row_frame.winfo_width())
+        except Exception:
+            return
+        if w <= 1:
+            return
+        mode = "wide" if w >= 320 else "narrow"
+        if mode == self._bottom_row_mode:
+            return
+        self._bottom_row_mode = mode
+        if mode == "wide":
+            self._btn_hide_taskbar.configure(text="Hide to taskbar", width=120)
+            self._btn_open_log.configure(text="Open log", width=90)
+        else:
+            self._btn_hide_taskbar.configure(text="Hide", width=60)
+            self._btn_open_log.configure(text="Log", width=50)
 
     def _rebuild_scenario_buttons(self) -> None:
         """Render the scenario button list. Layout depends on whether
@@ -5610,56 +5689,145 @@ class App:
     # ----- Editor (right) pane -----
 
     def _build_editor_pane(self) -> None:
-        pane = ctk.CTkFrame(self.root)
-        pane.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=8)
+        pane = ctk.CTkFrame(self.main_paned)
         pane.grid_columnconfigure(0, weight=1)
         pane.grid_rowconfigure(0, weight=1)
         self.editor_pane = pane
+        self.main_paned.add(pane, minsize=340, stretch="always")
 
-        self.tabview = ctk.CTkTabview(pane)
-        self.tabview.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        # Phase 3 editor area: stacked per-group rows of tab-style
+        # buttons (self.editor_tabs) above a single shared content
+        # frame (self.editor_content) that swaps in the selected
+        # scenario's editor. A draggable sash between them lets the
+        # user resize the strip area and also visually separates the
+        # two regions. Replaces the old single CTkTabview row.
+        # A thin sash *line* — a visible divider, not a chunky grip.
+        default_bg = self.editor_pane.cget("fg_color")
+        sash_bg = "#555555" if ctk.get_appearance_mode() == "Dark" else "#a0a0a0"
+        paned = tk.PanedWindow(
+            pane, orient="vertical", bd=0,
+            sashwidth=2, sashrelief="flat", bg=sash_bg,
+        )
+        paned.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.editor_paned = paned
+
+        # Both panes use the default editor background; the only divider
+        # between them is the thin sash line above.
+        tabs_holder = ctk.CTkFrame(paned, fg_color=default_bg)
+        self._editor_tabs_holder = tabs_holder
+        self.editor_tabs = ctk.CTkScrollableFrame(
+            tabs_holder, fg_color="transparent",
+        )
+        self.editor_tabs.pack(fill="both", expand=True)
+
+        self.editor_content = ctk.CTkFrame(paned, fg_color=default_bg)
+        self.editor_content.grid_columnconfigure(0, weight=1)
+        self.editor_content.grid_rowconfigure(0, weight=1)
+
+        paned.add(tabs_holder, minsize=40, height=160, stretch="never")
+        paned.add(self.editor_content, minsize=140, stretch="always")
+
         self.scenario_editors: dict[str, ScenarioEditor] = {}
+        self._editor_tab_buttons: dict[str, tuple] = {}
+        self._editor_group_collapsed: dict[str, bool] = {}
+        self._current_scenario: Optional[str] = None
         self._rebuild_editor_tabs()
 
-        # Save row
+        # Save row — responsive. Full labels when the editor pane is
+        # wide; collapses to compact icons as it narrows so the Save
+        # button is never pushed off-screen. Revert is always the undo
+        # glyph. See _relayout_save_row for the width thresholds.
         save_frame = ctk.CTkFrame(pane, fg_color="transparent")
         save_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 4))
-        ctk.CTkButton(
+        self._save_row_frame = save_frame
+        self._save_row_mode = None
+        self._btn_new = ctk.CTkButton(
             save_frame, text="+ New scenario",
             command=self._new_scenario, width=140, height=34,
-        ).pack(side="left", padx=4, pady=2)
-        ctk.CTkButton(
+        )
+        self._btn_new.pack(side="left", padx=4, pady=2)
+        self._btn_delete = ctk.CTkButton(
             save_frame, text="Delete scenario",
             command=self._delete_scenario, width=140, height=34,
             **SECONDARY_BTN_KWARGS,
-        ).pack(side="left", padx=4, pady=2)
-        ctk.CTkButton(
-            save_frame, text="Save changes",
-            command=self._save_yaml, width=140, height=34,
-        ).pack(side="right", padx=4, pady=2)
-        ctk.CTkButton(
-            save_frame, text="Revert",
-            command=self._revert_editor, width=100, height=34,
-            **SECONDARY_BTN_KWARGS,
-        ).pack(side="right", padx=4, pady=2)
+        )
+        self._btn_delete.pack(side="left", padx=4, pady=2)
+        self._btn_save = ctk.CTkButton(
+            save_frame, text="Save",
+            command=self._save_yaml, width=90, height=34,
+        )
+        self._btn_save.pack(side="right", padx=4, pady=2)
+        self._btn_revert = ctk.CTkButton(
+            save_frame, text="↺",
+            command=self._revert_editor, width=40, height=34,
+            font=ctk.CTkFont(size=18), **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_revert.pack(side="right", padx=4, pady=2)
+        save_frame.bind("<Configure>", self._relayout_save_row)
+
+    def _relayout_save_row(self, event=None) -> None:
+        """Swap the save-row buttons between full labels and compact
+        icons based on the available width, so the Save button is never
+        clipped. Three stages:
+          wide   → '+ New scenario' / 'Delete scenario' / 'Save'
+          medium → '+' / '−'        (Save keeps its label)
+          narrow → '+' / '−' / '✓'  (Save becomes a check)
+        Revert is always the undo glyph."""
+        try:
+            w = (event.width if event is not None
+                 else self._save_row_frame.winfo_width())
+        except Exception:
+            return
+        if w <= 1:
+            return
+        mode = "wide" if w >= 440 else ("medium" if w >= 240 else "narrow")
+        if mode == self._save_row_mode:
+            return
+        self._save_row_mode = mode
+        if mode == "wide":
+            self._btn_new.configure(text="+ New scenario", width=140)
+            self._btn_delete.configure(text="Delete scenario", width=140)
+            self._btn_save.configure(text="Save", width=90)
+        elif mode == "medium":
+            self._btn_new.configure(text="+", width=40)
+            self._btn_delete.configure(text="−", width=40)
+            self._btn_save.configure(text="Save", width=90)
+        else:  # narrow
+            self._btn_new.configure(text="+", width=40)
+            self._btn_delete.configure(text="−", width=40)
+            self._btn_save.configure(text="✓", width=40)
 
     def _rebuild_editor_tabs(self) -> None:
-        # CTkTabview doesn't have a clean "remove all" — recreate it.
-        for name in list(self.tabview._tab_dict.keys()):
-            self.tabview.delete(name)
+        """Rebuild the editor area: one ScenarioEditor per scenario
+        (all built into the shared content frame, only the selected
+        one shown) plus the stacked per-group tab strips above it."""
+        prev = getattr(self, "_current_scenario", None)
+
+        # Tear down old editors + strip widgets.
+        for ed in self.scenario_editors.values():
+            try:
+                ed.frame.destroy()
+            except Exception:
+                pass
         self.scenario_editors.clear()
+        for w in self.editor_content.winfo_children():
+            w.destroy()
+
+        # Build one editor per scenario. Insertion order follows
+        # self.scenarios so the YAML save order stays stable. All
+        # share the content frame; _select_editor_scenario shows one
+        # and grid_remove()s the rest.
         for name, sc in self.scenarios.items():
-            tab = self.tabview.add(name)
-            tab.grid_columnconfigure(0, weight=1)
-            tab.grid_rowconfigure(0, weight=1)
             editor = ScenarioEditor(
-                tab, sc,
+                self.editor_content, sc,
                 capture_handler=self._capture_hotkey,
                 get_columns=self._get_caseload_columns,
                 refresh_columns=self._refresh_caseload_columns_for_editor,
             )
-            editor.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+            editor.frame.grid(row=0, column=0, sticky="nsew")
+            editor.frame.grid_remove()
             self.scenario_editors[name] = editor
+
         # Each fresh ScenarioEditor builds every row visible by
         # default. Push the current advanced-mode preference in so
         # the right rows hide on first show.
@@ -5671,17 +5839,276 @@ class App:
             except Exception:
                 pass
 
+        self._build_editor_tab_strips()
+
+        # Restore the previous selection if it survived, else show the
+        # first scenario.
+        if prev in self.scenarios:
+            self._select_editor_scenario(prev)
+        elif self.scenarios:
+            self._select_editor_scenario(next(iter(self.scenarios)))
+        else:
+            self._current_scenario = None
+
+    def _build_editor_tab_strips(self) -> None:
+        """(Re)render the stacked tab strips in self.editor_tabs:
+        an optional Ungrouped row, then one collapsible color-outlined
+        row per group, each a wrapping grid of tab-style buttons."""
+        for w in self.editor_tabs.winfo_children():
+            w.destroy()
+        self._editor_tab_buttons = {}
+        TAB_COLS = 3
+        est = {"h": 8}  # running px estimate, drives the sash auto-fit
+
+        def _render_section(key, label, names, color, show_header):
+            collapsed = self._editor_group_collapsed.get(key, False)
+            sec = ctk.CTkFrame(
+                self.editor_tabs, fg_color="transparent",
+                border_width=(2 if color else 0),
+                border_color=(color or None), corner_radius=8,
+            )
+            sec.pack(fill="x", padx=2, pady=(4, 2))
+            est["h"] += 6
+            if show_header:
+                arrow = "▶" if collapsed else "▼"
+                # When collapsed, pad below the header so the box's
+                # bottom border is still visible (not hugged tight).
+                ctk.CTkButton(
+                    sec, text=f"{arrow}  {label}", anchor="w", height=24,
+                    fg_color="transparent",
+                    text_color=("gray10", "gray90"),
+                    hover_color=("gray85", "gray25"),
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    command=lambda k=key: self._toggle_editor_group(k),
+                ).pack(fill="x", padx=4, pady=(2, 4 if collapsed else 0))
+                est["h"] += 30
+                if collapsed:
+                    return
+            host = ctk.CTkFrame(sec, fg_color="transparent")
+            host.pack(fill="x", padx=6, pady=(0, 4))
+            for c in range(TAB_COLS):
+                host.grid_columnconfigure(c, weight=1)
+            for i, name in enumerate(names):
+                btn = ctk.CTkButton(
+                    host, text=name, height=28,
+                    command=lambda n=name: self._select_editor_scenario(n),
+                )
+                btn.grid(row=i // TAB_COLS, column=i % TAB_COLS,
+                         padx=3, pady=3, sticky="ew")
+                self._editor_tab_buttons[name] = (btn, color)
+            rows = (len(names) + TAB_COLS - 1) // TAB_COLS
+            est["h"] += rows * 34 + 8
+
+        # No groups → one flat headerless strip (legacy-ish).
+        if not self.groups:
+            if self.scenarios:
+                _render_section("__all__", "", list(self.scenarios),
+                                None, show_header=False)
+        else:
+            grouped: set[str] = set()
+            for g in self.groups:
+                grouped.update(s for s in g.scenarios if s in self.scenarios)
+            ungrouped = [n for n in self.scenarios if n not in grouped]
+            if ungrouped:
+                _render_section("__ungrouped__", "Ungrouped", ungrouped,
+                                None, show_header=True)
+            for g in self.groups:
+                valid = [s for s in g.scenarios if s in self.scenarios]
+                _render_section(g.name, g.name, valid, g.color,
+                                show_header=True)
+
+        # Trailing spacer so the last section's bottom border isn't
+        # clipped at the scroll viewport edge.
+        ctk.CTkFrame(self.editor_tabs, fg_color="transparent",
+                     height=6).pack(fill="x")
+        est["h"] += 10
+
+        # Grow/shrink the strip pane so an expanded group shows all its
+        # buttons without scrolling (capped so the editor keeps room).
+        self._fit_editor_tabs_height(est["h"])
+
+        # Re-apply the selected highlight to the freshly built buttons.
+        sel = getattr(self, "_current_scenario", None)
+        for n, (btn, color) in self._editor_tab_buttons.items():
+            self._style_editor_tab(btn, color, n == sel)
+
+    def _fit_editor_tabs_height(self, est_h: int) -> None:
+        """Size the strip pane to its content (within bounds) so an
+        expanded group reveals all its buttons. The user can still drag
+        the sash; the next expand/collapse re-fits."""
+        try:
+            h = max(48, min(int(est_h), 360))
+            self.editor_paned.paneconfigure(self._editor_tabs_holder, height=h)
+        except Exception:
+            pass
+
+    def _style_editor_tab(self, btn, color, selected: bool) -> None:
+        """Tab look: selected = solid fill, unselected = outline. Uses
+        the group color when present, else the default accent."""
+        if color:
+            if selected:
+                btn.configure(
+                    fg_color=color, border_width=0,
+                    text_color=_text_color_for_bg(color),
+                    hover_color=_hover_color_for(color),
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_width=2,
+                    border_color=color,
+                    text_color=("gray10", "gray90"),
+                    hover_color=("gray85", "gray25"),
+                )
+        else:
+            if selected:
+                btn.configure(
+                    fg_color=("#3a7ebf", "#1f538d"), border_width=0,
+                    text_color="#ffffff",
+                    hover_color=("#325882", "#14375e"),
+                )
+            else:
+                btn.configure(
+                    fg_color="transparent", border_width=2,
+                    border_color=("gray60", "gray40"),
+                    text_color=("gray10", "gray90"),
+                    hover_color=("gray85", "gray25"),
+                )
+
+    def _select_editor_scenario(self, name: str) -> None:
+        """Swap the content frame to `name`'s editor and update the
+        tab-button highlights. Replaces CTkTabview.set()."""
+        if name not in self.scenario_editors:
+            return
+        cur = getattr(self, "_current_scenario", None)
+        if cur and cur != name and cur in self.scenario_editors:
+            try:
+                self.scenario_editors[cur].frame.grid_remove()
+            except Exception:
+                pass
+        try:
+            self.scenario_editors[name].frame.grid()
+        except Exception:
+            pass
+        self._current_scenario = name
+        for n, (btn, color) in self._editor_tab_buttons.items():
+            self._style_editor_tab(btn, color, n == name)
+
+    def _toggle_editor_group(self, key: str) -> None:
+        """Collapse/expand a group's tab strip (buttons only — the
+        selected editor below is unaffected)."""
+        self._editor_group_collapsed[key] = (
+            not self._editor_group_collapsed.get(key, False)
+        )
+        self._build_editor_tab_strips()
+
     def _toggle_editor(self) -> None:
         if self._editor_visible:
-            self.editor_pane.grid_remove()
+            self.main_paned.forget(self.editor_pane)
             self.editor_toggle_btn.configure(text="Show editor")
             self.root.geometry("440x600")
             self._editor_visible = False
         else:
-            self.editor_pane.grid()
+            self.main_paned.add(
+                self.editor_pane, minsize=340, stretch="always",
+            )
             self.editor_toggle_btn.configure(text="Hide editor")
             self.root.geometry("900x600")
             self._editor_visible = True
+            self.root.after(0, self._restore_main_sash)
+
+    # ----- Window geometry + divider persistence -----
+
+    def _geometry_is_visible(self, geo: str) -> bool:
+        """Validate a 'WxH+X+Y' string: reject it when the window is
+        below our minimum size or when most of it would land off the
+        screen (so a saved position from an unplugged monitor doesn't
+        reopen the app somewhere invisible)."""
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", (geo or "").strip())
+        if not m:
+            return False
+        w, h, x, y = (int(m.group(1)), int(m.group(2)),
+                      int(m.group(3)), int(m.group(4)))
+        if w < 420 or h < 520:  # below minsize → reject
+            return False
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        # Require a meaningful slice of the window to overlap the
+        # screen, and the top-left corner not shoved past either edge.
+        vis_w = min(x + w, sw) - max(x, 0)
+        vis_h = min(y + h, sh) - max(y, 0)
+        if vis_w < 160 or vis_h < 160:
+            return False
+        if x > sw - 80 or y > sh - 80 or x + w < 80 or y + h < 80:
+            return False
+        return True
+
+    def _restore_window_geometry(self) -> None:
+        """Apply the saved (normal) geometry when it's still on-screen,
+        else the built-in default. If the window was closed maximized,
+        re-maximize once it's mapped."""
+        geo = (self.settings.window_geometry or "").strip()
+        if geo and self._geometry_is_visible(geo):
+            try:
+                self.root.geometry(geo)
+            except Exception:
+                self.root.geometry("900x600")
+        else:
+            self.root.geometry("900x600")
+        if getattr(self.settings, "window_state", "normal") == "zoomed":
+            # Defer so the window is mapped before maximizing. Registered
+            # before the sash restore (also after(0)) so the divider is
+            # placed against the maximized width.
+            self.root.after(0, self._safe_zoom)
+
+    def _safe_zoom(self) -> None:
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            pass
+
+    def _restore_main_sash(self) -> None:
+        """Place the left/right divider at the saved x (or a sensible
+        default split on first run), clamped to the current width so it
+        never lands off-screen."""
+        if not self._editor_visible:
+            return
+        try:
+            self.root.update_idletasks()
+            total = self.main_paned.winfo_width()
+            if total <= 1:  # not laid out yet — retry shortly
+                self.root.after(50, self._restore_main_sash)
+                return
+            saved = int(getattr(self.settings, "main_sash", 0) or 0)
+            if saved > 0:
+                x = max(160, min(saved, total - 200))
+            else:
+                # First run: ~38% to the left pane (≈ the old 1:2 split).
+                x = max(260, min(int(total * 0.38), total - 340))
+            self.main_paned.sash_place(0, x, 1)
+        except Exception:
+            pass
+
+    def _save_window_state(self) -> None:
+        """Persist the window geometry, maximized state, and divider
+        position so the next launch reopens where the user left it. When
+        maximized we keep the last *normal* geometry (don't overwrite it
+        with the maximized size) but record the zoomed state so it
+        reopens maximized."""
+        try:
+            state = self.root.state()
+            self.settings.window_state = "zoomed" if state == "zoomed" else "normal"
+            if state == "normal":
+                self.settings.window_geometry = self.root.geometry()
+            if self._editor_visible:
+                try:
+                    self.settings.main_sash = int(
+                        self.main_paned.sash_coord(0)[0]
+                    )
+                except Exception:
+                    pass
+            save_settings(self.settings)
+        except Exception:
+            pass
 
     def _new_scenario(self) -> None:
         """Prompt for a name, create a scenario with sensible defaults,
@@ -5714,14 +6141,11 @@ class App:
         except Exception as e:
             self._append_log(f"Could not save new scenario: {e}")
             return
-        # Defer the tab switch one mainloop tick. Without this the
-        # set() runs before CTkTabview has finished laying out the
-        # freshly-built tab content; the user sees an empty pane
-        # until they click another tab + back. `after(0, …)` lets
-        # the pending geometry events flush first so the new tab
-        # is fully drawn before we switch to it.
+        # Switch to the freshly-created scenario. With the grid-based
+        # content swap this is immediate (no CTkTabview layout race),
+        # so no after(0) deferral is needed.
         try:
-            self.root.after(0, lambda: self.tabview.set(name))
+            self._select_editor_scenario(name)
         except Exception:
             pass
 
@@ -5749,11 +6173,7 @@ class App:
         and rebuild tabs/buttons. The deletion is *draft* — notes.yaml
         isn't touched until the user clicks 'Save changes'. 'Revert'
         brings the scenario back."""
-        try:
-            name = self.tabview.get()
-        except Exception:
-            self._append_log("No scenario tab selected.")
-            return
+        name = getattr(self, "_current_scenario", None)
         if not name or name not in self.scenarios:
             self._append_log("No scenario tab selected.")
             return
@@ -7768,6 +8188,7 @@ class App:
         self.root.iconify()
 
     def _on_close(self) -> None:
+        self._save_window_state()
         try:
             if self.hotkey_listener is not None:
                 self.hotkey_listener.stop()
