@@ -5215,11 +5215,19 @@ class App:
             self.scenario_buttons[name] = btn
             return btn
 
-        # No groups → flat grid (original behavior preserved).
+        # No groups → flat grid (original behavior preserved), still
+        # offering "+ Add group" so the first group can be created.
         if not self.groups:
-            for i, (name, sc) in enumerate(self.scenarios.items()):
+            scenario_items = list(self.scenarios.items())
+            for i, (name, sc) in enumerate(scenario_items):
                 btn = _scenario_btn(self.button_frame, name, sc)
                 btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
+            ctk.CTkButton(
+                self.button_frame, text="+ Add group",
+                command=self._add_group, height=28,
+                **SECONDARY_BTN_KWARGS,
+            ).grid(row=(len(scenario_items) + 1) // 2, column=0, columnspan=2,
+                   sticky="ew", padx=6, pady=(10, 4))
             return
 
         # With groups → sectioned layout.
@@ -5246,40 +5254,55 @@ class App:
 
         for group in self.groups:
             collapsed = self._group_collapsed.get(group.name, False)
-            # Header: collapse-toggle button (colored to match group)
-            # + ⚙ settings button.
-            header = ctk.CTkFrame(self.button_frame, fg_color="transparent")
-            header.grid(row=row, column=0, columnspan=2,
-                        sticky="ew", padx=4, pady=(8, 0))
+            # Each group is a box outlined in its own color. The header
+            # mirrors the note-editor dropdown (transparent fill, bold
+            # text, ▼/▶ arrow) so it reads as a section title rather
+            # than another scenario button; member buttons sit indented
+            # inside the box.
+            box = ctk.CTkFrame(
+                self.button_frame, fg_color="transparent",
+                border_width=2, border_color=group.color, corner_radius=8,
+            )
+            box.grid(row=row, column=0, columnspan=2,
+                     sticky="ew", padx=4, pady=(8, 2))
+            box.grid_columnconfigure(0, weight=1)
+            box.grid_columnconfigure(1, weight=1)
+            row += 1
+
+            header = ctk.CTkFrame(box, fg_color="transparent")
+            header.grid(row=0, column=0, columnspan=2,
+                        sticky="ew", padx=6, pady=(4, 2))
             header.grid_columnconfigure(0, weight=1)
             arrow = "▶" if collapsed else "▼"
             ctk.CTkButton(
                 header, text=f"{arrow}  {group.name}",
                 anchor="w", height=28,
-                fg_color=group.color,
-                text_color=_text_color_for_bg(group.color),
-                hover_color=_hover_color_for(group.color),
-                font=ctk.CTkFont(size=12, weight="bold"),
+                fg_color="transparent",
+                text_color=("gray10", "gray90"),
+                hover_color=("gray85", "gray25"),
+                font=ctk.CTkFont(size=13, weight="bold"),
                 command=lambda gn=group.name: self._toggle_group(gn),
-            ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            ).grid(row=0, column=0, sticky="ew")
             ctk.CTkButton(
                 header, text="⚙", width=32, height=28,
                 command=lambda g=group: self._edit_group(g),
                 **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=1, padx=(0, 0))
-            row += 1
+            ).grid(row=0, column=1, padx=(4, 0))
             if collapsed:
                 continue
             valid = [s for s in group.scenarios if s in self.scenarios]
             for i, name in enumerate(valid):
                 btn = _scenario_btn(
-                    self.button_frame, name, self.scenarios[name],
-                    color=group.color,
+                    box, name, self.scenarios[name], color=group.color,
                 )
-                btn.grid(row=row + i // 2, column=i % 2,
-                         padx=6, pady=4, sticky="ew")
-            if valid:
-                row += (len(valid) + 1) // 2
+                # Extra left/right inset so buttons read as indented
+                # children of the group rather than full-width rows.
+                btn.grid(row=1 + i // 2, column=i % 2,
+                         padx=((14, 6) if i % 2 == 0 else (6, 14)),
+                         pady=4, sticky="ew")
+            # Trailing inner pad so the last row doesn't touch the border.
+            ctk.CTkFrame(box, fg_color="transparent", height=4).grid(
+                row=1 + (len(valid) + 1) // 2, column=0, columnspan=2)
 
         # "+ Add group" trailing button.
         ctk.CTkButton(
@@ -5326,7 +5349,9 @@ class App:
         dialog.transient(self.root)
         dialog.attributes("-topmost", True)
         dialog.grab_set()
-        dialog.geometry("520x600")
+        dialog.geometry("520x640")
+        dialog.minsize(480, 520)
+        dialog.resizable(True, True)
         dialog.lift()
         dialog.focus_force()
 
@@ -5448,7 +5473,9 @@ class App:
         _refresh_swatches()
         _update_preview()
 
-        # --- Scenarios checkbox list.
+        # --- Scenarios checkbox list (label here; scroll frame packed
+        # below, AFTER the bottom button bar so the buttons always win
+        # the space contest and stay visible even when cramped).
         ctk.CTkLabel(
             dialog, text="Scenarios in this group",
             font=ctk.CTkFont(size=12, weight="bold"),
@@ -5462,40 +5489,14 @@ class App:
             for s in g.scenarios:
                 current_membership[s] = g.name
         scenario_vars: dict[str, ctk.BooleanVar] = {}
-        sc_frame = ctk.CTkScrollableFrame(dialog, fg_color=("gray95", "gray18"))
-        sc_frame.pack(fill="both", expand=True, padx=20, pady=(2, 8))
-        initial_members = set(group.scenarios) if not is_new else set()
-        for name in self.scenarios:
-            v = ctk.BooleanVar(value=(name in initial_members))
-            scenario_vars[name] = v
-            row = ctk.CTkFrame(sc_frame, fg_color="transparent")
-            row.pack(fill="x", pady=1)
-            ctk.CTkCheckBox(
-                row, text=name, variable=v,
-            ).pack(side="left")
-            other_group = current_membership.get(name)
-            if other_group:
-                ctk.CTkLabel(
-                    row, text=f"  (currently in {other_group!r})",
-                    font=ctk.CTkFont(size=10, slant="italic"),
-                    text_color=("gray40", "gray65"),
-                ).pack(side="left", padx=(6, 0))
 
-        ctk.CTkLabel(
-            dialog,
-            text=(
-                "If a scenario is in another group, checking it here "
-                "moves it to this one (a scenario can only be in one "
-                "group at a time)."
-            ),
-            font=ctk.CTkFont(size=10, slant="italic"),
-            text_color=("gray45", "gray60"),
-            wraplength=460, justify="left", anchor="w",
-        ).pack(fill="x", padx=20, pady=(0, 8))
-
-        # --- Buttons row.
+        # --- Buttons row + hint, pinned to the bottom FIRST. Packing
+        # these side="bottom" before the expanding scroll frame
+        # reserves their space, so they never get pushed off-screen.
+        # (Callbacks read scenario_vars, which is populated further
+        # below before any button can be clicked — closures by ref.)
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_row.pack(fill="x", padx=20, pady=(0, 16), side="bottom")
+        btn_row.pack(fill="x", padx=20, pady=(4, 16), side="bottom")
 
         def _do_save() -> None:
             new_name = (name_entry.get() or "").strip()
@@ -5568,6 +5569,40 @@ class App:
                 fg_color=("#cc4444", "#aa3333"),
                 hover_color=("#aa3333", "#882222"),
             ).pack(side="right", padx=4)
+
+        # Hint sits just above the (already bottom-pinned) button bar.
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "If a scenario is in another group, checking it here "
+                "moves it to this one (a scenario can only be in one "
+                "group at a time)."
+            ),
+            font=ctk.CTkFont(size=10, slant="italic"),
+            text_color=("gray45", "gray60"),
+            wraplength=460, justify="left", anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 6), side="bottom")
+
+        # Scrollable scenario list fills whatever space is left between
+        # the top fields and the pinned hint/buttons.
+        sc_frame = ctk.CTkScrollableFrame(dialog, fg_color=("gray95", "gray18"))
+        sc_frame.pack(fill="both", expand=True, padx=20, pady=(2, 6))
+        initial_members = set(group.scenarios) if not is_new else set()
+        for name in self.scenarios:
+            v = ctk.BooleanVar(value=(name in initial_members))
+            scenario_vars[name] = v
+            row = ctk.CTkFrame(sc_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkCheckBox(
+                row, text=name, variable=v,
+            ).pack(side="left")
+            other_group = current_membership.get(name)
+            if other_group:
+                ctk.CTkLabel(
+                    row, text=f"  (currently in {other_group!r})",
+                    font=ctk.CTkFont(size=10, slant="italic"),
+                    text_color=("gray40", "gray65"),
+                ).pack(side="left", padx=(6, 0))
 
         dialog.bind("<Escape>", lambda _e: _do_cancel())
         dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
