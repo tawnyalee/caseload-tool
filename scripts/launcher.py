@@ -28,6 +28,7 @@ from typing import Callable, Optional
 
 import customtkinter as ctk
 import tkinter as tk
+from tkinter import ttk
 import yaml
 from pynput import keyboard
 
@@ -227,8 +228,11 @@ class BrowserWorker:
             custom_bodies or {}, prompt_vars or {}, on_done,
         ))
 
-    def submit_find_student(self, query: str) -> None:
-        self.q.put(("FIND", query))
+    def submit_find_student(self, query: str, new_tab: bool = False) -> None:
+        """Navigate to a student record. When `new_tab` is True the
+        student opens in a fresh browser tab (leaving existing tabs
+        open); otherwise the current/most-recent tab is reused."""
+        self.q.put(("FIND", query, new_tab))
 
     def submit_list_matches(
         self, query: str, on_results: Callable[[list[str]], None],
@@ -407,8 +411,11 @@ class BrowserWorker:
                 if on_done is not None:
                     on_done(success)
         elif cmd[0] == "FIND":
-            _, query = cmd
-            self._handle_find(ctx, query)
+            # Back-compat: older callers queued ("FIND", query) with no
+            # new_tab flag.
+            query = cmd[1]
+            new_tab = cmd[2] if len(cmd) > 2 else False
+            self._handle_find(ctx, query, new_tab)
         elif cmd[0] == "LIST_MATCHES":
             _, query, on_results = cmd
             names: list[str] = []
@@ -428,6 +435,7 @@ class BrowserWorker:
                             tgt.wait_for_timeout(2000)
                         except Exception:
                             pass
+                        self._bring_browser_forward(tgt)
             finally:
                 on_done(success)
         elif cmd[0] == "GET_STUDENT_CONTEXT":
@@ -476,7 +484,8 @@ class BrowserWorker:
                 )
             finally:
                 on_done(success, message)
-    def _try_match_or_navigate(self, target, query: str) -> bool:
+    def _try_match_or_navigate(self, target, query: str,
+                               raise_after: bool = True) -> bool:
         """Look for matches in the current DOM. If exactly one
         highest-priority match, click and return True. If multiple,
         post them to the main thread for a picker and return True
@@ -491,6 +500,10 @@ class BrowserWorker:
             self.on_status(f"  [search] match: {name!r} (priority {priority})")
             if click_caseload_row(row, name, name_idx, on_status=self.on_status):
                 self.on_status(f"Navigated to {name!r}.")
+                # Raise only AFTER the navigation click — see _handle_find.
+                # Suppressed for new-tab opens (background, by convention).
+                if raise_after:
+                    self._bring_browser_forward(target)
             return True
         # Multiple matches at the same priority — ask user to pick.
         names = [m[2] for m in top]
@@ -500,44 +513,46 @@ class BrowserWorker:
         self.on_multiple_matches(query, names)
         return True
 
-    def _handle_find(self, ctx, query: str) -> None:
-        target = self._active_page(ctx)
-        if target is None:
-            self.on_status("No browser pages open.")
-            return
-        self.on_status(f"Searching Caseload for {query!r}...")
-
-        # First pass: search whatever's currently in DOM.
+    def _close_record_subtab(self, target) -> bool:
+        """Close the currently-open console workspace subtab (the student
+        record) with the Shift+X console shortcut, so the live Caseload
+        list underneath becomes active again — far faster than reloading
+        it. Returns True only once we're back on the Caseload app page;
+        the caller falls back to a full reload otherwise (e.g. focus was
+        in a field so the shortcut didn't fire, or another record tab
+        was underneath)."""
         try:
-            if self._try_match_or_navigate(target, query):
-                return
+            # Right after a row click, focus is on the console (not a text
+            # field), so the global Shift+X shortcut fires the tab close.
+            target.keyboard.press("Shift+X")
         except Exception as e:
-            self.on_status(f"Search failed: {e}")
-            return
+            self.on_status(f"  [debug] close-subtab keypress: {e}")
+            return False
+        # Poll briefly for the URL to fall back to the Caseload app page.
+        try:
+            for _ in range(20):  # ~3s ceiling before we give up and reload
+                if "Caseload_App_Page" in (target.url or ""):
+                    return True
+                target.wait_for_timeout(150)
+        except Exception:
+            pass
+        return False
 
-        # Miss — Caseload list isn't in DOM (likely because the user
-        # navigated into a student record after the last search).
-        # Reload the Caseload list and retry once.
+    def _ensure_caseload_list(self, target) -> bool:
+        """Navigate `target` to the Caseload list and wait for the list
+        table to render. The table must have BOTH a Course Code header
+        AND a Name header — the Essential Actions panels match Course
+        Code only, so a looser wait would settle on a stale empty table.
+        Returns True once the real list is visible."""
         if not CASELOAD_URL:
-            self.on_status(
-                f"No match for {query!r}; CASELOAD_URL not set so we can't "
-                "reload Caseload. Open it manually and try again."
-            )
-            return
-
-        self.on_status("Caseload list not in DOM — navigating there to retry...")
+            return False
         # Lightning sometimes raises "Navigation interrupted" when its own
         # JS triggers a redirect during our goto. The navigation still
         # ultimately succeeds, so we treat the exception as advisory.
         try:
             target.goto(CASELOAD_URL, wait_until="domcontentloaded")
         except Exception as e:
-            self.on_status(f"  [debug] goto note: {e}")
-
-        # Wait for the real Caseload list table — must have BOTH a
-        # Course Code header AND a Name header. The Essential Actions
-        # panels match Course Code only, so we'd find a stale empty
-        # table if we used the looser wait.
+            self.on_status(f"  [debug] goto caseload: {e}")
         try:
             list_table = (
                 target.locator("table")
@@ -545,16 +560,87 @@ class BrowserWorker:
                 .filter(has=target.locator('th:has-text("Name")'))
             )
             list_table.first.wait_for(state="visible", timeout=20_000)
+            return True
         except Exception as e:
             self.on_status(f"Caseload list table didn't load in time: {e}")
-            return
+            return False
 
+    def _handle_find(self, ctx, query: str, new_tab: bool = False) -> None:
+        # `new_tab` is a Salesforce CONSOLE subtab, NOT a browser tab.
+        # Clicking a student from the Caseload list already opens it as a
+        # new console subtab; the only difference between reuse and
+        # new-tab is whether we first close the open record (Shift+X) —
+        # see the on_caseload block below. We always drive the SAME
+        # browser page (never ctx.new_page(), which would spawn a second
+        # Edge tab with its own Caseload).
+        target = self._active_page(ctx)
+        if target is None:
+            self.on_status("No browser pages open.")
+            return
+        # NOTE: we deliberately do NOT raise the browser here. Raising /
+        # bring_to_front() activates the tab and makes Lightning
+        # re-render, and clicking a row in that same instant raced the
+        # re-render — the click landed before the list was ready and the
+        # record didn't switch. Instead we navigate first (below, on the
+        # settled page) and raise the window only once navigation
+        # succeeds — see _bring_browser_forward() calls.
+        self.on_status(f"Searching Caseload for {query!r}...")
+
+        # Lightning routes record navigation only from the ACTIVE view.
+        # When a student record is already open the Caseload rows remain
+        # in the cached DOM (so a search still "finds" them) but clicking
+        # them no longer navigates — the URL stays on the open record.
+        # So re-activate the list first whenever we aren't already on it.
         try:
-            if self._try_match_or_navigate(target, query):
+            on_caseload = "Caseload_App_Page" in (target.url or "")
+        except Exception:
+            on_caseload = False
+        reloaded = False
+        if not on_caseload:
+            if not CASELOAD_URL:
+                self.on_status(
+                    f"No match for {query!r}; a record is open and "
+                    "CASELOAD_URL isn't set, so the Caseload list can't "
+                    "be reloaded. Open it manually and try again."
+                )
+                return
+            # Fast path (reuse/double-click only): the open record is a
+            # console workspace subtab sitting over a STILL-LIVE Caseload
+            # list. Closing it (Shift+X) re-activates that list instantly
+            # — far cheaper than a full reload. Falls back to a reload if
+            # we don't land back on Caseload (e.g. another student tab was
+            # underneath). New-tab opens deliberately keep their existing
+            # tabs, so they always reload instead of closing anything.
+            closed = (not new_tab) and self._close_record_subtab(target)
+            if not closed:
+                self.on_status("Reloading Caseload list before search...")
+                self._ensure_caseload_list(target)
+            reloaded = True
+
+        # First pass: search the (now active) Caseload list. New-tab
+        # opens stay in the background (no raise) by convention.
+        raise_after = not new_tab
+        try:
+            if self._try_match_or_navigate(target, query, raise_after):
                 return
         except Exception as e:
-            self.on_status(f"Retry search failed: {e}")
+            self.on_status(f"Search failed: {e}")
             return
+
+        # Miss. If we were already on Caseload and haven't reloaded, the
+        # student just isn't in the rendered row window — reloading won't
+        # help, so fall through to the row filter. Otherwise reload once
+        # and retry before filtering.
+        if not reloaded and CASELOAD_URL:
+            self.on_status(
+                "Caseload list not in DOM — navigating there to retry...")
+            if self._ensure_caseload_list(target):
+                try:
+                    if self._try_match_or_navigate(target, query, raise_after):
+                        return
+                except Exception as e:
+                    self.on_status(f"Retry search failed: {e}")
+                    return
 
         # Step 3: the Caseload table only renders ~10 rows at a time.
         # If the student isn't in that window, type the query into the
@@ -582,7 +668,7 @@ class BrowserWorker:
             return
 
         try:
-            if not self._try_match_or_navigate(target, query):
+            if not self._try_match_or_navigate(target, query, raise_after):
                 self.on_status(
                     f"No match for {query!r} after filtering. "
                     "Try Salesforce global search for students outside your caseload."
@@ -1004,6 +1090,202 @@ class BrowserWorker:
             except Exception:
                 continue
         return None
+
+    def _descendant_pids(self) -> set:
+        """PIDs of every process descended from this Python process,
+        via a Toolhelp32 snapshot (no third-party deps). Used to tell
+        OUR browser (a child of the launcher) apart from any everyday
+        Edge/Vivaldi the user has open."""
+        import ctypes
+        from ctypes import wintypes
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1 or snap == 0:
+            return set()
+        children: dict = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                children.setdefault(entry.th32ParentProcessID, []).append(
+                    entry.th32ProcessID)
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snap)
+        # BFS down from us.
+        out: set = set()
+        stack = [os.getpid()]
+        while stack:
+            pid = stack.pop()
+            for child in children.get(pid, ()):
+                if child not in out:
+                    out.add(child)
+                    stack.append(child)
+        return out
+
+    def _raise_browser_window(self, title_hint: str = "") -> None:
+        """Pull the launcher's browser window to the OS foreground.
+        `page.bring_to_front()` only activates the tab *within* the
+        browser; on Windows it does NOT raise the browser window above
+        other apps, so a navigation fired while the launcher has focus
+        lands on a window hidden behind the app and looks like nothing
+        happened.
+
+        We match the Chromium/Edge top-level window whose owning process
+        descends from this launcher (so we never grab the user's
+        everyday Edge/Vivaldi), falling back to a page-title match.
+        No-op off Windows."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        # Fast path: the browser window is stable for the session, so
+        # reuse the handle we found last time and skip the (relatively
+        # expensive) process snapshot + window enumeration. Only re-scan
+        # if the cached handle is gone (browser relaunched/closed).
+        cached = getattr(self, "_browser_hwnd", None)
+        if cached and user32.IsWindow(cached) and user32.IsWindowVisible(cached):
+            self._raise_hwnd(cached)
+            return
+
+        try:
+            ours = self._descendant_pids()
+        except Exception:
+            ours = set()
+
+        # (hwnd, pid, title) for every visible, titled Chromium window.
+        cands: list = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                cls = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls, 256)
+                if cls.value != "Chrome_WidgetWin_1":
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True  # toolbars / hidden helpers have no title
+                tbuf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, tbuf, n + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                cands.append((hwnd, pid.value, tbuf.value))
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        except Exception:
+            return
+
+        # Pick: descendant of us > title matches the page > sole candidate.
+        chosen = None  # (hwnd, pid)
+        mine = [c for c in cands if c[1] in ours]
+        if mine:
+            chosen = (mine[0][0], mine[0][1])
+        elif title_hint:
+            h = title_hint.lower()
+            for c in cands:
+                if c[2] and h in c[2].lower():
+                    chosen = (c[0], c[1])
+                    break
+        if chosen is None and len(cands) == 1:
+            chosen = (cands[0][0], cands[0][1])
+        if chosen is None:
+            # Only worth a log line when we couldn't find our window —
+            # a successful raise is self-evident (the window appears).
+            self.on_status(
+                f"  [raise] couldn't locate browser window "
+                f"({len(cands)} chromium window(s) seen)"
+            )
+            return
+        # Cache hwnd + owning pid for the fast path and the focus guard.
+        self._browser_hwnd, self._browser_pid = chosen
+        self._raise_hwnd(chosen[0])
+
+    def _user_is_on_us(self) -> bool:
+        """True if the current OS foreground window belongs to the
+        launcher or to our own browser. When it belongs to some OTHER
+        app (the user has moved on while a record loads), we must NOT
+        raise the browser — doing so steals focus / grabs the cursor
+        from whatever they're now using. Defaults to True off Windows."""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            fg = user32.GetForegroundWindow()
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            allowed = {os.getpid()}
+            bp = getattr(self, "_browser_pid", None)
+            if bp:
+                allowed.add(bp)
+            return pid.value in allowed
+        except Exception:
+            return True
+
+    def _bring_browser_forward(self, page) -> None:
+        """Activate the right tab and pull the browser window to the OS
+        foreground. Call this AFTER a navigation has completed — calling
+        it before clicking races Lightning's re-render on tab activation
+        and the click misses. Skipped entirely when the user has focused
+        a different app, so we never yank focus away from their work."""
+        if not self._user_is_on_us():
+            return
+        try:
+            if page is not None:
+                page.bring_to_front()
+        except Exception:
+            pass
+        self._raise_browser_window()
+
+    def _raise_hwnd(self, hwnd) -> None:
+        """Bring a known top-level window to the OS foreground. We rely
+        on the fact that the launcher is the foreground process when this
+        runs (guarded by _user_is_on_us), so a plain SetForegroundWindow
+        is honoured. We deliberately do NOT use AttachThreadInput to
+        force it past the foreground lock — that defeats Windows' own
+        focus-steal protection and was grabbing the cursor from other
+        apps."""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            SW_RESTORE = 9
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
     def _open_caseload_table(self, ctx):
         """Common helper: navigate to Caseload (if not already there)
@@ -4970,6 +5252,246 @@ class ScenarioEditor:
 
 
 # ============================================================
+# Caseload panel — in-app sortable/searchable view of the cached
+# caseload CSV. Container-agnostic: builds into any parent frame
+# (the docked right pane OR a popped-out window), and is fully
+# data-driven from app._caseload_rows so a rebuild on dock/undock
+# is cheap.
+# ============================================================
+
+class CaseloadPanel:
+    def __init__(self, parent, app: "App", popped: bool = False) -> None:
+        self.app = app
+        self.popped = popped  # rendered in a pop-out window vs the dock
+        self._sort_col: Optional[str] = None
+        self._sort_reverse = False
+        self._query = ""
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.frame.grid_columnconfigure(0, weight=1)
+        self.frame.grid_rowconfigure(1, weight=1)
+        self._build()
+        self.populate()
+
+    # ----- construction -----
+
+    def _build(self) -> None:
+        bar = ctk.CTkFrame(self.frame, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        bar.grid_columnconfigure(2, weight=1)
+        # Reload sits to the LEFT of the "Caseload" label.
+        self.refresh_btn = ctk.CTkButton(
+            bar, text="↻", width=36, command=self._on_refresh,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.refresh_btn.grid(row=0, column=0, padx=(0, 4))
+        ctk.CTkLabel(
+            bar, text="Caseload",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=1, padx=(4, 8))
+        self.search_var = ctk.StringVar()
+        self.search_entry = ctk.CTkEntry(
+            bar, textvariable=self.search_var,
+            placeholder_text="Search caseload…",
+        )
+        self.search_entry.grid(row=0, column=2, sticky="ew", padx=4)
+        self.search_var.trace_add("write", lambda *_: self._on_search())
+        self.freshness_lbl = ctk.CTkLabel(
+            bar, text="", font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray65"),
+        )
+        self.freshness_lbl.grid(row=0, column=3, padx=8)
+        # Pop the panel into its own window (2nd monitor) / re-dock it.
+        self.popout_btn = ctk.CTkButton(
+            bar, text=("⧉ Dock" if self.popped else "⧉ Pop out"),
+            width=80, command=self.app._toggle_caseload_popout,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.popout_btn.grid(row=0, column=4, padx=(0, 4))
+
+        table_wrap = ctk.CTkFrame(self.frame)
+        table_wrap.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        table_wrap.grid_columnconfigure(0, weight=1)
+        table_wrap.grid_rowconfigure(0, weight=1)
+        self._style_tree()
+        self.tree = ttk.Treeview(
+            table_wrap, show="headings", selectmode="browse",
+            style="Caseload.Treeview",
+        )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(table_wrap, orient="vertical",
+                            command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb = ttk.Scrollbar(table_wrap, orient="horizontal",
+                            command=self.tree.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        # Zebra striping for readability.
+        self.tree.tag_configure("even", background=self._even_bg)
+        self.tree.tag_configure("odd", background=self._odd_bg)
+        # Double-click a row → open that student in Salesforce (reuse
+        # the current tab). Right-click OR middle-click → open in a new
+        # browser tab, leaving existing tabs open (middle-click is the
+        # conventional "open in new tab" gesture).
+        self.tree.bind("<Double-1>", self._on_row_open)
+        self.tree.bind("<Button-3>", self._on_row_open_new_tab)
+        self.tree.bind("<Button-2>", self._on_row_open_new_tab)
+        self._row_by_iid: dict[str, dict] = {}
+        self._table_wrap = table_wrap
+        self.empty_lbl = ctk.CTkLabel(
+            table_wrap,
+            text="No caseload loaded.\nClick ↻ to download from Salesforce.",
+            font=ctk.CTkFont(size=12), justify="center",
+            text_color=("gray45", "gray60"),
+        )
+
+    def _style_tree(self) -> None:
+        """Style the ttk.Treeview to approximate the CTk theme. Uses the
+        'clam' ttk theme because the native Windows theme ignores
+        Treeview background config."""
+        if ctk.get_appearance_mode() == "Dark":
+            bg, fg, sel, hbg = "#2b2b2b", "#dce4ee", "#1f6aa5", "#343638"
+            self._even_bg, self._odd_bg = "#2b2b2b", "#333333"
+        else:
+            bg, fg, sel, hbg = "#ffffff", "#1a1a1a", "#3a7ebf", "#e5e5e5"
+            self._even_bg, self._odd_bg = "#ffffff", "#f0f0f0"
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(
+            "Caseload.Treeview", background=bg, foreground=fg,
+            fieldbackground=bg, bordercolor=bg, borderwidth=0, rowheight=24,
+        )
+        style.map("Caseload.Treeview",
+                  background=[("selected", sel)],
+                  foreground=[("selected", "#ffffff")])
+        style.configure(
+            "Caseload.Treeview.Heading", background=hbg, foreground=fg,
+            relief="flat", font=("", 10, "bold"),
+        )
+        style.map("Caseload.Treeview.Heading", background=[("active", sel)])
+
+    # ----- data + interaction -----
+
+    @staticmethod
+    def _sortkey(v):
+        s = str(v).strip()
+        try:
+            return (0, float(s.replace(",", "")))
+        except ValueError:
+            return (1, s.lower())
+
+    def _on_search(self) -> None:
+        self._query = self.search_var.get()
+        self.populate()
+
+    def _sort_by(self, col: str) -> None:
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col
+            self._sort_reverse = False
+        self.populate()
+
+    def _on_refresh(self) -> None:
+        # Routes through the app's worker-thread download; the cache
+        # reload calls back into populate() via _refresh_caseload_panel.
+        try:
+            self.app._on_caseload_refresh_clicked()
+        except Exception:
+            pass
+
+    def populate(self) -> None:
+        rows = self.app._caseload_rows or []
+        if not rows:
+            self.tree.delete(*self.tree.get_children())
+            self.tree["columns"] = ()
+            self.empty_lbl.grid(row=0, column=0, sticky="nsew",
+                                padx=20, pady=20)
+            self.update_freshness()
+            return
+        self.empty_lbl.grid_remove()
+        headers = list(rows[0].keys())
+        if tuple(self.tree["columns"]) != tuple(headers):
+            self.tree["columns"] = headers
+            for h in headers:
+                self.tree.heading(
+                    h, command=lambda c=h: self._sort_by(c))
+                self.tree.column(h, width=120, minwidth=60,
+                                 anchor="w", stretch=False)
+        # Heading labels (display names) + sort arrow on the active one.
+        for h in headers:
+            disp = caseload_csv.display_for_column(h)
+            if h == self._sort_col:
+                disp += "  " + ("▼" if self._sort_reverse else "▲")
+            self.tree.heading(h, text=disp)
+        # Filter by the search query (substring across all columns).
+        q = self._query.strip().lower()
+        view = ([r for r in rows
+                 if any(q in str(v).lower() for v in r.values())]
+                if q else list(rows))
+        if self._sort_col:
+            view.sort(key=lambda r: self._sortkey(r.get(self._sort_col, "")),
+                      reverse=self._sort_reverse)
+        self.tree.delete(*self.tree.get_children())
+        self._row_by_iid = {}
+        for i, r in enumerate(view):
+            iid = self.tree.insert(
+                "", "end", values=[r.get(h, "") for h in headers],
+                tags=("even" if i % 2 == 0 else "odd",),
+            )
+            self._row_by_iid[iid] = r
+        self.update_freshness(count=len(view), total=len(rows))
+
+    def _on_row_open(self, event=None) -> None:
+        """Open the double-clicked student in Salesforce, reusing the
+        current browser tab. Prefers the unambiguous Student ID,
+        falling back to Name."""
+        self._open_row(event, new_tab=False)
+
+    def _on_row_open_new_tab(self, event=None) -> None:
+        """Right-click → open the student in a new browser tab, leaving
+        any already-open student tabs as they are."""
+        self._open_row(event, new_tab=True)
+
+    def _open_row(self, event, new_tab: bool) -> None:
+        iid = self.tree.identify_row(event.y) if event is not None else \
+            self.tree.focus()
+        if not iid:
+            return
+        # Right-click doesn't move the selection on its own; do it so the
+        # acted-on row is visually obvious.
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        row = self._row_by_iid.get(iid)
+        if not row:
+            return
+        query = (str(row.get("StudentID", "")).strip()
+                 or str(row.get("Name", "")).strip())
+        if query:
+            self.app._find_student_by_query(query, new_tab=new_tab)
+
+    def update_freshness(self, count: Optional[int] = None,
+                         total: Optional[int] = None) -> None:
+        mt = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
+        age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH) if mt else "no CSV"
+        if count is not None and total is not None and count != total:
+            txt = f"{count}/{total} shown · {age}"
+        elif total is not None:
+            txt = f"{total} rows · {age}"
+        else:
+            txt = age
+        color = ("gray40", "gray65")
+        if mt is not None:
+            mins = (datetime.now() - mt).total_seconds() / 60
+            color = (("#2e7d32", "#7ee787") if mins < 30
+                     else ("#9a6700", "#ffd166") if mins < 120
+                     else ("#b00020", "#ff7b72"))
+        self.freshness_lbl.configure(text=txt, text_color=color)
+
+
+# ============================================================
 # Main app
 # ============================================================
 
@@ -5042,11 +5564,13 @@ class App:
         # the UI so the tabview helpers can use them.
         self.note_log_entries: list[NoteLogEntry] = []
         self.note_tabs: dict[str, dict] = {}  # tab_key -> {frame, list_frame}
+        self.caseload_panel: Optional[CaseloadPanel] = None
         self._build_main_pane()
         self._build_editor_pane()
+        self._build_caseload_pane()
 
-        # Place the left/right divider at its saved spot once the panes
-        # have a real laid-out width.
+        # Place the dividers at their saved spots once the panes have a
+        # real laid-out width.
         self.root.after(0, self._restore_main_sash)
 
         self.worker = BrowserWorker(
@@ -5098,6 +5622,11 @@ class App:
         ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
 
         # Find student — searches the in-DOM Caseload table.
+        # HIDDEN from view (2026-05-31): the caseload panel's own search
+        # box has superseded this. We keep the widgets + wiring intact
+        # (grid_remove retains the layout) so it can be restored with a
+        # single `self._find_frame.grid()` if we decide to bring it back;
+        # the final remove-or-keep decision is deferred.
         find_frame = ctk.CTkFrame(pane)
         find_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         find_frame.grid_columnconfigure(1, weight=1)
@@ -5112,6 +5641,8 @@ class App:
         ctk.CTkButton(
             find_frame, text="Find", width=70, command=self._find_student,
         ).grid(row=0, column=2, padx=(0, 8), pady=8)
+        self._find_frame = find_frame
+        find_frame.grid_remove()  # hidden; code retained intentionally
 
         # Course-code override moved to per-note in v0.4.x — each
         # NoteEditor carries its own "Override course code" field, so
@@ -5134,6 +5665,11 @@ class App:
             toggle_frame, text="Hide editor", width=120, command=self._toggle_editor,
         )
         self.editor_toggle_btn.pack(side="left")
+        self.caseload_toggle_btn = ctk.CTkButton(
+            toggle_frame, text="Hide caseload", width=120,
+            command=self._toggle_caseload,
+        )
+        self.caseload_toggle_btn.pack(side="left", padx=(8, 0))
         self.caseload_refresh_btn = ctk.CTkButton(
             toggle_frame, text="↻ Caseload",
             width=120, command=self._on_caseload_refresh_clicked,
@@ -5183,22 +5719,39 @@ class App:
         self._toggle_row_mode = None
         toggle_frame.bind("<Configure>", self._relayout_toggle_row)
 
+        # Activity-log header: collapse toggle + Copy-to-clipboard. The
+        # log box (row 6) can be collapsed to reclaim vertical space.
+        self._log_pane = pane
+        self._log_visible = True
+        log_header = ctk.CTkFrame(pane, fg_color="transparent")
+        log_header.grid(row=5, column=0, sticky="ew", padx=8, pady=(8, 0))
+        self._log_collapse_btn = ctk.CTkButton(
+            log_header, text="▼ Activity log", width=130, anchor="w",
+            command=self._toggle_log, **SECONDARY_BTN_KWARGS,
+        )
+        self._log_collapse_btn.pack(side="left")
+        self._log_copy_btn = ctk.CTkButton(
+            log_header, text="📋 Copy", width=80, command=self._copy_log,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._log_copy_btn.pack(side="right")
+
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
-        self.log_tabview.grid(row=5, column=0, sticky="nsew", padx=8, pady=(8, 0))
+        self.log_tabview.grid(row=6, column=0, sticky="nsew", padx=8, pady=(2, 0))
         activity_tab = self.log_tabview.add("Activity")
         activity_tab.grid_columnconfigure(0, weight=1)
         activity_tab.grid_rowconfigure(0, weight=1)
         self.log = ctk.CTkTextbox(activity_tab, wrap="word")
         self.log.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.log.configure(state="disabled")
-        pane.grid_rowconfigure(5, weight=1)
+        pane.grid_rowconfigure(6, weight=1)
 
         # Bottom row. Quit is packed first (side=right) so it always
         # reserves its slot and stays visible; the other two collapse to
         # short labels when the row is too narrow.
         bottom = ctk.CTkFrame(pane, fg_color="transparent")
-        bottom.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 8))
+        bottom.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 8))
         ctk.CTkButton(
             bottom, text="Quit", width=80, command=self._on_close,
         ).pack(side="right")
@@ -5688,6 +6241,130 @@ class App:
 
     # ----- Editor (right) pane -----
 
+    def _build_caseload_pane(self) -> None:
+        """Add the caseload panel as the rightmost pane in the main
+        horizontal split (main | editor | caseload). Built as a
+        container-agnostic CaseloadPanel so it can pop out into its own
+        window (and re-dock) — see _toggle_caseload_popout."""
+        self.caseload_dock = ctk.CTkFrame(self.main_paned)
+        self.caseload_dock.grid_columnconfigure(0, weight=1)
+        self.caseload_dock.grid_rowconfigure(0, weight=1)
+        self.main_paned.add(self.caseload_dock, minsize=300, stretch="always")
+        self._caseload_visible = True
+        self._caseload_popped = False
+        self.caseload_window: Optional[ctk.CTkToplevel] = None
+        self._mount_caseload_panel(self.caseload_dock, popped=False)
+
+    def _mount_caseload_panel(self, parent, popped: bool) -> None:
+        """(Re)build the caseload panel into `parent`, discarding any
+        previous instance. The panel is data-driven (renders from
+        self._caseload_rows), so a rebuild on dock/undock is instant —
+        tkinter can't reparent a live widget, so we rebuild instead."""
+        old = getattr(self, "caseload_panel", None)
+        if old is not None:
+            try:
+                old.frame.destroy()
+            except Exception:
+                pass
+        self.caseload_panel = CaseloadPanel(parent, self, popped=popped)
+        self.caseload_panel.frame.grid(row=0, column=0, sticky="nsew")
+        self.caseload_panel.populate()
+
+    def _toggle_caseload_popout(self) -> None:
+        if getattr(self, "_caseload_popped", False):
+            self._dock_caseload()
+        else:
+            self._pop_out_caseload()
+
+    def _pop_out_caseload(self) -> None:
+        """Move the caseload panel into its own resizable window (for a
+        second monitor). Removes the docked pane and disables the
+        Hide/Show-caseload toggle until it's re-docked."""
+        # Remove the docked pane from the split if it's showing.
+        if self._caseload_visible:
+            try:
+                self.main_paned.forget(self.caseload_dock)
+            except Exception:
+                pass
+            self._caseload_visible = False
+        win = ctk.CTkToplevel(self.root)
+        win.title("Caseload")
+        win.minsize(360, 320)
+        geo = (self.settings.caseload_window_geometry or "").strip()
+        if geo and self._geometry_is_visible(geo):
+            win.geometry(geo)
+        else:
+            win.geometry("700x800")
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(0, weight=1)
+        # Closing the pop-out re-docks rather than losing the panel.
+        win.protocol("WM_DELETE_WINDOW", self._dock_caseload)
+        self.caseload_window = win
+        self._caseload_popped = True
+        self._mount_caseload_panel(win, popped=True)
+        # The dock toggle is meaningless while popped out.
+        self.caseload_toggle_btn.configure(
+            text="Caseload popped", state="disabled")
+        win.after(80, win.lift)
+        self.root.after(0, self._restore_main_sash)
+
+    def _dock_caseload(self) -> None:
+        """Tear down the pop-out window and re-dock the panel as the
+        rightmost pane."""
+        win = getattr(self, "caseload_window", None)
+        if win is not None:
+            try:
+                self.settings.caseload_window_geometry = win.geometry()
+                save_settings(self.settings)
+            except Exception:
+                pass
+        # Re-add the dock pane (rightmost) and rebuild the panel into it.
+        try:
+            self.main_paned.add(
+                self.caseload_dock, minsize=300, stretch="always")
+        except Exception:
+            pass
+        self._caseload_visible = True
+        self._caseload_popped = False
+        self._mount_caseload_panel(self.caseload_dock, popped=False)
+        self.caseload_window = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self.caseload_toggle_btn.configure(
+            text="Hide caseload", state="normal")
+        self.root.after(0, self._restore_main_sash)
+
+    def _toggle_caseload(self) -> None:
+        """Show/hide the rightmost caseload pane. Caseload is always the
+        last pane, so re-showing it is a plain add() (appends to the
+        right of main/editor)."""
+        if self._caseload_visible:
+            self.main_paned.forget(self.caseload_dock)
+            self.caseload_toggle_btn.configure(text="Show caseload")
+            self._caseload_visible = False
+        else:
+            self.main_paned.add(
+                self.caseload_dock, minsize=300, stretch="always")
+            self.caseload_toggle_btn.configure(text="Hide caseload")
+            self._caseload_visible = True
+        self.root.after(0, self._restore_main_sash)
+
+    def _refresh_caseload_panel(self) -> None:
+        """Repopulate the caseload panel from the current cache. Safe to
+        call from any thread / before the panel exists — marshals onto
+        the Tk main loop."""
+        panel = getattr(self, "caseload_panel", None)
+        root = getattr(self, "root", None)
+        if panel is None or root is None:
+            return
+        try:
+            root.after(0, panel.populate)
+        except Exception:
+            pass
+
     def _build_editor_pane(self) -> None:
         pane = ctk.CTkFrame(self.main_paned)
         pane.grid_columnconfigure(0, weight=1)
@@ -6005,16 +6682,20 @@ class App:
         if self._editor_visible:
             self.main_paned.forget(self.editor_pane)
             self.editor_toggle_btn.configure(text="Show editor")
-            self.root.geometry("440x600")
             self._editor_visible = False
         else:
-            self.main_paned.add(
-                self.editor_pane, minsize=340, stretch="always",
-            )
+            # Re-insert BEFORE the caseload pane so the order stays
+            # main | editor | caseload (add() alone would append it
+            # after caseload). Only valid when caseload is currently
+            # shown — you can't insert before a forgotten pane.
+            kw = dict(minsize=340, stretch="always")
+            if (getattr(self, "caseload_dock", None) is not None
+                    and getattr(self, "_caseload_visible", False)):
+                kw["before"] = self.caseload_dock
+            self.main_paned.add(self.editor_pane, **kw)
             self.editor_toggle_btn.configure(text="Hide editor")
-            self.root.geometry("900x600")
             self._editor_visible = True
-            self.root.after(0, self._restore_main_sash)
+        self.root.after(0, self._restore_main_sash)
 
     # ----- Window geometry + divider persistence -----
 
@@ -6066,25 +6747,46 @@ class App:
         except Exception:
             pass
 
+    def _parse_sash_positions(self) -> list[int]:
+        """Saved divider x-positions, newest field first, migrating the
+        legacy single `main_sash` when the list field is empty."""
+        raw = (getattr(self.settings, "sash_positions", "") or "").strip()
+        if raw:
+            try:
+                return [int(x) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                return []
+        legacy = int(getattr(self.settings, "main_sash", 0) or 0)
+        return [legacy] if legacy > 0 else []
+
+    @staticmethod
+    def _default_sash_positions(n: int, total: int) -> list[int]:
+        """Default divider positions for `n` sashes across `total` px."""
+        if n == 1:
+            return [int(total * 0.38)]
+        if n == 2:  # main | editor | caseload
+            return [int(total * 0.30), int(total * 0.64)]
+        return [int(total * (i + 1) / (n + 1)) for i in range(n)]
+
     def _restore_main_sash(self) -> None:
-        """Place the left/right divider at the saved x (or a sensible
-        default split on first run), clamped to the current width so it
-        never lands off-screen."""
-        if not self._editor_visible:
-            return
+        """Place every divider at its saved x (or a sensible default
+        split), clamped within the current width. Handles 1 sash
+        (editor hidden) or 2 (main | editor | caseload)."""
         try:
             self.root.update_idletasks()
+            n_sash = len(self.main_paned.panes()) - 1
+            if n_sash < 1:
+                return
             total = self.main_paned.winfo_width()
             if total <= 1:  # not laid out yet — retry shortly
                 self.root.after(50, self._restore_main_sash)
                 return
-            saved = int(getattr(self.settings, "main_sash", 0) or 0)
-            if saved > 0:
-                x = max(160, min(saved, total - 200))
-            else:
-                # First run: ~38% to the left pane (≈ the old 1:2 split).
-                x = max(260, min(int(total * 0.38), total - 340))
-            self.main_paned.sash_place(0, x, 1)
+            saved = self._parse_sash_positions()
+            xs = (saved if len(saved) == n_sash
+                  else self._default_sash_positions(n_sash, total))
+            for i, x in enumerate(xs):
+                xi = max(60, min(int(x), total - 60))
+                self.main_paned.sash_place(i, xi, 1)
         except Exception:
             pass
 
@@ -6099,11 +6801,22 @@ class App:
             self.settings.window_state = "zoomed" if state == "zoomed" else "normal"
             if state == "normal":
                 self.settings.window_geometry = self.root.geometry()
-            if self._editor_visible:
+            try:
+                n_sash = len(self.main_paned.panes()) - 1
+                xs = [int(self.main_paned.sash_coord(i)[0])
+                      for i in range(n_sash)]
+                if xs:
+                    self.settings.sash_positions = ",".join(
+                        str(x) for x in xs)
+                    self.settings.main_sash = xs[0]  # keep legacy in sync
+            except Exception:
+                pass
+            # Remember the pop-out window's geometry if it's open.
+            if (getattr(self, "_caseload_popped", False)
+                    and getattr(self, "caseload_window", None) is not None):
                 try:
-                    self.settings.main_sash = int(
-                        self.main_paned.sash_coord(0)[0]
-                    )
+                    self.settings.caseload_window_geometry = \
+                        self.caseload_window.geometry()
                 except Exception:
                     pass
             save_settings(self.settings)
@@ -6419,14 +7132,23 @@ class App:
     # ----- Scenario firing -----
 
     def _find_student(self) -> None:
-        query = self.search_var.get().strip()
+        self._find_student_by_query(self.search_var.get())
+
+    def _find_student_by_query(self, query: str, new_tab: bool = False) -> None:
+        """Navigate the worker browser to a student record by query
+        (name / Student ID / email). Shared by the main Find box and
+        the caseload panel's row-click. When `new_tab` is True the
+        student opens in a fresh browser tab (right-click), otherwise
+        the current tab is reused (double-click)."""
+        query = (query or "").strip()
         if not query:
             return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
-        self._append_log(f"--- Searching {query!r} ---")
-        self.worker.submit_find_student(query)
+        where = " (new tab)" if new_tab else ""
+        self._append_log(f"--- Searching {query!r}{where} ---")
+        self.worker.submit_find_student(query, new_tab=new_tab)
 
     def _fire(self, scenario: ScenarioConfig) -> None:
         if self._is_busy:
@@ -7216,10 +7938,9 @@ class App:
             self._append_log(f"Template preview render failed: {e}")
             return False
 
-        inline_images = {
-            Path(fname).stem: TEMPLATES_DIR / fname
-            for fname in email_cfg.inline_images
-        }
+        inline_images = self._resolve_inline_images(
+            preview_body, email_cfg.inline_images,
+        )
 
         self._append_log("Opening template preview in Outlook...")
         try:
@@ -7245,6 +7966,33 @@ class App:
             f"Outlook (it won't deliver; the placeholder address is "
             f"invalid).",
         )
+
+    def _resolve_inline_images(
+        self, body_html: str, configured: Optional[list] = None,
+    ) -> dict:
+        """Build the {cid: path} map for compose_email.
+
+        Starts from the scenario's explicitly-configured filenames, then
+        auto-adds any `cid:` the rendered body references whose matching
+        file exists in TEMPLATES_DIR (the Add-image dialog writes
+        `src="cid:<filename-stem>"`, so cid `image001` ⇢ `image001.*`).
+
+        The auto-add is what prevents the 'linked image cannot be
+        displayed' breakage: a scenario can reuse a template whose image
+        was never listed in *its* inline_images, and the image still
+        embeds because we resolve it straight from the body."""
+        images: dict = {}
+        for fname in (configured or []):
+            p = TEMPLATES_DIR / fname
+            if p.exists():
+                images[Path(fname).stem] = p
+        for cid in set(re.findall(r'src="cid:([^"]+)"', body_html or "")):
+            if cid in images:
+                continue
+            match = next(iter(sorted(TEMPLATES_DIR.glob(f"{cid}.*"))), None)
+            if match is not None:
+                images[cid] = match
+        return images
 
     def _send_scenario_email(
         self,
@@ -7346,11 +8094,12 @@ class App:
             self._append_log(f"Email template render failed: {e}")
             return False
 
-        # CID auto-derived from filename stem (signature.png → 'signature').
-        inline_images = {
-            Path(fname).stem: TEMPLATES_DIR / fname
-            for fname in email_cfg.inline_images
-        }
+        # CID images: configured list PLUS any cid: the body references
+        # (so a template's image embeds even if this scenario's
+        # inline_images list was left empty).
+        inline_images = self._resolve_inline_images(
+            body_html, email_cfg.inline_images,
+        )
 
         # To: optional override (for test-mode addresses or any custom
         # routing), falling back to the student's email from caseload.
@@ -8155,6 +8904,7 @@ class App:
                     "emails will use the slower per-student row scrape. "
                     "Set up Caseload Tool view in ⚙ Settings to fix."
                 )
+        self._refresh_caseload_panel()
         return True
 
     def _read_clipboard_content(self) -> str:
@@ -8217,6 +8967,36 @@ class App:
         self.log.insert("end", msg + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _toggle_log(self) -> None:
+        """Collapse/expand the activity-log box to reclaim vertical
+        space. Collapsed leaves just the header row visible."""
+        if self._log_visible:
+            self.log_tabview.grid_remove()
+            self._log_pane.grid_rowconfigure(6, weight=0)
+            self._log_collapse_btn.configure(text="▶ Activity log")
+            self._log_visible = False
+        else:
+            self.log_tabview.grid()
+            self._log_pane.grid_rowconfigure(6, weight=1)
+            self._log_collapse_btn.configure(text="▼ Activity log")
+            self._log_visible = True
+
+    def _copy_log(self) -> None:
+        """Copy the full activity-log text to the clipboard, with a brief
+        'Copied ✓' confirmation on the button."""
+        try:
+            text = self.log.get("1.0", "end-1c")
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            return
+        try:
+            self._log_copy_btn.configure(text="Copied ✓")
+            self.root.after(
+                1200, lambda: self._log_copy_btn.configure(text="📋 Copy"))
+        except Exception:
+            pass
 
     # ----- Note log (tabs + CSV) -----
 

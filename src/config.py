@@ -134,9 +134,16 @@ class Settings:
     # Empty / 0 means "use the built-in default".
     window_geometry: str = ""
     main_sash: int = 0
+    # All horizontal divider x-positions, comma-separated (main|editor,
+    # editor|caseload, ...). Supersedes the single main_sash, which is
+    # kept in sync for backward compatibility.
+    sash_positions: str = ""
     # "normal" or "zoomed" (maximized). When zoomed, window_geometry
     # holds the last *normal* size to fall back to on un-maximize.
     window_state: str = "normal"
+    # Geometry "WxH+X+Y" of the caseload panel when popped out into its
+    # own window (for a second monitor). Empty means "use the default".
+    caseload_window_geometry: str = ""
 
 
 def load_settings() -> Settings:

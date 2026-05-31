@@ -448,16 +448,22 @@ def click_caseload_row(row, name: str, name_idx: int, on_status=None) -> bool:
         try:
             if sub_locator.count() == 0:
                 continue
-            # Step 2a: try Playwright click first (gets event
-            # propagation right, triggers Lightning handlers
-            # reliably).
+            # Step 2a: JS click first. It dispatches the click straight
+            # to the element, so it fires Lightning's onClick handler
+            # regardless of (a) the cell being scrolled off-viewport, or
+            # (b) the row being visually COVERED by an already-open
+            # student record panel. A coordinate-based Playwright click
+            # — even force=True — lands on whatever overlays the row, so
+            # opening a second student while one was already open would
+            # silently click the open record and navigate nowhere (it
+            # still reported success because force clicks never raise).
             try:
-                sub_locator.first.click(force=True)
-                return True
-            except Exception as inner:
-                # Step 2b: fall back to JS click — bypasses the
-                # viewport requirement entirely.
                 sub_locator.first.evaluate("el => el.click()")
+                return True
+            except Exception:
+                # Step 2b: fall back to a real Playwright click for any
+                # component that insists on a trusted pointer event.
+                sub_locator.first.click(force=True)
                 return True
         except Exception as e:
             diag(f"  [search] click attempt failed: {e}")
