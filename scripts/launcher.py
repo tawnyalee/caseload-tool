@@ -5459,6 +5459,9 @@ class CaseloadPanel:
         # rebuild (pop-out / re-dock).
         self._active_filters: list[dict] = []
         self._filters_open = False
+        # Column drag-reorder state (header click-drag).
+        self._coldrag: Optional[dict] = None
+        self._suppress_next_sort = False
         self.frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.frame.grid_columnconfigure(0, weight=1)
         # Rows: 0 bar · 1 filters (collapsible) · 2 table (stretch) ·
@@ -5479,10 +5482,11 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         )
         self.refresh_btn.grid(row=0, column=0, padx=(0, 4))
-        ctk.CTkLabel(
+        self.caseload_label = ctk.CTkLabel(
             bar, text="Caseload",
             font=ctk.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=1, padx=(4, 8))
+        )
+        self.caseload_label.grid(row=0, column=1, padx=(4, 8))
         self.search_var = ctk.StringVar()
         self.search_entry = ctk.CTkEntry(
             bar, textvariable=self.search_var,
@@ -5499,18 +5503,24 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         )
         self.filters_toggle_btn.grid(row=0, column=3, padx=(0, 4))
+        # Column chooser (show/hide + reorder + persisted widths).
+        self.columns_btn = ctk.CTkButton(
+            bar, text="☰ Columns", width=90, command=self._open_columns_dialog,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.columns_btn.grid(row=0, column=4, padx=(0, 4))
         self.freshness_lbl = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11),
             text_color=("gray40", "gray65"),
         )
-        self.freshness_lbl.grid(row=0, column=4, padx=8)
+        self.freshness_lbl.grid(row=0, column=5, padx=8)
         # Pop the panel into its own window (2nd monitor) / re-dock it.
         self.popout_btn = ctk.CTkButton(
             bar, text=("⧉ Dock" if self.popped else "⧉ Pop out"),
             width=80, command=self.app._toggle_caseload_popout,
             **SECONDARY_BTN_KWARGS,
         )
-        self.popout_btn.grid(row=0, column=5, padx=(0, 4))
+        self.popout_btn.grid(row=0, column=6, padx=(0, 4))
 
         # Collapsible filters section (row 1) — hidden until toggled.
         self.filters_wrap = ctk.CTkFrame(self.frame)
@@ -5582,6 +5592,9 @@ class CaseloadPanel:
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<space>", self._toggle_focused_row)
         self.tree.bind("<Key-space>", self._toggle_focused_row)
+        # Drag a column heading sideways to reorder columns.
+        self.tree.bind("<B1-Motion>", self._on_head_drag, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._on_head_release, add="+")
         self._row_by_iid: dict[str, dict] = {}
         self._table_wrap = table_wrap
         self.empty_lbl = ctk.CTkLabel(
@@ -5612,6 +5625,49 @@ class CaseloadPanel:
         )
         self.fire_sel_btn.grid(row=0, column=2, padx=(0, 4))
         self.action_bar.grid_remove()  # shown on first selection
+
+        # Responsive bar: collapse labels to symbols when the panel is
+        # narrow (docked in a thin pane). Recomputed on resize.
+        self._narrow = False
+        self.frame.bind("<Configure>", self._on_panel_resize)
+
+    def _bar_button_text(self) -> dict:
+        """Button/label text for the current narrow/wide + toggle state."""
+        n = self._narrow
+        filt_arrow = "▾" if self._filters_open else "▸"
+        popped = getattr(self, "popped", False)
+        return {
+            "filters": filt_arrow if n else f"{filt_arrow} Filters",
+            "columns": "☰" if n else "☰ Columns",
+            "popout": ("⧉" if popped else "⧉") if n
+                      else ("⧉ Dock" if popped else "⧉ Pop out"),
+        }
+
+    def _apply_bar_mode(self) -> None:
+        t = self._bar_button_text()
+        try:
+            self.filters_toggle_btn.configure(
+                text=t["filters"], width=36 if self._narrow else 80)
+            self.columns_btn.configure(
+                text=t["columns"], width=36 if self._narrow else 90)
+            self.popout_btn.configure(
+                text=t["popout"], width=36 if self._narrow else 80)
+            if self._narrow:
+                self.caseload_label.grid_remove()
+            else:
+                self.caseload_label.grid()
+        except Exception:
+            pass
+
+    def _on_panel_resize(self, event=None) -> None:
+        try:
+            w = self.frame.winfo_width()
+        except Exception:
+            return
+        narrow = w < 460
+        if narrow != self._narrow:
+            self._narrow = narrow
+            self._apply_bar_mode()
 
     def _style_tree(self) -> None:
         """Style the ttk.Treeview to approximate the CTk theme. Uses the
@@ -5693,6 +5749,11 @@ class CaseloadPanel:
         self.populate()
 
     def _sort_by(self, col: str) -> None:
+        # A heading drag (reorder) fires the heading command on release too;
+        # swallow that one sort so reordering doesn't also re-sort.
+        if self._suppress_next_sort:
+            self._suppress_next_sort = False
+            return
         if self._sort_col == col:
             self._sort_reverse = not self._sort_reverse
         else:
@@ -5728,14 +5789,88 @@ class CaseloadPanel:
 
     def _on_tree_click(self, event):
         """Left-click handler: toggle selection when the click lands in the
-        checkbox (#0 tree) column; otherwise let the default browse-select
-        run."""
-        if self.tree.identify_region(event.x, event.y) != "tree":
-            return  # data cell / heading / separator → default behaviour
+        checkbox (#0 tree) column; arm a column drag on a heading press;
+        otherwise let the default browse-select / sort / resize run."""
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "heading":
+            name = self._col_name_at(event.x)
+            self._coldrag = (
+                {"col": name, "x": event.x, "moved": False} if name else None)
+            return  # let sort (on release) / resize proceed unless we drag
+        self._coldrag = None
+        if region != "tree":
+            return  # data cell / separator → default behaviour
         iid = self.tree.identify_row(event.y)
         if iid:
             self._toggle_row(iid)
         return "break"  # don't move the highlight on a checkbox click
+
+    def _disp_cols(self) -> list[str]:
+        """The currently-displayed data columns (names) in display order."""
+        try:
+            cols = list(self.tree["columns"])
+        except Exception:
+            return []
+        try:
+            dc = self.tree["displaycolumns"]
+            dc = list(dc) if not isinstance(dc, str) else []
+        except Exception:
+            dc = []
+        if not dc or dc == ["#all"]:
+            return cols
+        return [c for c in dc if c in cols]
+
+    def _col_name_at(self, x) -> Optional[str]:
+        """Data-column name under x (None for the #0 checkbox column)."""
+        colid = self.tree.identify_column(x)
+        if not colid or colid == "#0":
+            return None
+        try:
+            idx = int(colid[1:]) - 1
+        except (ValueError, IndexError):
+            return None
+        cols = self._disp_cols()
+        return cols[idx] if 0 <= idx < len(cols) else None
+
+    def _on_head_drag(self, event):
+        d = self._coldrag
+        if not d:
+            return
+        if not d["moved"] and abs(event.x - d["x"]) > 6:
+            d["moved"] = True
+            try:
+                self.tree.configure(cursor="exchange")
+            except Exception:
+                pass
+
+    def _on_head_release(self, event):
+        d = self._coldrag
+        self._coldrag = None
+        try:
+            self.tree.configure(cursor="")
+        except Exception:
+            pass
+        if not d or not d.get("moved") or not d.get("col"):
+            return
+        # This release was a drag, not a heading click → don't also sort.
+        self._suppress_next_sort = True
+        src = d["col"]
+        cols = self._disp_cols()
+        if src not in cols:
+            return
+        tgt = self._col_name_at(event.x)
+        cols.remove(src)
+        if tgt and tgt in cols:
+            cols.insert(cols.index(tgt), src)
+        elif self.tree.identify_column(event.x) == "#0":
+            cols.insert(0, src)  # dropped on the far-left → move to front
+        else:
+            cols.append(src)  # released past the last column → end
+        try:
+            self.tree["displaycolumns"] = cols
+        except Exception:
+            return
+        self.persist_column_state()
 
     def _toggle_focused_row(self, event=None):
         """Space toggles the checkbox of the keyboard-focused row."""
@@ -5840,13 +5975,12 @@ class CaseloadPanel:
         if self._filters_open:
             self.filters_wrap.grid_remove()
             self._filters_open = False
-            self.filters_toggle_btn.configure(text="▸ Filters")
         else:
             self.filters_wrap.grid()
             self._filters_open = True
-            self.filters_toggle_btn.configure(text="▾ Filters")
             if not self.filter_rows:
                 self._add_filter_row()
+        self._apply_bar_mode()  # refresh the ▸/▾ arrow (respects narrow mode)
 
     def _add_filter_row(self, prefilled: Optional[dict] = None) -> "FilterRow":
         row = FilterRow(
@@ -5902,6 +6036,243 @@ class CaseloadPanel:
         except Exception:
             return list(rows)
 
+    # ----- column show/hide + reorder + width persistence -----
+
+    def _load_col_prefs(self) -> dict:
+        """Parse the persisted caseload column layout. Always returns a
+        dict with visible / hidden / widths keys."""
+        import json
+        raw = (self.app.settings.caseload_columns or "").strip()
+        if not raw:
+            return {"visible": [], "hidden": [], "widths": {}}
+        try:
+            d = json.loads(raw)
+            return {
+                "visible": [str(c) for c in d.get("visible", [])],
+                "hidden": [str(c) for c in d.get("hidden", [])],
+                "widths": {str(k): v for k, v in dict(d.get("widths", {})).items()},
+            }
+        except Exception:
+            return {"visible": [], "hidden": [], "widths": {}}
+
+    def _resolve_display_columns(self, headers: list[str],
+                                 prefs: Optional[dict] = None) -> list[str]:
+        """Ordered list of visible CSV headers from saved prefs. Columns
+        never seen before (new CSV exports) default to visible and append
+        after the saved order; explicitly-hidden ones stay hidden."""
+        prefs = prefs if prefs is not None else self._load_col_prefs()
+        hidden = set(prefs.get("hidden", []))
+        visible = [c for c in prefs.get("visible", []) if c in headers]
+        seen = set(visible) | hidden
+        for c in headers:
+            if c not in seen:
+                visible.append(c)
+        return visible or list(headers)
+
+    def _apply_column_layout(self, headers: list[str]) -> None:
+        """Set the Treeview's displaycolumns (show/hide + order) and saved
+        widths from the persisted prefs."""
+        prefs = self._load_col_prefs()
+        visible = self._resolve_display_columns(headers, prefs)
+        try:
+            self.tree["displaycolumns"] = visible
+        except Exception:
+            try:
+                self.tree["displaycolumns"] = list(headers)
+            except Exception:
+                pass
+        widths = prefs.get("widths", {})
+        for h, w in widths.items():
+            if h in headers and isinstance(w, int) and w > 20:
+                try:
+                    self.tree.column(h, width=w)
+                except Exception:
+                    pass
+
+    def _current_col_widths(self) -> dict:
+        """Current pixel width of every defined column, keyed by header."""
+        out = {}
+        try:
+            cols = list(self.tree["columns"])
+        except Exception:
+            return out
+        for c in cols:
+            try:
+                out[c] = int(self.tree.column(c, "width"))
+            except Exception:
+                pass
+        return out
+
+    def persist_column_state(self) -> None:
+        """Capture the current visible/order + widths into Settings. Called
+        on Apply, and on teardown (pop-out/re-dock, app close) so a
+        drag-resize survives even without opening the chooser."""
+        import json
+        try:
+            cols = list(self.tree["columns"])
+        except Exception:
+            cols = []
+        if not cols:
+            return
+        try:
+            dc = self.tree["displaycolumns"]
+            dc = list(dc) if not isinstance(dc, str) else [dc]
+            if not dc or dc == ["#all"]:
+                visible = list(cols)
+            else:
+                visible = [c for c in dc if c in cols]
+        except Exception:
+            visible = list(cols)
+        hidden = [c for c in cols if c not in visible]
+        payload = {
+            "visible": visible, "hidden": hidden,
+            "widths": self._current_col_widths(),
+        }
+        try:
+            self.app.settings.caseload_columns = json.dumps(payload)
+            save_settings(self.app.settings)
+        except Exception:
+            pass
+
+    def _open_columns_dialog(self) -> None:
+        """Dialog to show/hide and reorder the caseload columns."""
+        rows = self.app._caseload_rows or []
+        if not rows:
+            return
+        headers = list(rows[0].keys())
+        # Capture any drag-resizes done since load so they aren't lost.
+        self.persist_column_state()
+        prefs = self._load_col_prefs()
+        visible_order = self._resolve_display_columns(headers, prefs)
+        hidden = [c for c in headers if c not in visible_order]
+        # Working model: [header, visible_bool], visible first in order.
+        work = [[c, True] for c in visible_order] + [[c, False] for c in hidden]
+
+        dlg = ctk.CTkToplevel(self.frame)
+        dlg.title("Choose columns")
+        dlg.geometry("440x500")
+        try:
+            dlg.transient(self.frame.winfo_toplevel())
+        except Exception:
+            pass
+        dlg.attributes("-topmost", True)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            dlg, text="Show, hide and reorder caseload columns",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        scroll = ctk.CTkScrollableFrame(dlg)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        scroll.grid_columnconfigure(2, weight=1)
+
+        def move(idx: int, delta: int) -> None:
+            j = idx + delta
+            if 0 <= j < len(work):
+                work[idx], work[j] = work[j], work[idx]
+                redraw()
+
+        def redraw() -> None:
+            for w in scroll.winfo_children():
+                w.destroy()
+            for i, pair in enumerate(work):
+                hdr = pair[0]
+                var = ctk.BooleanVar(value=pair[1])
+
+                def on_toggle(p=pair, v=var):
+                    p[1] = v.get()
+
+                ctk.CTkButton(
+                    scroll, text="▲", width=26, command=lambda ix=i: move(ix, -1),
+                    **SECONDARY_BTN_KWARGS,
+                ).grid(row=i, column=0, padx=(2, 0), pady=1)
+                ctk.CTkButton(
+                    scroll, text="▼", width=26, command=lambda ix=i: move(ix, 1),
+                    **SECONDARY_BTN_KWARGS,
+                ).grid(row=i, column=1, padx=(2, 4), pady=1)
+                ctk.CTkCheckBox(
+                    scroll, text=caseload_csv.display_for_column(hdr),
+                    variable=var, command=on_toggle,
+                ).grid(row=i, column=2, sticky="w", padx=4, pady=1)
+
+        redraw()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 10))
+
+        def do_apply() -> None:
+            visible = [p[0] for p in work if p[1]]
+            if not visible:
+                from tkinter import messagebox
+                messagebox.showinfo(
+                    "Columns", "Keep at least one column visible.")
+                return
+            hidden2 = [p[0] for p in work if not p[1]]
+            import json
+            payload = {
+                "visible": visible, "hidden": hidden2,
+                "widths": self._current_col_widths(),
+            }
+            self.app.settings.caseload_columns = json.dumps(payload)
+            save_settings(self.app.settings)
+            self._apply_column_layout(headers)
+            dlg.destroy()
+
+        def check_all() -> None:
+            # Reveal every column WITHOUT changing the current order.
+            for p in work:
+                p[1] = True
+            redraw()
+
+        def copy_caseload() -> None:
+            # Match the live Salesforce Caseload view's columns + order.
+            from tkinter import messagebox
+            if not self.app.worker.ready_event.is_set():
+                messagebox.showinfo(
+                    "Copy caseload", "Browser not ready yet — try again "
+                    "once it's loaded.")
+                return
+            cols = self.app._read_caseload_columns_blocking()
+            if not cols:
+                messagebox.showinfo(
+                    "Copy caseload",
+                    "Couldn't read the caseload view's columns. Make sure "
+                    "the browser is on the Caseload list, then try again.")
+                return
+            view = []
+            for c in cols:
+                csvh = caseload_csv.resolve_column(c.get("name", ""), headers)
+                if csvh in headers and csvh not in view:
+                    view.append(csvh)
+            if not view:
+                messagebox.showinfo(
+                    "Copy caseload",
+                    "None of the caseload view's columns matched the CSV "
+                    "export.")
+                return
+            rest = [h for h in headers if h not in view]
+            work[:] = [[h, True] for h in view] + [[h, False] for h in rest]
+            redraw()
+
+        ctk.CTkButton(btns, text="Apply", width=70, command=do_apply).pack(
+            side="right", padx=(6, 0))
+        ctk.CTkButton(
+            btns, text="Cancel", width=70, command=dlg.destroy,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            btns, text="Show all", width=78, command=check_all,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btns, text="Copy caseload", width=110, command=copy_caseload,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(6, 0))
+
     def populate(self) -> None:
         rows = self.app._caseload_rows or []
         if not rows:
@@ -5925,6 +6296,8 @@ class CaseloadPanel:
                     h, command=lambda c=h: self._sort_by(c))
                 self.tree.column(h, width=120, minwidth=60,
                                  anchor="w", stretch=False)
+            # Apply the saved show/hide + order + widths.
+            self._apply_column_layout(headers)
         # Heading labels (display names) + sort arrow on the active one.
         for h in headers:
             disp = caseload_csv.display_for_column(h)
@@ -6882,6 +7255,10 @@ class App:
         tkinter can't reparent a live widget, so we rebuild instead."""
         old = getattr(self, "caseload_panel", None)
         if old is not None:
+            try:
+                old.persist_column_state()  # keep widths/order across rebuild
+            except Exception:
+                pass
             try:
                 old.frame.destroy()
             except Exception:
@@ -9924,6 +10301,13 @@ class App:
 
     def _on_close(self) -> None:
         self._save_window_state()
+        # Persist caseload column layout (widths the user drag-resized).
+        try:
+            panel = getattr(self, "caseload_panel", None)
+            if panel is not None:
+                panel.persist_column_state()
+        except Exception:
+            pass
         try:
             if self.hotkey_listener is not None:
                 self.hotkey_listener.stop()

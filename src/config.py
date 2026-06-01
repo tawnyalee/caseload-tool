@@ -144,6 +144,13 @@ class Settings:
     # Geometry "WxH+X+Y" of the caseload panel when popped out into its
     # own window (for a second monitor). Empty means "use the default".
     caseload_window_geometry: str = ""
+    # Caseload-panel column layout as a JSON string:
+    #   {"visible": [csv_header,...ordered], "hidden": [csv_header,...],
+    #    "widths": {csv_header: px}}
+    # Empty means "show every column in CSV order at default width".
+    # Columns the user has never seen (new CSV exports) default to visible
+    # and append after the saved order.
+    caseload_columns: str = ""
 
 
 def load_settings() -> Settings:
