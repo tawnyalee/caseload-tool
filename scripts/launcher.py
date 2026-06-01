@@ -29,6 +29,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk
+import tkinter.font as tkfont
 import yaml
 from pynput import keyboard
 
@@ -2399,6 +2400,587 @@ def prompt_add_image_dialog(
     return result["html"], result["filename"]
 
 
+class _EditorHTMLParser(HTMLParser):
+    """Parse simple HTML into a RichTextEditor's Tk Text with editable
+    tags. Companion to RichTextEditor.to_html — handles paragraphs,
+    headings, b/i/u, links, alignment, images, and (for round-tripping
+    older templates) bullet/numbered lists rendered as plain lines."""
+
+    def __init__(self, editor: "RichTextEditor"):
+        super().__init__()
+        self.ed = editor
+        self.t = editor.text
+        self._inline: list[str] = []        # active bold/italic/underline
+        self._link: Optional[str] = None    # active link tag name
+        self._block_start: Optional[str] = None
+        self._block: str = "p"              # p | h2
+        self._align: str = "left"
+        self._list: list[str] = []          # ul/ol nesting (round-trip only)
+        self._ol_n: list[int] = []
+        self._skip = 0
+        self._pending_nl = False            # emit a newline before next block
+
+    _SKIP = {"style", "script", "head", "title", "meta", "link"}
+
+    def _begin_block(self, block: str, align: str) -> None:
+        if self._pending_nl:
+            self.t.insert("end", "\n")
+        self._pending_nl = False
+        self._block_start = self.t.index("end-1c")
+        self._block = block
+        self._align = align
+
+    def _end_block(self) -> None:
+        if self._block_start is None:
+            return
+        end = self.t.index("end-1c")
+        if self._block == "h2":
+            self.t.tag_add("h2", self._block_start, end)
+        elif self._block in ("ul", "ol"):
+            self.t.tag_add(self._block, self._block_start, end)
+        if self._align == "center":
+            self.t.tag_add("align_center", self._block_start, end)
+        elif self._align == "right":
+            self.t.tag_add("align_right", self._block_start, end)
+        self._block_start = None
+        self._pending_nl = True
+
+    @staticmethod
+    def _align_of(attrs: dict) -> str:
+        style = (attrs.get("style", "") or "").lower()
+        if "text-align:center" in style.replace(" ", ""):
+            return "center"
+        if "text-align:right" in style.replace(" ", ""):
+            return "right"
+        return "left"
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        d = dict(attrs)
+        if tag == "p":
+            self._begin_block("p", self._align_of(d))
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._begin_block("h2", self._align_of(d))
+        elif tag == "br":
+            self.t.insert("end", "\n")
+        elif tag in ("b", "strong"):
+            self._inline.append("bold")
+        elif tag in ("i", "em"):
+            self._inline.append("italic")
+        elif tag == "u":
+            self._inline.append("underline")
+        elif tag == "a":
+            self._link = self.ed._new_link(d.get("href", ""))
+        elif tag in ("ul", "ol"):
+            self._list.append(tag)
+            self._ol_n.append(0)
+        elif tag == "li":
+            if self._pending_nl:
+                self.t.insert("end", "\n")
+            self._pending_nl = False
+            self._block_start = self.t.index("end-1c")
+            kind = "ol" if (self._list and self._list[-1] == "ol") else "ul"
+            self._block, self._align = kind, "left"
+            mstart = self.t.index("end-1c")
+            if kind == "ol":
+                self._ol_n[-1] += 1
+                self.t.insert("end", "%d. " % self._ol_n[-1])
+            else:
+                self.t.insert("end", "• ")
+            self.t.tag_add("listmarker", mstart, "end-1c")
+        elif tag == "img":
+            self.ed._insert_image_token(
+                d.get("src", ""), pending_nl=self._pending_nl)
+            self._pending_nl = True
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP:
+            self._skip = max(0, self._skip - 1)
+            return
+        if self._skip:
+            return
+        if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6", "li"):
+            self._end_block()
+        elif tag in ("b", "strong"):
+            self._pop("bold")
+        elif tag in ("i", "em"):
+            self._pop("italic")
+        elif tag == "u":
+            self._pop("underline")
+        elif tag == "a":
+            self._link = None
+        elif tag in ("ul", "ol"):
+            if self._list:
+                self._list.pop()
+                self._ol_n.pop()
+
+    def _pop(self, name: str) -> None:
+        for i in range(len(self._inline) - 1, -1, -1):
+            if self._inline[i] == name:
+                del self._inline[i]
+                return
+
+    def _insert(self, text: str) -> None:
+        tags = tuple(self._inline) + ((self._link,) if self._link else ())
+        self.t.insert("end", text, tags)
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        collapsed = re.sub(r"\s+", " ", data)
+        if not collapsed.strip() and "\n" in data:
+            return
+        if collapsed:
+            self._insert(collapsed)
+
+    def handle_entityref(self, name):
+        if not self._skip:
+            self._insert(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        if not self._skip:
+            self._insert(html.unescape(f"&#{name};"))
+
+
+class RichTextEditor:
+    """Lightweight rich-text editor over tk.Text that round-trips to
+    simple, email-friendly HTML. Block model is LINE-BASED: each logical
+    line is one block — a paragraph by default, or a heading; alignment is
+    a per-line attribute. Inline runs carry bold/italic/underline/link
+    tags. {{vars}} are literal text; images are placeholder tokens that
+    serialize back to `<img src="cid:…">`. (Lists are a later phase.)"""
+
+    _INLINE = ("bold", "italic", "underline")
+
+    def __init__(self, parent, base_size: int = 11,
+                 on_add_image: Optional[Callable] = None,
+                 on_insert_var=None):
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.frame.grid_rowconfigure(1, weight=1)
+        self.frame.grid_columnconfigure(0, weight=1)
+        self._base_size = base_size
+        self._link_seq = 0
+        self._links: dict[str, str] = {}
+        self._img_seq = 0
+        self._imgs: dict[str, str] = {}
+        self._on_add_image = on_add_image
+
+        self._build_toolbar()
+
+        wrap = ctk.CTkFrame(self.frame)
+        wrap.grid(row=1, column=0, sticky="nsew")
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg, fg = ("#2b2b2b", "#dce4ee") if dark else ("#ffffff", "#1a1a1a")
+        self.text = tk.Text(
+            wrap, wrap="word", undo=True, borderwidth=0,
+            font=("Segoe UI", base_size), padx=10, pady=8,
+            background=bg, foreground=fg, insertbackground=fg,
+            spacing3=4,
+        )
+        self.text.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(wrap, command=self.text.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=vsb.set)
+        self._configure_tags()
+        # Enter continues/exits a list; Space drives Markdown shortcuts.
+        self.text.bind("<Return>", self._on_return)
+        self.text.bind("<KeyPress-space>", self._on_space)
+
+    # ----- setup -----
+
+    def _configure_tags(self) -> None:
+        base = tkfont.Font(family="Segoe UI", size=self._base_size)
+        self.text.tag_configure(
+            "bold", font=tkfont.Font(
+                family="Segoe UI", size=self._base_size, weight="bold"))
+        self.text.tag_configure(
+            "italic", font=tkfont.Font(
+                family="Segoe UI", size=self._base_size, slant="italic"))
+        self.text.tag_configure(
+            "underline", font=tkfont.Font(
+                family="Segoe UI", size=self._base_size, underline=True))
+        self.text.tag_configure(
+            "h2", font=tkfont.Font(
+                family="Segoe UI", size=self._base_size + 6, weight="bold"),
+            spacing1=8, spacing3=4)
+        self.text.tag_configure("align_center", justify="center")
+        self.text.tag_configure("align_right", justify="right")
+        self.text.tag_configure("ul", lmargin1=22, lmargin2=38)
+        self.text.tag_configure("ol", lmargin1=22, lmargin2=38)
+        self.text.tag_configure("listmarker")  # marks bullet/number prefix
+        self.text.tag_configure(
+            "image", foreground=("#1f6aa5" if ctk.get_appearance_mode() ==
+                                 "Dark" else "#3a7ebf"))
+        del base
+
+    def _build_toolbar(self) -> None:
+        bar = ctk.CTkFrame(self.frame, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+        def btn(text, cmd, w=34):
+            return ctk.CTkButton(
+                bar, text=text, width=w, height=26, command=cmd,
+                font=ctk.CTkFont(size=12), **SECONDARY_BTN_KWARGS)
+
+        btn("B", lambda: self._toggle_inline("bold"), 30).pack(
+            side="left", padx=1)
+        btn("I", lambda: self._toggle_inline("italic"), 30).pack(
+            side="left", padx=1)
+        btn("U", lambda: self._toggle_inline("underline"), 30).pack(
+            side="left", padx=1)
+        btn("Heading", self._toggle_heading, 64).pack(side="left", padx=(8, 1))
+        btn("• List", lambda: self._toggle_list("ul"), 52).pack(
+            side="left", padx=(6, 1))
+        btn("1. List", lambda: self._toggle_list("ol"), 56).pack(
+            side="left", padx=1)
+        ctk.CTkLabel(
+            bar, text="Align:", font=ctk.CTkFont(size=11),
+        ).pack(side="left", padx=(8, 2))
+        btn("Left", lambda: self._set_align("left"), 48).pack(
+            side="left", padx=1)
+        btn("Center", lambda: self._set_align("center"), 58).pack(
+            side="left", padx=1)
+        btn("Right", lambda: self._set_align("right"), 52).pack(
+            side="left", padx=1)
+        btn("🔗 Link", self._add_link, 64).pack(side="left", padx=(8, 1))
+        if self._on_add_image:
+            btn("🖼 Image", lambda: self._on_add_image(), 70).pack(
+                side="left", padx=1)
+
+    # ----- formatting actions -----
+
+    def _sel_range(self):
+        try:
+            return self.text.index("sel.first"), self.text.index("sel.last")
+        except tk.TclError:
+            return None
+
+    def _toggle_inline(self, tag: str) -> None:
+        rng = self._sel_range()
+        if not rng:
+            return
+        a, b = rng
+        # If every char already has the tag, remove it; else add it.
+        on = all(tag in self.text.tag_names(f"{a}+{i}c")
+                 for i in range(self._span(a, b)))
+        if on:
+            self.text.tag_remove(tag, a, b)
+        else:
+            self.text.tag_add(tag, a, b)
+        self.text.focus_set()
+
+    def _span(self, a: str, b: str) -> int:
+        return max(0, len(self.text.get(a, b)))
+
+    def _line_range(self):
+        sel = self._sel_range()
+        if sel:
+            first = int(sel[0].split(".")[0])
+            last = int(sel[1].split(".")[0])
+        else:
+            first = last = int(self.text.index("insert").split(".")[0])
+        return first, last
+
+    def _line_block_kind(self, ln: int) -> Optional[str]:
+        names = self.text.tag_names(f"{ln}.0")
+        for k in ("h2", "ul", "ol"):
+            if k in names:
+                return k
+        return None
+
+    def _strip_marker(self, ln: int) -> None:
+        """Remove a leading bullet/number marker from a list line."""
+        a = f"{ln}.0"
+        rng = self.text.tag_nextrange("listmarker", a, f"{ln}.end")
+        if rng and self.text.compare(rng[0], "==", a):
+            self.text.delete(rng[0], rng[1])
+
+    def _set_line_block(self, ln: int, block: Optional[str]) -> None:
+        """Set a line's block type: None (paragraph), 'h2', 'ul', or 'ol'.
+        Markers for list lines are (re)generated by _renumber_lists."""
+        a, b = f"{ln}.0", f"{ln + 1}.0"
+        self._strip_marker(ln)
+        for t in ("h2", "ul", "ol"):
+            self.text.tag_remove(t, a, b)
+        if block in ("h2", "ul", "ol"):
+            self.text.tag_add(block, a, b)
+
+    def _renumber_lists(self) -> None:
+        """Rewrite every list line's marker: '• ' for bullets, sequential
+        '1. 2. …' for numbered runs (restarting after any break)."""
+        last = int(self.text.index("end-1c").split(".")[0])
+        prev = None
+        n = 0
+        for ln in range(1, last + 1):
+            kind = self._line_block_kind(ln)
+            kind = kind if kind in ("ul", "ol") else None
+            if kind == "ol":
+                n = (n + 1) if prev == "ol" else 1
+            prev = kind
+            if kind:
+                self._strip_marker(ln)
+                marker = (f"{n}. " if kind == "ol" else "• ")
+                self.text.insert(f"{ln}.0", marker)
+                self.text.tag_add(
+                    "listmarker", f"{ln}.0", f"{ln}.0 + {len(marker)}c")
+                self.text.tag_add(kind, f"{ln}.0", f"{ln + 1}.0")
+
+    def _toggle_heading(self) -> None:
+        first, last = self._line_range()
+        all_h2 = all(self._line_block_kind(ln) == "h2"
+                     for ln in range(first, last + 1))
+        for ln in range(first, last + 1):
+            self._set_line_block(ln, None if all_h2 else "h2")
+        self.text.focus_set()
+
+    def _toggle_list(self, kind: str) -> None:
+        first, last = self._line_range()
+        all_kind = all(self._line_block_kind(ln) == kind
+                       for ln in range(first, last + 1))
+        for ln in range(first, last + 1):
+            self._set_line_block(ln, None if all_kind else kind)
+        self._renumber_lists()
+        self.text.focus_set()
+
+    def _on_return(self, event=None):
+        """Inside a list: Enter starts a new item; Enter on an empty item
+        leaves the list. Elsewhere: default newline (new paragraph)."""
+        ln = int(self.text.index("insert").split(".")[0])
+        kind = self._line_block_kind(ln)
+        if kind not in ("ul", "ol"):
+            return  # default
+        line = self.text.get(f"{ln}.0", f"{ln}.end")
+        content = re.sub(r"^(?:•\s*|\d+\.\s*)", "", line)
+        if not content.strip():
+            self._set_line_block(ln, None)
+            self._renumber_lists()
+            return "break"
+        self.text.insert("insert", "\n")
+        newln = int(self.text.index("insert").split(".")[0])
+        self.text.tag_add(kind, f"{newln}.0", f"{newln + 1}.0")
+        self._renumber_lists()
+        self.text.see("insert")
+        return "break"
+
+    def _on_space(self, event=None):
+        """Markdown shortcuts on the space key. Line-start: '# '→heading,
+        '- '/'* '/'+ '→bullets, '1. '→numbered. Inline (token then space):
+        **bold**, *italic* / _italic_, [text](url)."""
+        ln, col = map(int, self.text.index("insert").split("."))
+        before = self.text.get(f"{ln}.0", "insert")
+        if before == "#":
+            self.text.delete(f"{ln}.0", "insert")
+            self._set_line_block(ln, "h2")
+            return "break"
+        if before in ("-", "*", "+"):
+            self.text.delete(f"{ln}.0", "insert")
+            self._set_line_block(ln, "ul")
+            self._renumber_lists()
+            return "break"
+        if re.fullmatch(r"\d+\.", before):
+            self.text.delete(f"{ln}.0", "insert")
+            self._set_line_block(ln, "ol")
+            self._renumber_lists()
+            return "break"
+        # Inline tokens ending right at the cursor.
+        for pat, tag in (
+            (r"\*\*([^*]+)\*\*$", "bold"),
+            (r"__([^_]+)__$", "bold"),
+            (r"(?<!\*)\*([^*\s][^*]*)\*$", "italic"),
+            (r"(?<!_)_([^_\s][^_]*)_$", "italic"),
+        ):
+            m = re.search(pat, before)
+            if m:
+                a = f"{ln}.{col - len(m.group(0))}"
+                self.text.delete(a, "insert")
+                self.text.insert(a, m.group(1), (tag,))
+                return  # let the space type normally after the run
+        m = re.search(r"\[([^\]]+)\]\(([^)]+)\)$", before)
+        if m:
+            a = f"{ln}.{col - len(m.group(0))}"
+            link_tag = self._new_link(m.group(2))
+            self.text.delete(a, "insert")
+            self.text.insert(a, m.group(1), (link_tag,))
+            return
+        return
+
+    def _set_align(self, how: str) -> None:
+        first, last = self._line_range()
+        for ln in range(first, last + 1):
+            # Tk's `justify` only takes effect when the tag spans the full
+            # line INCLUDING its newline — hence {ln}.0 .. {ln+1}.0.
+            a, b = f"{ln}.0", f"{ln + 1}.0"
+            self.text.tag_remove("align_center", a, b)
+            self.text.tag_remove("align_right", a, b)
+            if how == "center":
+                self.text.tag_add("align_center", a, b)
+            elif how == "right":
+                self.text.tag_add("align_right", a, b)
+        self.text.focus_set()
+
+    def _add_link(self) -> None:
+        rng = self._sel_range()
+        if not rng:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Add link", "Select the text to turn into a link first.")
+            return
+        url = ctk.CTkInputDialog(
+            text="Link URL (https://… or mailto:…):", title="Add link").get_input()
+        if not url:
+            return
+        tag = self._new_link(url.strip())
+        self.text.tag_add(tag, rng[0], rng[1])
+        self.text.focus_set()
+
+    def _new_link(self, href: str) -> str:
+        self._link_seq += 1
+        tag = f"link#{self._link_seq}"
+        self._links[tag] = href
+        dark = ctk.get_appearance_mode() == "Dark"
+        self.text.tag_configure(
+            tag, foreground=("#79b8ff" if dark else "#1a73e8"),
+            underline=True)
+        return tag
+
+    def insert_text(self, text: str) -> None:
+        self.text.insert("insert", text)
+        self.text.focus_set()
+
+    def _insert_image_token(self, src: str, pending_nl: bool = False) -> None:
+        if pending_nl:
+            self.text.insert("end", "\n")
+        stem = src[4:] if src.startswith("cid:") else src.rsplit("/", 1)[-1]
+        self._img_seq += 1
+        tag = f"img#{self._img_seq}"
+        self._imgs[tag] = src
+        start = self.text.index("end-1c")
+        self.text.insert("end", f"🖼 {stem}")
+        self.text.tag_add("image", start, "end-1c")
+        self.text.tag_add(tag, start, "end-1c")
+
+    def insert_image(self, src: str) -> None:
+        """Insert an image placeholder at a fresh line near the cursor."""
+        self.text.insert("insert", "\n")
+        stem = src[4:] if src.startswith("cid:") else src.rsplit("/", 1)[-1]
+        self._img_seq += 1
+        tag = f"img#{self._img_seq}"
+        self._imgs[tag] = src if src.startswith("cid:") else f"cid:{stem}"
+        start = self.text.index("insert")
+        self.text.insert("insert", f"🖼 {stem}")
+        self.text.tag_add("image", start, "insert")
+        self.text.tag_add(tag, start, "insert")
+        self.text.insert("insert", "\n")
+        self.text.focus_set()
+
+    # ----- HTML <-> editor -----
+
+    def set_html(self, html_text: str) -> None:
+        self.text.delete("1.0", "end")
+        for t in list(self._links):
+            self._links.pop(t, None)
+        self._imgs.clear()
+        self._link_seq = self._img_seq = 0
+        parser = _EditorHTMLParser(self)
+        try:
+            parser.feed(html_text or "")
+            parser.close()
+        except Exception:
+            # Fall back to dropping the raw text in unstyled.
+            self.text.insert("1.0", html_text or "")
+        # Trim a leading blank line the block logic may have produced.
+        if self.text.get("1.0", "1.end").strip() == "" and \
+                int(self.text.index("end-1c").split(".")[0]) > 1:
+            self.text.delete("1.0", "2.0")
+        self._renumber_lists()  # normalize bullet/number markers
+        self.text.edit_reset()
+
+    def _inline_key_at(self, idx: str):
+        names = self.text.tag_names(idx)
+        inline = tuple(n for n in self._INLINE if n in names)
+        link = next((n for n in names if n.startswith("link#")), None)
+        return inline, link
+
+    def _img_tag_on_line(self, ln: int) -> Optional[str]:
+        for n in self.text.tag_names(f"{ln}.0"):
+            if n.startswith("img#"):
+                return n
+        return None
+
+    def _serialize_line(self, ln: int) -> str:
+        line = self.text.get(f"{ln}.0", f"{ln}.end")
+        runs = []  # (text, (inline_tuple, link))
+        for col, ch in enumerate(line):
+            key = self._inline_key_at(f"{ln}.{col}")
+            if runs and runs[-1][1] == key:
+                runs[-1][0].append(ch)
+            else:
+                runs.append(([ch], key))
+        out = []
+        for chars, (inline, link) in runs:
+            text = html.escape("".join(chars))
+            opens, closes = "", ""
+            if link:
+                href = html.escape(self._links.get(link, ""), quote=True)
+                opens += f'<a href="{href}">'
+                closes = "</a>" + closes
+            for t, (o, c) in (("bold", ("<b>", "</b>")),
+                              ("italic", ("<i>", "</i>")),
+                              ("underline", ("<u>", "</u>"))):
+                if t in inline:
+                    opens += o
+                    closes = c + closes
+            out.append(opens + text + closes)
+        return "".join(out)
+
+    def to_html(self) -> str:
+        blocks = []
+        last = int(self.text.index("end-1c").split(".")[0])
+        ln = 1
+        while ln <= last:
+            img_tag = self._img_tag_on_line(ln)
+            if img_tag:
+                src = self._imgs.get(img_tag, "")
+                if src:
+                    blocks.append(f'<img src="{html.escape(src, quote=True)}">')
+                ln += 1
+                continue
+            names0 = self.text.tag_names(f"{ln}.0")
+            if "ul" in names0 or "ol" in names0:
+                kind = "ul" if "ul" in names0 else "ol"
+                items = []
+                while ln <= last and kind in self.text.tag_names(f"{ln}.0"):
+                    raw = self.text.get(f"{ln}.0", f"{ln}.end")
+                    if raw.strip():
+                        inner = re.sub(r"^(?:•\s*|\d+\.\s*)", "",
+                                       self._serialize_line(ln))
+                        items.append(f"<li>{inner}</li>")
+                    ln += 1
+                if items:
+                    blocks.append(f"<{kind}>" + "".join(items) + f"</{kind}>")
+                continue
+            raw = self.text.get(f"{ln}.0", f"{ln}.end")
+            if not raw.strip():
+                ln += 1
+                continue
+            inner = self._serialize_line(ln)
+            align = ("center" if "align_center" in names0
+                     else "right" if "align_right" in names0 else "")
+            style = f' style="text-align:{align}"' if align else ""
+            if "h2" in names0:
+                blocks.append(f"<h2{style}>{inner}</h2>")
+            else:
+                blocks.append(f"<p{style}>{inner}</p>")
+            ln += 1
+        return "\n".join(blocks) + ("\n" if blocks else "")
+
+
 def prompt_html_template_editor(
     parent,
     path: Path,
@@ -2443,9 +3025,33 @@ def prompt_html_template_editor(
     toolbar = ctk.CTkFrame(dialog, fg_color="transparent")
     toolbar.pack(fill="x", padx=8, pady=(8, 0))
 
+    # Edit mode: "rich" (WYSIWYG) or "html" (raw source). Defaults to
+    # rich for a friendly start; existing templates load into it and the
+    # user can flip to HTML for fine control.
+    mode = {"value": "rich"}
+
+    mode_row = ctk.CTkFrame(toolbar, fg_color="transparent")
+    mode_row.pack(fill="x", pady=(0, 2))
+    mode_btn = ctk.CTkButton(
+        mode_row, text="</> Edit HTML", width=130, height=26,
+        command=lambda: _toggle_mode(),
+        font=ctk.CTkFont(size=11), **SECONDARY_BTN_KWARGS,
+    )
+    mode_btn.pack(side="left")
+    ctk.CTkLabel(
+        mode_row,
+        text="  Rich editor — select text, then B / I / U, H, align, 🔗. "
+             "Switch to HTML for raw control.",
+        font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
+    ).pack(side="left", padx=(6, 0))
+
     def insert_var(var: str) -> None:
-        text_box.insert("insert", f"{{{{{var}}}}}")
-        text_box.focus_force()
+        token = f"{{{{{var}}}}}"
+        if mode["value"] == "rich":
+            rich.insert_text(token)
+        else:
+            text_box.insert("insert", token)
+            text_box.focus_force()
 
     def _make_row(label: str, items: list[tuple[str, str]],
                   highlight: bool = False):
@@ -2494,8 +3100,12 @@ def prompt_html_template_editor(
     def on_add_image() -> None:
         html, filename = prompt_add_image_dialog(dialog, TEMPLATES_DIR)
         if html:
-            text_box.insert("insert", "\n" + html + "\n")
-            text_box.focus_force()
+            if mode["value"] == "rich":
+                stem = Path(filename).stem if filename else ""
+                rich.insert_image(f"cid:{stem}" if stem else html)
+            else:
+                text_box.insert("insert", "\n" + html + "\n")
+                text_box.focus_force()
             if on_image_added and filename:
                 try:
                     on_image_added(filename)
@@ -2652,6 +3262,64 @@ def prompt_html_template_editor(
     # laid out (tag_add can no-op against a not-yet-laid-out widget).
     text_box.after(0, apply_highlighting)
 
+    # ---- Rich-text editor (alternate view, default). ----
+    rich = RichTextEditor(
+        dialog, base_size=current["font_size"], on_add_image=on_add_image)
+
+    def _toggle_mode() -> None:
+        if mode["value"] == "rich":
+            # Rich → HTML: serialize and show the raw editor.
+            try:
+                html_src = rich.to_html()
+            except Exception as e:
+                messagebox.showerror("Switch to HTML failed", str(e))
+                return
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", html_src)
+            rich.frame.pack_forget()
+            text_box.pack(fill="both", expand=True, padx=8, pady=6,
+                          before=btn_row)
+            mode["value"] = "html"
+            mode_btn.configure(text="✏ Rich editor")
+            text_box.after(0, apply_highlighting)
+            text_box.focus_set()
+        else:
+            # HTML → Rich: parse the raw source into the rich view.
+            try:
+                rich.set_html(text_box.get("1.0", "end-1c"))
+            except Exception as e:
+                messagebox.showerror("Switch to rich editor failed", str(e))
+                return
+            text_box.pack_forget()
+            rich.frame.pack(fill="both", expand=True, padx=8, pady=6,
+                            before=btn_row)
+            mode["value"] = "rich"
+            mode_btn.configure(text="</> Edit HTML")
+            rich.text.focus_set()
+
+    # Start in rich mode — UNLESS the template has a table (still not
+    # round-trippable), in which case open in HTML so saving can't drop it.
+    # Lists ARE supported now, so they open in rich.
+    start_rich = not re.search(r"<\s*table\b", content or "", re.IGNORECASE)
+    if start_rich:
+        try:
+            rich.set_html(content)
+            text_box.pack_forget()
+            rich.frame.pack(fill="both", expand=True, padx=8, pady=6)
+            mode_btn.configure(text="</> Edit HTML")
+        except Exception:
+            start_rich = False
+    if not start_rich:
+        # Stay in HTML mode (text_box already packed); offer rich opt-in.
+        mode["value"] = "html"
+        mode_btn.configure(text="✏ Rich editor")
+
+    def _active_html() -> str:
+        """Current template HTML from whichever view is active."""
+        if mode["value"] == "rich":
+            return rich.to_html()
+        return text_box.get("1.0", "end-1c")
+
     # Ctrl+MouseWheel and Ctrl+= / Ctrl+- to zoom the editor view.
     def zoom(delta: int) -> str:
         new_size = max(8, min(40, current["font_size"] + delta))
@@ -2674,9 +3342,7 @@ def prompt_html_template_editor(
         tgt = target_path or current["path"]
         try:
             tgt.parent.mkdir(parents=True, exist_ok=True)
-            tgt.write_text(
-                text_box.get("1.0", "end-1c"), encoding="utf-8",
-            )
+            tgt.write_text(_active_html(), encoding="utf-8")
             return True
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
@@ -2753,7 +3419,7 @@ def prompt_html_template_editor(
         (where the preview itself is written)."""
         import webbrowser
         import re as _re
-        buffer = text_box.get("1.0", "end-1c")
+        buffer = _active_html()
         rendered = email_template.render_with_placeholders(buffer)
 
         def _fix_cid(m: _re.Match) -> str:
@@ -2797,7 +3463,7 @@ def prompt_html_template_editor(
             webbrowser.open(uri, new=2)
 
     btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=8, pady=(0, 8))
+    btn_row.pack(fill="x", padx=8, pady=(0, 8), side="bottom")
     ctk.CTkButton(
         btn_row, text="Save", command=do_save, width=100,
     ).pack(side="left", padx=4)
