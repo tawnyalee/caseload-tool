@@ -3158,6 +3158,12 @@ def prompt_html_template_editor(
         font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
     ).pack(side="left", padx=(10, 0))
 
+    # ---- Action row (created + reserved at the BOTTOM now, populated
+    # later). Packing it before the editor guarantees the buttons keep
+    # their space even though the editor area expands to fill. ----
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=8, pady=(0, 8), side="bottom")
+
     # ---- Text editor. ----
     text_box = ctk.CTkTextbox(
         dialog, wrap="word",
@@ -3277,8 +3283,9 @@ def prompt_html_template_editor(
             text_box.delete("1.0", "end")
             text_box.insert("1.0", html_src)
             rich.frame.pack_forget()
-            text_box.pack(fill="both", expand=True, padx=8, pady=6,
-                          before=btn_row)
+            # Pack AFTER btn_row (already reserved at the bottom) so the
+            # expanding editor fills above it and never squeezes it out.
+            text_box.pack(fill="both", expand=True, padx=8, pady=6)
             mode["value"] = "html"
             mode_btn.configure(text="✏ Rich editor")
             text_box.after(0, apply_highlighting)
@@ -3291,8 +3298,7 @@ def prompt_html_template_editor(
                 messagebox.showerror("Switch to rich editor failed", str(e))
                 return
             text_box.pack_forget()
-            rich.frame.pack(fill="both", expand=True, padx=8, pady=6,
-                            before=btn_row)
+            rich.frame.pack(fill="both", expand=True, padx=8, pady=6)
             mode["value"] = "rich"
             mode_btn.configure(text="</> Edit HTML")
             rich.text.focus_set()
@@ -3462,8 +3468,6 @@ def prompt_html_template_editor(
         if not _open_in_edge(uri):
             webbrowser.open(uri, new=2)
 
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=8, pady=(0, 8), side="bottom")
     ctk.CTkButton(
         btn_row, text="Save", command=do_save, width=100,
     ).pack(side="left", padx=4)
