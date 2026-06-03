@@ -67,11 +67,62 @@ if not _is_frozen():
 SCENARIOS_YAML = USER_CONFIG_DIR / "scenarios.yaml"
 # Back-compat alias so older imports keep working.
 NOTES_YAML = SCENARIOS_YAML
+# The bundled sample scenario file (read-only reference): in a frozen
+# build it sits in the bundle, in dev it's the project-root copy. Used to
+# seed first-run and to let the user reload the samples from Settings.
+DEFAULT_SCENARIOS_FILE = (
+    (_bundle / "default_scenarios.yaml") if _bundle is not None
+    else (PROJECT_ROOT / "default_scenarios.yaml")
+)
 BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
 SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
 NOTE_LOG_CSV = USER_CONFIG_DIR / "note_log.csv"
-TEMPLATES_DIR = USER_CONFIG_DIR / "templates"
-TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
+# Email templates. Renamed from the bare "templates" folder. Migrate the
+# legacy folder name so upgraders keep their templates.
+EMAIL_TEMPLATES_DIR = USER_CONFIG_DIR / "email_templates"
+_legacy_templates_dir = USER_CONFIG_DIR / "templates"
+if not EMAIL_TEMPLATES_DIR.exists() and _legacy_templates_dir.exists():
+    try:
+        _legacy_templates_dir.rename(EMAIL_TEMPLATES_DIR)
+    except Exception:
+        pass
+EMAIL_TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
+# The user can keep several template folders and switch the active one
+# from Settings. `templates_dir()` is the live folder used for reading,
+# writing, listing, and rendering templates; `set_templates_dir()` swaps
+# it. Defaults to EMAIL_TEMPLATES_DIR.
+_active_templates_dir = EMAIL_TEMPLATES_DIR
+
+
+def templates_dir() -> Path:
+    """The currently-active email-templates folder."""
+    return _active_templates_dir
+
+
+def set_templates_dir(path) -> Path:
+    """Switch the active email-templates folder (created if missing)."""
+    global _active_templates_dir
+    p = Path(path)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    _active_templates_dir = p
+    return p
+
+
+# Back-compat constant (snapshot of the default folder). New code should
+# call templates_dir() so folder switches take effect.
+TEMPLATES_DIR = EMAIL_TEMPLATES_DIR
+
+# Bundled sample template folder — seeds first-run + restorable from
+# Settings (mirrors DEFAULT_SCENARIOS_FILE).
+DEFAULT_EMAIL_TEMPLATES_DIR = (
+    (_bundle / "default_email_templates") if _bundle is not None
+    else (PROJECT_ROOT / "default_email_templates")
+)
 
 # Salesforce caseload export. Round 1 — user manually drops a CSV
 # here; round 2 will populate it via Playwright export automation.
@@ -113,17 +164,17 @@ def _seed_user_scenarios_yaml() -> None:
 
 
 def _seed_user_templates() -> None:
-    """First-run convenience: copy bundled starter email templates into
-    the user's templates dir if it's empty. Doesn't overwrite existing
-    files."""
-    if any(TEMPLATES_DIR.iterdir()):
+    """First-run convenience: copy the bundled sample email templates into
+    the user's email_templates dir if it's empty. Doesn't overwrite
+    existing files."""
+    if any(EMAIL_TEMPLATES_DIR.iterdir()):
         return
-    src = (_bundle / "templates") if _bundle is not None else (PROJECT_ROOT / "templates")
+    src = DEFAULT_EMAIL_TEMPLATES_DIR
     if not src.exists():
         return
     for f in src.iterdir():
         if f.is_file():
-            (TEMPLATES_DIR / f.name).write_bytes(f.read_bytes())
+            (EMAIL_TEMPLATES_DIR / f.name).write_bytes(f.read_bytes())
 
 
 _seed_user_scenarios_yaml()
@@ -190,6 +241,9 @@ class Settings:
     # CaseloadPanel.QUICK_VIEW_CATALOG) in display order. Empty = the
     # built-in default set.
     quickview_fields: str = ""
+    # Active email-templates folder (absolute path). Empty = the default
+    # email_templates folder. Lets the user keep several template sets.
+    email_templates_dir: str = ""
 
 
 def load_settings() -> Settings:

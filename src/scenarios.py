@@ -333,8 +333,12 @@ def run_scenario(
         # Lets a single scenario file notes against multiple courses
         # by pinning each note to its own.
         per_note_code = template.course_code_override or course_code
-        will_append_clip = template.append_clipboard and clipboard
         is_custom = i in custom_bodies
+        # When the note has a custom body (the user edited it at fire time),
+        # the clipboard was already folded into that text during review —
+        # don't append it again here.
+        will_append_clip = (
+            template.append_clipboard and clipboard and not is_custom)
         if will_append_clip or is_custom:
             combined, trimmed = combine_with_clipboard(
                 base_body, clipboard if will_append_clip else "",

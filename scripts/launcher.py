@@ -44,8 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import caseload_csv, caseload_filter, email_template
 from src.browser import persistent_context
 from src.config import (
-    CASELOAD_CSV_PATH, CASELOAD_URL, NOTE_LOG_CSV, TEMPLATES_DIR,
+    CASELOAD_CSV_PATH, CASELOAD_URL, DEFAULT_EMAIL_TEMPLATES_DIR,
+    DEFAULT_SCENARIOS_FILE, EMAIL_TEMPLATES_DIR, NOTE_LOG_CSV,
     USER_CONFIG_DIR, Settings, load_settings, save_settings,
+    set_templates_dir, templates_dir,
 )
 from src.version import __version__
 from src.note_form import NoteData
@@ -3498,7 +3500,7 @@ def prompt_html_template_editor(
         )
 
     # Insert-image button row. Opens the image dialog, copies the
-    # picked file into TEMPLATES_DIR (if not already there), drops a
+    # picked file into templates_dir() (if not already there), drops a
     # `<img src="cid:STEM">` snippet at the cursor, and registers
     # the filename on the scenario's inline_images list via the
     # `on_image_added` callback.
@@ -3510,7 +3512,7 @@ def prompt_html_template_editor(
     ).pack(side="left", padx=(0, 4))
 
     def on_add_image() -> None:
-        html, filename = prompt_add_image_dialog(dialog, TEMPLATES_DIR)
+        html, filename = prompt_add_image_dialog(dialog, templates_dir())
         if html:
             if mode["value"] == "rich":
                 stem = Path(filename).stem if filename else ""
@@ -3841,7 +3843,7 @@ def prompt_html_template_editor(
         review only. `{{var}}` placeholders are swapped for human-
         readable `<LABEL>` text so the user can see where values
         will land. CID image references are rewritten to relative
-        filenames so the browser can load images from TEMPLATES_DIR
+        filenames so the browser can load images from templates_dir()
         (where the preview itself is written)."""
         import webbrowser
         import re as _re
@@ -3850,7 +3852,7 @@ def prompt_html_template_editor(
 
         def _fix_cid(m: _re.Match) -> str:
             stem = m.group(1)
-            for f in sorted(TEMPLATES_DIR.glob(f"{stem}.*")):
+            for f in sorted(templates_dir().glob(f"{stem}.*")):
                 if f.suffix.lower() != ".html":
                     return f'src="{f.name}"'
             return m.group(0)  # leave alone if no matching file
@@ -3873,9 +3875,9 @@ def prompt_html_template_editor(
             'cid: refs rewritten to filenames · close the tab when done.'
             '</div>\n' + rendered + '\n</body></html>'
         )
-        preview_path = TEMPLATES_DIR / "_preview.html"
+        preview_path = templates_dir() / "_preview.html"
         try:
-            TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+            templates_dir().mkdir(parents=True, exist_ok=True)
             preview_path.write_text(shell, encoding="utf-8")
         except Exception as e:
             messagebox.showerror("Preview failed", str(e))
@@ -4713,6 +4715,7 @@ def prompt_batch_email_review(
             if new:
                 for i in range(min(len(rendered), len(new))):
                     rendered[i] = new[i]
+                edits.clear()  # template re-render discards per-body edits
                 _show(state["current"])
 
         tpl_combo.configure(command=_on_tpl_change)
@@ -4846,8 +4849,9 @@ def prompt_batch_email_review(
         else:
             cc_label.grid_remove()
             cc_value.grid_remove()
-        # Subject.
-        subj_value.configure(text=entry.get("subject", ""))
+        # Subject (+ an edited marker when this body was hand-edited).
+        edited_tag = "   ✏ edited" if state["current"] in edits else ""
+        subj_value.configure(text=entry.get("subject", "") + edited_tag)
         # Body render.
         body_text.configure(state="normal")
         body_text.delete("1.0", "end")
@@ -4957,7 +4961,7 @@ def prompt_batch_email_review(
 
         def _fix_cid(m):
             stem = m.group(1)
-            for f in sorted(TEMPLATES_DIR.glob(f"{stem}.*")):
+            for f in sorted(templates_dir().glob(f"{stem}.*")):
                 if f.suffix.lower() != ".html":
                     return f'src="{f.name}"'
             return m.group(0)
@@ -4978,9 +4982,9 @@ def prompt_batch_email_review(
             f'{html.escape(entry.get("subject", ""))}</div>\n'
             + body_html + '\n</body></html>'
         )
-        preview_path = TEMPLATES_DIR / "_preview.html"
+        preview_path = templates_dir() / "_preview.html"
         try:
-            TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+            templates_dir().mkdir(parents=True, exist_ok=True)
             preview_path.write_text(shell, encoding="utf-8")
         except Exception:
             return
@@ -4992,6 +4996,38 @@ def prompt_batch_email_review(
             import webbrowser
             webbrowser.open(uri, new=2)
 
+    # Per-student body edits the user makes via "Edit body" — {idx: html}.
+    # Returned to the caller so the edited body is what actually sends.
+    edits: dict = {}
+
+    def _edit_current_body() -> None:
+        """One-off: edit THIS student's email body in the rich-text editor.
+        The edit applies only to this send, not the saved template."""
+        idx = state["current"]
+        entry = rendered[idx]
+        if entry.get("render_error"):
+            return
+        tmp = templates_dir() / "_oneoff_edit.html"
+        try:
+            templates_dir().mkdir(parents=True, exist_ok=True)
+            tmp.write_text(entry.get("body_html", ""), encoding="utf-8")
+        except Exception:
+            return
+        saved = prompt_html_template_editor(dialog, tmp)
+        if saved:
+            try:
+                new_html = tmp.read_text(encoding="utf-8")
+            except Exception:
+                new_html = None
+            if new_html is not None:
+                rendered[idx]["body_html"] = new_html
+                edits[idx] = new_html
+                _show(idx)
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
     nav_l = ctk.CTkFrame(bottom, fg_color="transparent")
     nav_l.pack(side="left")
     ctk.CTkButton(nav_l, text="◀ Prev", width=80, command=_prev,
@@ -5001,7 +5037,10 @@ def prompt_batch_email_review(
     ctk.CTkButton(nav_l, text="Skip & next", width=110,
                    command=_skip_and_next,
                    **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
-    ctk.CTkButton(nav_l, text="Open this one in Edge", width=180,
+    ctk.CTkButton(nav_l, text="✏ Edit body", width=110,
+                   command=_edit_current_body,
+                   **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
+    ctk.CTkButton(nav_l, text="Open in Edge", width=120,
                    command=_view_current_in_edge,
                    **SECONDARY_BTN_KWARGS).pack(side="left", padx=2)
 
@@ -5044,7 +5083,7 @@ def prompt_batch_email_review(
         _show(0)
 
     parent.wait_window(dialog)
-    return result_box["value"], chosen_template_box["value"]
+    return result_box["value"], chosen_template_box["value"], edits
 
 
 def prompt_batch_review(
@@ -5476,6 +5515,7 @@ class NoteEditor:
         cc_row = ctk.CTkFrame(content, fg_color="transparent")
         cc_row.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 0))
         cc_row.grid_columnconfigure(1, weight=1)
+        self._cc_override_row = cc_row  # advanced-only (see apply_advanced_visibility)
         ctk.CTkLabel(
             cc_row, text="Override course code:", width=180, anchor="w",
         ).grid(row=0, column=0, sticky="w")
@@ -5717,15 +5757,24 @@ class NoteEditor:
             pass
 
     def apply_advanced_visibility(self, advanced: bool) -> None:
-        """Hide the append-clipboard checkbox in basic mode unless
-        this note already has it enabled. Same "show if configured"
-        rule the ScenarioEditor uses for its advanced rows."""
+        """Hide advanced-only note rows in basic mode unless this note
+        already uses them. Same "show if configured" rule the
+        ScenarioEditor uses for its advanced rows."""
         try:
             has_value = bool(self.append_clipboard_var.get())
             if advanced or has_value:
                 self._append_clipboard_checkbox.grid()
             else:
                 self._append_clipboard_checkbox.grid_remove()
+        except Exception:
+            pass
+        # Override course code — advanced-only; shown if already set.
+        try:
+            has_cc = bool(self.course_code_override_entry.get().strip())
+            if advanced or has_cc:
+                self._cc_override_row.grid()
+            else:
+                self._cc_override_row.grid_remove()
         except Exception:
             pass
 
@@ -6111,7 +6160,7 @@ class ScenarioEditor:
             row=0, column=1, sticky="ew", padx=8, pady=(6, 0),
         )
 
-        # Body template (dropdown over TEMPLATES_DIR + Open button)
+        # Body template (dropdown over templates_dir() + Open button)
         ctk.CTkLabel(frame, text="Body template").grid(
             row=1, column=0, sticky="w", padx=8, pady=(4, 0),
         )
@@ -6239,7 +6288,7 @@ class ScenarioEditor:
         """List the .html templates in the user's templates dir, in
         sorted order. Empty list if folder is missing or unreadable."""
         try:
-            return sorted(p.name for p in TEMPLATES_DIR.glob("*.html"))
+            return sorted(p.name for p in templates_dir().glob("*.html"))
         except Exception:
             return []
 
@@ -6344,7 +6393,7 @@ class ScenarioEditor:
         name = self.email_body_combo.get().strip()
         if not name or "(none" in name:
             return None
-        return TEMPLATES_DIR / name
+        return templates_dir() / name
 
     def _edit_template_in_app(self) -> None:
         """Open the in-app HTML editor for the selected template.
@@ -6379,7 +6428,7 @@ class ScenarioEditor:
         )
 
     def _new_template(self) -> None:
-        """Create a fresh `.html` template under TEMPLATES_DIR. Asks
+        """Create a fresh `.html` template under templates_dir(). Asks
         for a filename, seeds the file with a minimal stub, refreshes
         the body-template dropdown, selects the new file, and opens
         the in-app editor on it."""
@@ -6394,7 +6443,7 @@ class ScenarioEditor:
         name = raw.strip()
         if not name.lower().endswith(".html"):
             name += ".html"
-        path = TEMPLATES_DIR / name
+        path = templates_dir() / name
         if path.exists():
             if not messagebox.askyesno(
                 "File exists",
@@ -6468,7 +6517,7 @@ class ScenarioEditor:
         name = self.email_body_combo.get().strip()
         if not name or "(none" in name:
             return
-        path = TEMPLATES_DIR / name
+        path = templates_dir() / name
         if not path.exists():
             return
         try:
@@ -8375,6 +8424,11 @@ class App:
         if not _notes_font_registered[0]:
             register_font_apply("notes", self._reapply_notes_font)
             _notes_font_registered[0] = True
+        # Point at the saved email-templates folder (if the user picked a
+        # non-default one and it still exists).
+        _tpl = (self.settings.email_templates_dir or "").strip()
+        if _tpl and Path(_tpl).is_dir():
+            set_templates_dir(_tpl)
 
         # In-memory caseload cache populated from CASELOAD_CSV_PATH.
         # Set by _reload_caseload_cache() (called on startup and via
@@ -8473,6 +8527,9 @@ class App:
         # (popping before the main window paints makes the dialog
         # look orphaned).
         if not self.settings.first_run_complete:
+            # Start a brand-new user with the scenario editor collapsed so
+            # the first view is uncluttered (they can Show editor anytime).
+            self.root.after(0, self._hide_editor_initially)
             self.root.after(400, self._show_first_run_setup)
 
         # Once the worker has the browser open, auto-refresh the
@@ -9562,6 +9619,15 @@ class App:
         )
         self._build_editor_tab_strips()
 
+    def _hide_editor_initially(self) -> None:
+        """Collapse the editor on first launch (called once for a new
+        user). No-op if it's already hidden."""
+        if getattr(self, "_editor_visible", False):
+            try:
+                self._toggle_editor()
+            except Exception:
+                pass
+
     def _toggle_editor(self) -> None:
         if self._editor_visible:
             self.main_paned.forget(self.editor_pane)
@@ -9745,6 +9811,172 @@ class App:
             self._select_editor_scenario(name)
         except Exception:
             pass
+
+    def _settings_new_scenario(self, dialog=None) -> None:
+        """Settings → New scenario: close Settings, reveal the editor (so
+        the new tab is visible), then run the normal new-scenario flow."""
+        if dialog is not None:
+            try:
+                dialog.grab_release(); dialog.destroy()
+            except Exception:
+                pass
+        if not getattr(self, "_editor_visible", True):
+            try:
+                self._toggle_editor()
+            except Exception:
+                pass
+        self._new_scenario()
+
+    def _load_scenarios_dialog(self, dialog=None) -> None:
+        """Settings → Load from file: pick a .yaml and load it."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Load scenarios file",
+            filetypes=[("Scenario files", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if path:
+            self._load_scenarios_from_file(Path(path), dialog)
+
+    def _save_scenarios_dialog(self) -> None:
+        """Settings → Save to file: export the current scenarios.yaml to a
+        location of the user's choice (to share or back up). Saves the
+        editor's current state first so the export is up to date."""
+        # Flush any unsaved editor edits to scenarios.yaml so the export
+        # matches what's on screen.
+        try:
+            self._save_yaml()
+        except Exception:
+            pass
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            title="Save scenarios to file",
+            defaultextension=".yaml",
+            initialfile="scenarios.yaml",
+            filetypes=[("Scenario files", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_bytes(SCENARIOS_YAML.read_bytes())
+            self._append_log(f"Saved scenarios to {path}.")
+        except Exception as e:
+            self._append_log(f"Save scenarios failed: {e}", error=True)
+
+    def _load_sample_scenarios(self, dialog=None) -> None:
+        """Settings → Load samples: restore the bundled sample scenarios."""
+        self._load_scenarios_from_file(DEFAULT_SCENARIOS_FILE, dialog)
+
+    def _load_scenarios_from_file(self, src_path, dialog=None) -> None:
+        """Validate, confirm, back up the current scenarios.yaml, then
+        replace it with `src_path` and reload tabs/buttons/hotkeys."""
+        src_path = Path(src_path)
+        if not src_path.exists():
+            self._append_log(
+                f"Load scenarios: file not found ({src_path}).", error=True)
+            return
+        try:
+            loaded = load_scenarios(src_path)
+            load_groups(src_path)
+        except Exception as e:
+            self._append_log(
+                f"Load scenarios: '{src_path.name}' isn't a valid scenarios "
+                f"file ({e}).", error=True)
+            return
+        n = len(loaded)
+        if not ask_yes_no_topmost(
+            self.root, "Load scenarios?",
+            f"Replace your current scenarios with {n} scenario(s) from "
+            f"'{src_path.name}'?\n\nYour current scenarios are backed up "
+            f"to scenarios.yaml.bak first.",
+            yes_label="Load", no_label="Cancel",
+        ):
+            return
+        try:
+            if SCENARIOS_YAML.exists():
+                SCENARIOS_YAML.with_name("scenarios.yaml.bak").write_bytes(
+                    SCENARIOS_YAML.read_bytes())
+        except Exception:
+            pass
+        try:
+            SCENARIOS_YAML.write_bytes(src_path.read_bytes())
+        except Exception as e:
+            self._append_log(f"Load scenarios failed: {e}", error=True)
+            return
+        try:
+            self.scenarios = load_scenarios()
+            self.groups = load_groups()
+        except Exception as e:
+            self._append_log(f"Loaded but reload failed: {e}", error=True)
+            return
+        self._rebuild_editor_tabs()
+        self._rebuild_scenario_buttons()
+        self._restart_hotkeys()
+        self._append_log(
+            f"Loaded {n} scenario(s) from '{src_path.name}'. "
+            "Previous scenarios backed up to scenarios.yaml.bak.")
+        if dialog is not None:
+            try:
+                dialog.grab_release(); dialog.destroy()
+            except Exception:
+                pass
+
+    def _set_active_template_folder(self, path, label_widget=None) -> None:
+        """Switch the active email-templates folder, persist it, and
+        refresh anything that lists templates."""
+        p = set_templates_dir(path)
+        self.settings.email_templates_dir = str(p)
+        save_settings(self.settings)
+        if label_widget is not None:
+            try:
+                label_widget.configure(text=f"Folder:  {p}")
+            except Exception:
+                pass
+        try:
+            self._rebuild_editor_tabs()  # refresh template dropdowns
+        except Exception:
+            pass
+        self._append_log(f"Email templates folder: {p}")
+
+    def _create_template_folder(self, label_widget=None) -> None:
+        """Create a new (empty) email-templates folder under the config
+        dir and switch to it. Optionally seed it with the bundled samples."""
+        dlg = ctk.CTkInputDialog(
+            text="Name for the new email-templates folder:",
+            title="Create template folder")
+        raw = dlg.get_input()
+        if raw is None:
+            return
+        name = raw.strip().strip("/\\")
+        if not name:
+            return
+        newp = USER_CONFIG_DIR / name
+        try:
+            newp.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self._append_log(f"Couldn't create folder: {e}", error=True)
+            return
+        # Offer to seed the new folder with the bundled samples so it's
+        # usable immediately (otherwise it starts empty).
+        if not any(newp.iterdir()) and DEFAULT_EMAIL_TEMPLATES_DIR.exists():
+            if ask_yes_no_topmost(
+                self.root, "Seed samples?",
+                "Copy the sample templates into the new folder so it's not "
+                "empty?", yes_label="Copy samples", no_label="Leave empty",
+            ):
+                for f in DEFAULT_EMAIL_TEMPLATES_DIR.iterdir():
+                    if f.is_file():
+                        try:
+                            (newp / f.name).write_bytes(f.read_bytes())
+                        except Exception:
+                            pass
+        self._set_active_template_folder(newp, label_widget)
+
+    def _load_template_folder(self, label_widget=None) -> None:
+        """Switch the active email-templates folder to an existing one."""
+        from tkinter import filedialog
+        p = filedialog.askdirectory(title="Choose an email-templates folder")
+        if p:
+            self._set_active_template_folder(p, label_widget)
 
     def _capture_hotkey(self, on_done: Callable[[str], None]) -> None:
         """Open the modal capture dialog. Pauses the global pynput
@@ -10161,23 +10393,32 @@ class App:
         if prompt_vars is None:
             return  # user cancelled a prompt
 
-        # Step 3: body edits. The user is committed to a student now,
-        # so the dialogs are filled with the right context in mind.
+        # Step 3: clipboard FIRST (main-thread read; Tk + PIL aren't
+        # thread-safe) so it can be folded into the additional-text review.
+        clipboard = ""
+        if any(n.append_clipboard for n in scenario.notes):
+            clipboard = self._read_clipboard_content()
+
+        # Step 4: body edits. The user is committed to a student now, so
+        # the dialogs are filled with the right context in mind. When a
+        # note uses BOTH "enter additional text" and "append clipboard",
+        # prefill the editor with the clipboard paste so it's reviewed/
+        # edited in one place (run_scenario then skips the separate append
+        # for any note that has a custom body, so it isn't duplicated).
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
             if not n.enter_additional_text:
                 continue
             label = f"Note {i + 1}"
-            edited = prompt_additional_text(self.root, label, n.body)
+            prefill = n.body
+            if n.append_clipboard and clipboard:
+                sep = "\n" if prefill and not prefill.endswith("\n") else ""
+                prefill = f"{prefill}{sep}{clipboard}"
+            edited = prompt_additional_text(self.root, label, prefill)
             if edited is None:
                 self._append_log(f"{label} edit cancelled; scenario not fired.")
                 return
             custom_bodies[i] = edited
-
-        # Step 4: clipboard (main-thread read; Tk + PIL aren't thread-safe).
-        clipboard = ""
-        if any(n.append_clipboard for n in scenario.notes):
-            clipboard = self._read_clipboard_content()
 
         # Step 5: email (if scenario has one). Reviewed in the same in-app
         # previewer as batch/selection (incl. the fire-time template
@@ -10199,13 +10440,15 @@ class App:
                 return [self._build_email_preview_data(
                     scn, {}, prompt_vars, user_info, ctx_override=student_ctx)]
 
-            scenario, selected = self._run_email_review(scenario, _render, who)
+            scenario, selected, edits = self._run_email_review(
+                scenario, _render, who)
             if not selected:
                 self._append_log("Email review cancelled; note not filed.")
                 return
             ctx_send = {**student_ctx, **prompt_vars}
             if not self._send_scenario_email(
                 scenario.email, ctx_send, auto_send=True,
+                body_html_override=edits.get(0),
             ):
                 self._append_log("Email send failed; note not filed.")
                 return
@@ -10341,13 +10584,14 @@ class App:
         # review of every outgoing message); column-based filter
         # review otherwise.
         has_email = scenario.email is not None
+        body_overrides: dict = {}
         if has_email:
             filter_summary = ", ".join(
                 f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                 for f in scenario.batch.filters
                 if f.get("column")
             )
-            scenario, confirmed = self._review_emails(
+            scenario, confirmed, body_overrides = self._review_emails(
                 scenario, matched, prompt_vars, filter_summary,
             )
             if confirmed is None:
@@ -10370,7 +10614,7 @@ class App:
         # _execute_scenario_over_rows.
         self._execute_scenario_over_rows(
             scenario, override, confirmed, prompt_vars,
-            has_email=has_email, source="batch",
+            has_email=has_email, source="batch", body_overrides=body_overrides,
         )
 
     @staticmethod
@@ -10386,31 +10630,38 @@ class App:
         self, scenario: ScenarioConfig, override: str,
         confirmed: list[dict], prompt_vars: dict, *,
         has_email: bool, source: str = "batch",
+        body_overrides: Optional[dict] = None,
     ) -> None:
         """Shared execution core for firing a scenario across many
         students — the full caseload batch AND the panel's hand-picked
         mini-batch. Gathers per-note custom bodies + clipboard, then loops
         fast-find → auto-send email (if configured) → file note. The
         activity log is the progress display. `source` is the noun used in
-        log lines ('batch' / 'selection')."""
-        # Step 6: per-note custom-body prompts and clipboard read.
-        # Gathered AFTER confirmation so cancelled runs don't waste typing.
+        log lines ('batch' / 'selection'). `body_overrides` maps a row's
+        position in `confirmed` to a hand-edited email body (from the
+        reviewer's Edit-body button)."""
+        body_overrides = body_overrides or {}
+        # Step 6: clipboard FIRST (read once up front — Tk + PIL aren't safe
+        # on the worker thread) so it can be folded into the additional-text
+        # review, then the per-note custom-body prompts. Gathered AFTER
+        # confirmation so cancelled runs don't waste typing.
+        clipboard = ""
+        if any(n.append_clipboard for n in scenario.notes):
+            clipboard = self._read_clipboard_content()
         custom_bodies: dict[int, str] = {}
         for i, n in enumerate(scenario.notes):
             if not n.enter_additional_text:
                 continue
             label = f"Note {i + 1} (applies to all {len(confirmed)} students)"
-            edited = prompt_additional_text(self.root, label, n.body)
+            prefill = n.body
+            if n.append_clipboard and clipboard:
+                sep = "\n" if prefill and not prefill.endswith("\n") else ""
+                prefill = f"{prefill}{sep}{clipboard}"
+            edited = prompt_additional_text(self.root, label, prefill)
             if edited is None:
                 self._append_log(f"{label}: cancelled; {source} not started.")
                 return
             custom_bodies[i] = edited
-
-        # Clipboard is read once up front — Tk + PIL aren't safe to call
-        # from the worker thread.
-        clipboard = ""
-        if any(n.append_clipboard for n in scenario.notes):
-            clipboard = self._read_clipboard_content()
 
         total = len(confirmed)
 
@@ -10494,6 +10745,7 @@ class App:
                     ctx_info = {**ctx_info, **prompt_vars}
                     if not self._send_scenario_email(
                         scenario.email, ctx_info, auto_send=True,
+                        body_html_override=body_overrides.get(idx - 1),
                     ):
                         skipped.append((student_name, "auto-send failed"))
                         continue
@@ -10576,13 +10828,14 @@ class App:
         # Review/confirm. With an email step, reuse the per-student FERPA
         # review modal (same as batch), including the fire-time template
         # dropdown; otherwise a single count/name confirm.
+        body_overrides: dict = {}
         if has_email:
             n0 = len(rows)
             summary = (
                 f"{n0} hand-picked from the caseload panel" if n0 != 1
                 else self._row_name_and_query(rows[0])[0]
             )
-            scenario, confirmed = self._review_emails(
+            scenario, confirmed, body_overrides = self._review_emails(
                 scenario, rows, prompt_vars, summary,
             )
             if confirmed is None:
@@ -10611,6 +10864,7 @@ class App:
             self._execute_scenario_over_rows(
                 scenario, override, confirmed, prompt_vars,
                 has_email=has_email, source="selection",
+                body_overrides=body_overrides,
             )
         finally:
             self._set_idle()
@@ -10739,7 +10993,7 @@ class App:
     def _email_template_files() -> list[str]:
         """Sorted .html template filenames in the templates dir."""
         try:
-            return sorted(p.name for p in TEMPLATES_DIR.glob("*.html"))
+            return sorted(p.name for p in templates_dir().glob("*.html"))
         except Exception:
             return []
 
@@ -10759,19 +11013,19 @@ class App:
             return render(_replace(
                 scenario, email=_replace(scenario.email, body_html_file=tpl)))
 
-        selected, chosen_tpl = prompt_batch_email_review(
+        selected, chosen_tpl, edits = prompt_batch_email_review(
             self.root, scenario.name, rendered, summary,
             templates=templates, current_template=cur_tpl,
             on_template_change=(_on_tpl if pick else None),
         )
         if not selected:
-            return scenario, None
+            return scenario, None, {}
         if pick and chosen_tpl and chosen_tpl != scenario.email.body_html_file:
             scenario = _replace(
                 scenario,
                 email=_replace(scenario.email, body_html_file=chosen_tpl))
             self._append_log(f"Using email template {chosen_tpl!r}.")
-        return scenario, selected
+        return scenario, selected, edits
 
     def _review_emails(
         self, scenario: ScenarioConfig, rows: list[dict],
@@ -10791,17 +11045,25 @@ class App:
                 for row in rows
             ]
 
-        scenario, selected = self._run_email_review(scenario, render, summary)
+        scenario, selected, edits = self._run_email_review(
+            scenario, render, summary)
         if selected is None:
             self._append_log(
                 f"{scenario.name!r}: email review cancelled / nobody selected.")
-            return scenario, None
+            return scenario, None, {}
         confirmed = [rows[i] for i in selected]
+        # Re-key any hand-edited bodies from reviewer-index to the position
+        # within `confirmed`, which is what the execution loop iterates.
+        body_overrides = {
+            pos: edits[i] for pos, i in enumerate(selected) if i in edits
+        }
         self._append_log(
             f"Email review confirmed: {len(confirmed)} of {len(rows)} "
             "student(s)."
+            + (f" ({len(body_overrides)} hand-edited)" if body_overrides
+               else "")
         )
-        return scenario, confirmed
+        return scenario, confirmed, body_overrides
 
     def _build_email_preview_data(
         self,
@@ -10861,7 +11123,7 @@ class App:
         to = ""
         cc = ""
         try:
-            template_path = TEMPLATES_DIR / email_cfg.body_html_file
+            template_path = templates_dir() / email_cfg.body_html_file
             template_html = email_template.load_template(template_path)
             body_html = email_template.render(template_html, ctx)
             body_html = email_template.wrap_with_font(
@@ -11052,7 +11314,7 @@ class App:
         from tkinter import messagebox
         from src import outlook_email
 
-        template_path = TEMPLATES_DIR / email_cfg.body_html_file
+        template_path = templates_dir() / email_cfg.body_html_file
         if not template_path.exists():
             self._append_log(
                 f"Email template not found: {template_path}; batch aborted."
@@ -11121,7 +11383,7 @@ class App:
 
         Starts from the scenario's explicitly-configured filenames, then
         auto-adds any `cid:` the rendered body references whose matching
-        file exists in TEMPLATES_DIR (the Add-image dialog writes
+        file exists in templates_dir() (the Add-image dialog writes
         `src="cid:<filename-stem>"`, so cid `image001` ⇢ `image001.*`).
 
         The auto-add is what prevents the 'linked image cannot be
@@ -11130,13 +11392,13 @@ class App:
         embeds because we resolve it straight from the body."""
         images: dict = {}
         for fname in (configured or []):
-            p = TEMPLATES_DIR / fname
+            p = templates_dir() / fname
             if p.exists():
                 images[Path(fname).stem] = p
         for cid in set(re.findall(r'src="cid:([^"]+)"', body_html or "")):
             if cid in images:
                 continue
-            match = next(iter(sorted(TEMPLATES_DIR.glob(f"{cid}.*"))), None)
+            match = next(iter(sorted(templates_dir().glob(f"{cid}.*"))), None)
             if match is not None:
                 images[cid] = match
         return images
@@ -11147,6 +11409,7 @@ class App:
         student_ctx: dict,
         *,
         auto_send: bool = False,
+        body_html_override: Optional[str] = None,
     ) -> bool:
         """Render the template and either Display() the draft for
         review (default) or Send() it programmatically (`auto_send`).
@@ -11211,7 +11474,7 @@ class App:
                     f"address {user_info['email']!r}."
                 )
 
-        template_path = TEMPLATES_DIR / email_cfg.body_html_file
+        template_path = templates_dir() / email_cfg.body_html_file
         if not template_path.exists():
             self._append_log(
                 f"Email template not found: {template_path}. Scenario aborted."
@@ -11224,8 +11487,14 @@ class App:
             return False
 
         try:
-            template_html = email_template.load_template(template_path)
-            body_html = email_template.render(template_html, student_ctx)
+            if body_html_override is not None:
+                # Per-student one-off: the user edited this body in the
+                # reviewer; send exactly that (already rendered) instead of
+                # re-rendering from the template.
+                body_html = body_html_override
+            else:
+                template_html = email_template.load_template(template_path)
+                body_html = email_template.render(template_html, student_ctx)
             # If the scenario pins a font, wrap the body in an inline-
             # styled div so Outlook honors it. Otherwise (default) the
             # HTML goes through untouched and Outlook applies the
@@ -11429,6 +11698,7 @@ class App:
                 "  •  Email font / size override  (per-scenario)\n"
                 "  •  Email override  (To: redirect, for testing)\n"
                 "  •  Append clipboard contents  (per-note toggle)\n"
+                "  •  📁 Templates folder + Open log buttons\n"
                 "  •  🔬 Capture button  (network traffic recording — "
                 "for REST API discovery)"
             ),
@@ -11483,6 +11753,74 @@ class App:
             command=lambda: self._setup_caseload_tool_view_with_help(dialog),
             width=260,
         ).pack(anchor="w", padx=32, pady=(0, 12))
+
+        # ---- Scenarios ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        ctk.CTkLabel(
+            dialog, text="Scenarios",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(
+            dialog,
+            text="Create a new scenario, load a scenarios file someone "
+                 "shared, or restore the built-in samples. Your current "
+                 "scenarios are backed up first.",
+            wraplength=510, justify="left", anchor="w",
+            text_color=("gray45", "gray60"), font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=32, pady=(0, 6))
+        scen_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        scen_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkButton(
+            scen_row, text="+ New", width=70,
+            command=lambda: self._settings_new_scenario(dialog),
+        ).pack(side="left")
+        ctk.CTkButton(
+            scen_row, text="Load file…", width=100,
+            command=lambda: self._load_scenarios_dialog(dialog),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            scen_row, text="Save file…", width=100,
+            command=self._save_scenarios_dialog,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            scen_row, text="Load samples", width=110,
+            command=lambda: self._load_sample_scenarios(dialog),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+
+        # ---- Email templates ----
+        ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x", padx=20, pady=(2, 8))
+        ctk.CTkLabel(
+            dialog, text="Email templates",
+            font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 2))
+        tpl_folder_lbl = ctk.CTkLabel(
+            dialog, text=f"Folder:  {templates_dir()}",
+            wraplength=510, justify="left", anchor="w",
+            text_color=("gray45", "gray60"), font=ctk.CTkFont(size=11),
+        )
+        tpl_folder_lbl.pack(fill="x", padx=32, pady=(0, 6))
+        tpl_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        tpl_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkButton(
+            tpl_row, text="Create folder…", width=130,
+            command=lambda: self._create_template_folder(tpl_folder_lbl),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        ctk.CTkButton(
+            tpl_row, text="Load folder…", width=130,
+            command=lambda: self._load_template_folder(tpl_folder_lbl),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            tpl_row, text="Open folder", width=110,
+            command=self._on_open_templates_folder,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
 
         # ---- Display (foldable) ----
         ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
@@ -11996,6 +12334,24 @@ class App:
         except Exception:
             pass
 
+        # 📁 Templates (raw folder access) and Open log (the log file) are
+        # extra controls a first-time user rarely needs — hide in basic.
+        try:
+            if advanced:
+                self._btn_templates.pack(
+                    side="left", padx=(8, 0), before=self._btn_settings)
+            else:
+                self._btn_templates.pack_forget()
+        except Exception:
+            pass
+        try:
+            if advanced:
+                self._btn_open_log.pack(side="left", padx=(8, 0))
+            else:
+                self._btn_open_log.pack_forget()
+        except Exception:
+            pass
+
         # Push the new visibility into every open scenario tab.
         try:
             for editor in self.scenario_editors.values():
@@ -12054,14 +12410,14 @@ class App:
         scenario tab switch all rebuild)."""
         import os
         try:
-            os.startfile(str(TEMPLATES_DIR))
+            os.startfile(str(templates_dir()))
         except AttributeError:
             # os.startfile is Windows-only — fall back for future
             # Mac/Linux support.
             import subprocess, sys
             opener = {"darwin": "open"}.get(sys.platform, "xdg-open")
             try:
-                subprocess.Popen([opener, str(TEMPLATES_DIR)])
+                subprocess.Popen([opener, str(templates_dir())])
             except Exception as e:
                 self._append_log(f"Couldn't open templates folder: {e}")
         except Exception as e:

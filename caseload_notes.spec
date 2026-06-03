@@ -20,6 +20,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ("default_scenarios.yaml", "."),  # bundled sample — seeded into user dir on first run
+        ("default_email_templates", "default_email_templates"),  # sample email templates
         *ctk_datas,
     ],
     hiddenimports=[

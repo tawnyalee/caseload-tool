@@ -154,12 +154,17 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
                 editor.evaluate("el => el.focus()")
             except Exception:
                 pass
-            # Quill editor reacts to keyboard input; .fill works for contenteditable
-            # but using type() preserves newlines correctly.
+            # Enter the body fast: insert_text() drops the whole line in a
+            # single input event (vs. type()'s per-character keystrokes,
+            # which made long clipboard-appended notes crawl). Newlines are
+            # still real Enter presses so the Quill editor splits paragraphs
+            # correctly. insert_text dispatches a proper input event, so
+            # Quill registers the text just like a paste.
             for i, line in enumerate(data.body.splitlines() or [data.body]):
                 if i > 0:
                     page.keyboard.press("Enter")
-                page.keyboard.type(line)
+                if line:
+                    page.keyboard.insert_text(line)
 
         if data.submit:
             submit_btn = selectors.submit_button(page)

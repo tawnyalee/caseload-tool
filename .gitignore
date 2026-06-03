@@ -35,6 +35,8 @@ caseload.csv
 # Only the bundled sample, default_scenarios.yaml, is tracked. The legacy
 # notes.yaml name + its backups are ignored too.
 scenarios.yaml
+scenarios.yaml.bak
+scenarios-*.yaml
 notes.yaml
 notes.yaml.bak*
 
@@ -45,11 +47,12 @@ _preview.html
 # to each install; don't commit.
 settings.json
 
-# User-specific email templates — only the canonical sample ships
-# with the repo. Real students' emails contain identifiable
-# correspondence; keep them out of source control (FERPA).
-templates/*
-!templates/sample_followup.html
+# User-specific email templates — the user's live folder(s). Only the
+# bundled sample set (default_email_templates/) ships with the repo.
+# Real students' emails contain identifiable correspondence; keep them
+# out of source control (FERPA). "templates/" is the legacy folder name.
+email_templates/
+templates/
 
 # Network-capture dumps from the 🔬 Capture button. Contain
 # Salesforce session cookies + aura.token (active credentials)
