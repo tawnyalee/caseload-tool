@@ -1,130 +1,160 @@
-# ============================================================
-# Sample scenarios — edit these to match how you work!
-# ============================================================
-#
-# This file is just examples to get you started. The easiest way to edit
-# it is inside the app (the right-hand editor panel), but you can also
-# edit this file directly. Your changes are saved to "scenarios.yaml" in
-# your config folder — this sample file is never overwritten.
-#
-# Three kinds of scenarios are shown below:
-#   1. A single note  (logs one interaction note on the open student)
-#   2. A note + email (logs a note AND sends an email)
-#   3. A batch        (runs a note+email across many students by filter)
-#
-# Field cheat-sheet:
-#   hotkey            global shortcut, e.g. "Ctrl+Shift+W" (blank = none)
-#   find_first        true = look the student up before filing the note
-#   close_tab_after   true = close the Salesforce tab when done
-#   panel_action      true = show this in the caseload panel's right-click menu
-#   interaction_type  "Email to Student" / "Email from Student" /
-#                     "Live Call" / "Admin Note"
-#   submit            true = click Submit; false = leave the note for review
-#   email.cc_pm       true = CC the student's Program Mentor
-#   batch.filters     which students to include (column / op / value)
-#
-# ------------------------------------------------------------
-
 scenarios:
-
-  # 1) SINGLE NOTE — logs one "Email to Student" note on the open student.
-  Welcome note:
-    hotkey: ''
+  approval:
+    hotkey: F2
     close_tab_after: true
     find_first: false
-    panel_action: true
     notes:
     - interaction_format: Single Interaction
+      interaction_type: Email from Student
+      body: Task 1 approval sent for review
+      academic_activities:
+      - Course/Program Information Discussed
+      - Course/Program Information Requested
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+    - interaction_format: Single Interaction
       interaction_type: Email to Student
-      body: Welcome email sent.
+      body: Task 1 approval form approved and emailed. Task 2 info sent.
       academic_activities: []
       submit: true
       append_clipboard: false
       enter_additional_text: false
-
-  # A phone-call note. find_first looks the student up first; submit is
-  # false so you can review/add detail before filing.
-  Call logged:
-    hotkey: ''
+  flup email:
+    hotkey: Ctrl+Shift+S
+    close_tab_after: true
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email from Student
+      body: 'em exchange with st: '
+      academic_activities:
+      - Course/Program Information Discussed
+      - Course/Program Information Requested
+      submit: true
+      append_clipboard: true
+      enter_additional_text: true
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: 'em exchange with st: '
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+  followup to call:
+    hotkey: F5
     close_tab_after: true
     find_first: true
-    panel_action: true
     notes:
     - interaction_format: Single Interaction
       interaction_type: Live Call
-      body: Spoke with student. Followed up on course progress.
+      body: Followup call completed.
       academic_activities:
       - Course/Program Information Discussed
+      - Course/Program Information Requested
       submit: false
       append_clipboard: false
       enter_additional_text: false
-
-  # 2) NOTE + EMAIL — logs a note and sends a follow-up email. The email
-  # body comes from a template file in your "templates" folder. {{first_name}}
-  # is filled in per student. Leave "to" blank to use the student's email.
-  Follow-up email:
-    hotkey: ''
-    close_tab_after: true
-    find_first: false
-    panel_action: true
-    notes:
-    - interaction_format: Single Interaction
-      interaction_type: Email to Student
-      body: Follow-up email sent.
-      academic_activities: []
-      submit: true
-      append_clipboard: false
-      enter_additional_text: false
     email:
-      subject: Following up, {{first_name}}
+      subject: Following up on our call, {{first_name}}
       body_html_file: sample_followup.html
       to: ''
       signature_file: ''
       inline_images: []
       cc_pm: false
-      pick_template: false
-
-  # 3) BATCH — sends the welcome email to every student on a course who
-  # doesn't yet have a CI assigned. Change "C123" to your course code.
-  # preview: true shows you the recipient list before anything sends.
-  Welcome batch (by course):
+  welcome-C769:
     hotkey: ''
     close_tab_after: true
     find_first: false
     notes:
     - interaction_format: Single Interaction
       interaction_type: Email to Student
-      body: Welcome email sent.
+      body: 'welcome em with Task 1 guidance sent. '
       academic_activities: []
       submit: true
       append_clipboard: false
       enter_additional_text: false
     email:
-      subject: Getting started in your course
-      body_html_file: sample_followup.html
+      subject: Welcome C769 email from your course faculty
+      body_html_file: C769-welcome.html
       to: ''
+      signature_file: WGU (your.email@wgu.edu)
+      inline_images:
+      - image001.png
+      cc_pm: true
+    batch:
+      filters:
+      - column: Last Assigned CI Contact
+        op: is empty
+        value: ''
+      - column: Course Code
+        op: is
+        value: C769
+      preview: true
+  outreach-C769:
+    hotkey: ''
+    close_tab_after: true
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email from Student
+      body: testing outreach batch. Ill bet out
+      academic_activities: []
+      submit: false
+      append_clipboard: false
+      enter_additional_text: false
+    email:
+      subject: ''
+      body_html_file: welcome-C769-2.html
+      to: your.email@wgu.edu
       signature_file: ''
+      inline_images: []
+      cc_pm: false
+      font_size: 12
+    batch:
+      filters:
+      - column: Course Code
+        op: is
+        value: C769
+      preview: true
+  new_task1_policy-batch:
+    hotkey: ''
+    close_tab_after: true
+    find_first: false
+    notes:
+    - interaction_format: Single Interaction
+      interaction_type: Email to Student
+      body: outreach email. with new Task 1 policy
+      academic_activities: []
+      submit: true
+      append_clipboard: false
+      enter_additional_text: false
+    email:
+      subject: New D502 Task 1 approval form policy
+      body_html_file: task 1 D502 policy.html
+      to: ''
+      signature_file: WGU (your.email@wgu.edu)
       inline_images: []
       cc_pm: true
     batch:
       filters:
       - column: Course Code
         op: is
-        value: C123
-      - column: Last Assigned CI Contact
+        value: D502
+      - column: Task1
         op: is empty
         value: ''
       preview: true
-
-# Groups organize the scenario buttons into labeled, colored sections.
 groups:
-- name: Single actions
+- name: basic
   color: '#239a8e'
   scenarios:
-  - Welcome note
-  - Call logged
-  - Follow-up email
-- name: Batches
-  color: '#3f9d3f'
+  - approval
+  - flup email
+  - followup to call
+- name: C769 Batch Actions
+  color: '#c08a25'
   scenarios:
-  - Welcome batch (by course)
+  - welcome-C769
+  - outreach-C769
+  - new_task1_policy-batch

@@ -2145,6 +2145,12 @@ _DIALOG_DEFAULTS: dict[str, str] = {
 # as a constant so the UI label and the serialize check stay in sync.
 EMAIL_FONT_DEFAULT_LABEL = "(Outlook default)"
 
+# Placeholder address shipped in the bundled sample actions/templates
+# (default_scenarios.yaml + default_email_templates/). If an action is
+# fired while its email still contains this, the user hasn't swapped in
+# their own address yet — warn before sending (see App._fire).
+SAMPLE_EMAIL_PLACEHOLDER = "your.email@wgu.edu"
+
 
 # ---- Adjustable text sizes (per "channel") -------------------------------
 # Named font channels so each reading/editing surface can carry its own
@@ -5830,6 +5836,9 @@ class ScenarioEditor:
         capture_handler=None,
         get_columns: Optional[Callable[[], list[str]]] = None,
         refresh_columns: Optional[Callable[[], list[str]]] = None,
+        get_groups: Optional[Callable[[], list[str]]] = None,
+        get_scenario_group: Optional[Callable[[], str]] = None,
+        on_group_change: Optional[Callable[[str, str], None]] = None,
     ):
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
@@ -5857,6 +5866,28 @@ class ScenarioEditor:
             self.frame, placeholder_text="e.g. welcome, approval, custom", width=300,
         )
         self.name_entry.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
+
+        # Group selector — reassign this action's group without opening
+        # the group-settings dialog. "(none)" = ungrouped.
+        self._get_groups = get_groups or (lambda: [])
+        self._get_scenario_group = get_scenario_group or (lambda: "")
+        self._on_group_change = on_group_change
+        row += 1
+        group_row = ctk.CTkFrame(self.frame, fg_color="transparent")
+        group_row.grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
+        ctk.CTkLabel(
+            group_row, text="Group", font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left", padx=(0, 8))
+        self._group_options = ["(none)"] + list(self._get_groups())
+        cur_group = self._get_scenario_group() or "(none)"
+        if cur_group not in self._group_options:
+            cur_group = "(none)"
+        self.group_var = ctk.StringVar(value=cur_group)
+        self.group_menu = ctk.CTkOptionMenu(
+            group_row, values=self._group_options, variable=self.group_var,
+            width=220, command=self._on_group_menu_change,
+        )
+        self.group_menu.pack(side="left")
 
         # Hotkey — entry field + "Press to set" capture button.
         row += 1
@@ -5990,6 +6021,31 @@ class ScenarioEditor:
     @property
     def current_name(self) -> str:
         return self.name_entry.get().strip()
+
+    def _on_group_menu_change(self, choice: str) -> None:
+        """Group dropdown changed — hand the new assignment back to the
+        app (which mutates groups + persists). '(none)' = ungrouped."""
+        if self._on_group_change is None:
+            return
+        target = "" if choice == "(none)" else choice
+        try:
+            self._on_group_change(self.current_name, target)
+        except Exception:
+            pass
+
+    def refresh_group_options(self) -> None:
+        """Re-read the available groups + this action's current group and
+        update the dropdown. Cheap; called when an editor is reused across
+        a rebuild so its group list/value can't go stale."""
+        try:
+            opts = ["(none)"] + list(self._get_groups())
+            cur = self._get_scenario_group() or "(none)"
+            if cur not in opts:
+                cur = "(none)"
+            self.group_menu.configure(values=opts)
+            self.group_var.set(cur)
+        except Exception:
+            pass
 
     def _start_capture(self) -> None:
         if self.capture_handler is None:
@@ -8565,6 +8621,13 @@ class App:
         # (popping before the main window paints makes the dialog
         # look orphaned).
         if not self.settings.first_run_complete:
+            # First-time view is uncluttered: editor already starts hidden;
+            # also collapse the viewer (they set up the caseload first).
+            self.root.after(0, self._hide_viewer_initially)
+            # Size the window to comfortably show the sample groups +
+            # toolbar + a square-ish log (runs after the viewer hides and
+            # advanced-mode trims the toolbar, so the measurement is right).
+            self.root.after(0, self._apply_first_run_geometry)
             self.root.after(400, self._show_first_run_setup)
 
         # Once the worker has the browser open, auto-refresh the
@@ -8651,7 +8714,7 @@ class App:
         )
         self._btn_add_group.pack(side="left", padx=(8, 0))
         self.caseload_toggle_btn = ctk.CTkButton(
-            toggle_frame, text="Hide caseload", width=120,
+            toggle_frame, text="Hide viewer", width=120,
             command=self._toggle_caseload, **SECONDARY_BTN_KWARGS,
         )
         self.caseload_toggle_btn.pack(side="left", padx=(8, 0))
@@ -8882,11 +8945,17 @@ class App:
                 font=ctk.CTkFont(size=13, weight="bold"),
                 command=lambda gn=group.name: self._toggle_group(gn),
             ).grid(row=0, column=0, sticky="ew")
+            # '+' adds a new action directly into this group.
+            ctk.CTkButton(
+                header, text="+", width=32, height=28,
+                command=lambda gn=group.name: self._new_scenario_in_group(gn),
+                **SECONDARY_BTN_KWARGS,
+            ).grid(row=0, column=1, padx=(4, 0))
             ctk.CTkButton(
                 header, text="⚙", width=32, height=28,
                 command=lambda g=group: self._edit_group(g),
                 **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=1, padx=(4, 0))
+            ).grid(row=0, column=2, padx=(4, 0))
             if collapsed:
                 continue
             valid = [s for s in group.scenarios if s in self.scenarios]
@@ -9081,6 +9150,9 @@ class App:
             for s in g.scenarios:
                 current_membership[s] = g.name
         scenario_vars: dict[str, ctk.BooleanVar] = {}
+        # When deleting, optionally delete the group's actions too (rather
+        # than leaving them ungrouped). Off by default — destructive.
+        delete_actions_var = ctk.BooleanVar(value=False)
 
         # --- Buttons row + hint, pinned to the bottom FIRST. Packing
         # these side="bottom" before the expanding scroll frame
@@ -9129,13 +9201,37 @@ class App:
         def _do_delete() -> None:
             if is_new or group is None:
                 return
-            # Unparenting is automatic — we just remove the group itself,
-            # any scenarios it referenced just become ungrouped.
+            also_actions = bool(delete_actions_var.get())
+            member_actions = [s for s in group.scenarios if s in self.scenarios]
+            # Destructive when also deleting actions — confirm with a count.
+            if also_actions and member_actions:
+                if not ask_yes_no_topmost(
+                    self.root, "Delete group and its actions?",
+                    f"Delete group {group.name!r} AND its "
+                    f"{len(member_actions)} action(s)?\n\n"
+                    + ", ".join(member_actions)
+                    + "\n\nThis can't be undone.",
+                    yes_label="Delete all", no_label="Cancel",
+                ):
+                    return
+            if also_actions:
+                for s in member_actions:
+                    self.scenarios.pop(s, None)
+            # Remove the group itself. Without "delete actions", its
+            # scenarios simply become ungrouped.
             try:
                 self.groups.remove(group)
             except ValueError:
                 pass
+            if also_actions:
+                # Drop the deleted actions' editors before _save_yaml
+                # serializes from the editor set.
+                self._rebuild_editor_tabs()
             self._save_yaml()
+            if also_actions and member_actions:
+                self._append_log(
+                    f"Deleted group {group.name!r} and "
+                    f"{len(member_actions)} action(s).")
             try: dialog.grab_release()
             except Exception: pass
             try: dialog.destroy()
@@ -9161,6 +9257,11 @@ class App:
                 fg_color=("#cc4444", "#aa3333"),
                 hover_color=("#aa3333", "#882222"),
             ).pack(side="right", padx=4)
+            ctk.CTkButton(
+                btn_row, text="Copy group", width=110,
+                command=lambda: self._copy_group(group, dialog),
+                **SECONDARY_BTN_KWARGS,
+            ).pack(side="right", padx=4)
 
         # Hint sits just above the (already bottom-pinned) button bar.
         ctk.CTkLabel(
@@ -9174,6 +9275,17 @@ class App:
             text_color=("gray45", "gray60"),
             wraplength=460, justify="left", anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 6), side="bottom")
+
+        # "Delete actions too" option — only meaningful when editing an
+        # existing group. Sits just above the hint/buttons.
+        if not is_new:
+            ctk.CTkCheckBox(
+                dialog,
+                text="When deleting: also delete this group's actions "
+                     "(otherwise they become ungrouped)",
+                variable=delete_actions_var,
+                font=ctk.CTkFont(size=11),
+            ).pack(fill="x", padx=20, pady=(0, 4), side="bottom")
 
         # Scrollable scenario list fills whatever space is left between
         # the top fields and the pinned hint/buttons.
@@ -9298,7 +9410,7 @@ class App:
             except Exception:
                 pass
         self.caseload_toggle_btn.configure(
-            text="Hide caseload", state="normal")
+            text="Hide viewer", state="normal")
         self.root.after(0, self._restore_main_sash)
 
     def _toggle_caseload(self) -> None:
@@ -9316,7 +9428,7 @@ class App:
             except Exception:
                 w = getattr(self, "_caseload_last_w", DEFAULT_W)
             self.main_paned.forget(self.caseload_dock)
-            self.caseload_toggle_btn.configure(text="Show caseload")
+            self.caseload_toggle_btn.configure(text="Show viewer")
             self._caseload_visible = False
             self._grow_window_width(-int(w or DEFAULT_W))
         else:
@@ -9329,7 +9441,7 @@ class App:
             self._grow_window_width(+w)
             self.main_paned.add(
                 self.caseload_dock, minsize=300, stretch="always")
-            self.caseload_toggle_btn.configure(text="Hide caseload")
+            self.caseload_toggle_btn.configure(text="Hide viewer")
             self._caseload_visible = True
             # Keep the main (or editor) pane at its prior width; the new
             # window width goes to the caseload viewer.
@@ -9451,6 +9563,11 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_delete.pack(side="left", padx=4, pady=2)
+        self._btn_copy = ctk.CTkButton(
+            save_frame, text="Copy", command=self._copy_scenario,
+            width=90, height=34, **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_copy.pack(side="left", padx=4, pady=2)
         self._btn_save = ctk.CTkButton(
             save_frame, text="Save",
             command=self._save_yaml, width=90, height=34,
@@ -9486,55 +9603,96 @@ class App:
         if mode == "wide":
             self._btn_new.configure(text="+ New action", width=140)
             self._btn_delete.configure(text="Delete action", width=140)
+            self._btn_copy.configure(text="Copy", width=90)
             self._btn_save.configure(text="Save", width=90)
         elif mode == "medium":
             self._btn_new.configure(text="+", width=40)
             self._btn_delete.configure(text="−", width=40)
+            self._btn_copy.configure(text="⧉", width=40)
             self._btn_save.configure(text="Save", width=90)
         else:  # narrow
             self._btn_new.configure(text="+", width=40)
             self._btn_delete.configure(text="−", width=40)
+            self._btn_copy.configure(text="⧉", width=40)
             self._btn_save.configure(text="✓", width=40)
 
-    def _rebuild_editor_tabs(self) -> None:
-        """Rebuild the editor area: one ScenarioEditor per scenario
-        (all built into the shared content frame, only the selected
-        one shown) plus the stacked per-group tab strips above it."""
-        prev = getattr(self, "_current_scenario", None)
-
-        # Tear down old editors + strip widgets.
-        for ed in self.scenario_editors.values():
-            try:
-                ed.frame.destroy()
-            except Exception:
-                pass
-        self.scenario_editors.clear()
-        for w in self.editor_content.winfo_children():
-            w.destroy()
-
-        # Build one editor per scenario. Insertion order follows
-        # self.scenarios so the YAML save order stays stable. All
-        # share the content frame; _select_editor_scenario shows one
-        # and grid_remove()s the rest.
-        for name, sc in self.scenarios.items():
-            editor = ScenarioEditor(
-                self.editor_content, sc,
-                capture_handler=self._capture_hotkey,
-                get_columns=self._get_caseload_columns,
-                refresh_columns=self._refresh_caseload_columns_for_editor,
-            )
-            editor.frame.grid(row=0, column=0, sticky="nsew")
-            editor.frame.grid_remove()
-            self.scenario_editors[name] = editor
-
-        # Each fresh ScenarioEditor builds every row visible by
-        # default. Push the current advanced-mode preference in so
-        # the right rows hide on first show.
+    def _build_one_editor(self, name: str, sc: ScenarioConfig) -> None:
+        """Construct a single ScenarioEditor for `name` into the shared
+        content frame (hidden until selected). Each editor is a large
+        widget tree, so we build them one at a time and reuse them
+        across rebuilds — see _rebuild_editor_tabs."""
+        editor = ScenarioEditor(
+            self.editor_content, sc,
+            capture_handler=self._capture_hotkey,
+            get_columns=self._get_caseload_columns,
+            refresh_columns=self._refresh_caseload_columns_for_editor,
+            get_groups=lambda: [g.name for g in self.groups],
+            get_scenario_group=(lambda n=name: self._group_of_scenario(n)),
+            on_group_change=self._set_scenario_group,
+        )
+        editor.frame.grid(row=0, column=0, sticky="nsew")
+        editor.frame.grid_remove()
+        self.scenario_editors[name] = editor
         if hasattr(self, "settings"):
             try:
-                advanced = self.settings.advanced_mode
-                for ed in self.scenario_editors.values():
-                    ed.apply_advanced_visibility(advanced)
+                editor.apply_advanced_visibility(self.settings.advanced_mode)
+            except Exception:
+                pass
+
+    def _rebuild_editor_tabs(self, force: bool = False) -> None:
+        """(Re)sync the editor area with self.scenarios.
+
+        Incremental by default: existing editors are reused, only added
+        scenarios get a fresh (heavy) ScenarioEditor built, and only
+        removed ones are destroyed. Rebuilding all editors on every
+        save/delete/copy was the source of the UI lag — each editor is a
+        big widget tree and the user can have many actions.
+
+        `force=True` tears down and rebuilds everything; use it when the
+        underlying content changed out-of-band (revert, load-from-file,
+        template-folder switch) so reused editors don't show stale data."""
+        prev = getattr(self, "_current_scenario", None)
+
+        if force:
+            for ed in self.scenario_editors.values():
+                try:
+                    ed.frame.destroy()
+                except Exception:
+                    pass
+            self.scenario_editors.clear()
+            for w in self.editor_content.winfo_children():
+                w.destroy()
+
+        wanted = list(self.scenarios.keys())
+        wanted_set = set(wanted)
+
+        # Destroy editors whose scenario no longer exists (delete/rename).
+        for name in list(self.scenario_editors.keys()):
+            if name not in wanted_set:
+                try:
+                    self.scenario_editors[name].frame.destroy()
+                except Exception:
+                    pass
+                del self.scenario_editors[name]
+
+        # Build editors only for scenarios that don't have one yet.
+        for name in wanted:
+            if name not in self.scenario_editors:
+                self._build_one_editor(name, self.scenarios[name])
+
+        # Keep the dict ordered like self.scenarios so the YAML save
+        # order (which serializes from the editor dict) stays stable.
+        self.scenario_editors = {
+            n: self.scenario_editors[n]
+            for n in wanted if n in self.scenario_editors
+        }
+
+        # Reused editors may carry stale group dropdowns (a group was
+        # renamed/added/removed, or another action changed groups) —
+        # cheap to refresh each one's option list + current value.
+        for ed in self.scenario_editors.values():
+            try:
+                ed.refresh_group_options()
             except Exception:
                 pass
 
@@ -9705,6 +9863,14 @@ class App:
         call site stays valid."""
         return
 
+    def _hide_viewer_initially(self) -> None:
+        """First-run: collapse the caseload viewer. No-op if already hidden."""
+        if getattr(self, "_caseload_visible", False):
+            try:
+                self._toggle_caseload()
+            except Exception:
+                pass
+
     def _hide_main_pane(self) -> None:
         try:
             self.main_paned.forget(self.main_pane)
@@ -9732,35 +9898,44 @@ class App:
                 pass
 
     def _toggle_editor(self) -> None:
-        """Enter/leave the focused editor MODE. Opening the editor hides
-        the main fire pane (keeping the caseload panel); closing it brings
-        the main pane back. The editor's own Done button also calls this."""
+        """Enter/leave the FOCUSED editor mode. Editing is decluttered: it
+        hides BOTH the fire pane and the caseload viewer so the editor fills
+        the window; Done restores them (viewer only if it was open)."""
         if self._editor_visible:
-            # Leave editor → restore the main fire pane.
+            # Leave editor → restore the main pane (+ viewer if it was up).
             try:
                 self.main_paned.forget(self.editor_pane)
             except Exception:
                 pass
             self._editor_visible = False
             self._show_main_pane()
+            if (getattr(self, "_viewer_before_edit", False)
+                    and not self._caseload_visible):
+                try:
+                    self._toggle_caseload()  # re-show the viewer
+                except Exception:
+                    pass
             self.editor_toggle_btn.configure(text="✎ Edit actions")
         else:
-            # Enter editor → hide the main pane, show editor (before the
-            # caseload pane so order stays editor | caseload).
+            # Enter editor → remember + hide the viewer, hide the main pane,
+            # show the editor alone (full-focus).
+            self._viewer_before_edit = bool(
+                getattr(self, "_caseload_visible", False))
+            if self._caseload_visible:
+                try:
+                    self._toggle_caseload()  # hide viewer
+                except Exception:
+                    pass
             self._hide_main_pane()
-            kw = dict(minsize=340, stretch="never")
-            if (getattr(self, "caseload_dock", None) is not None
-                    and getattr(self, "_caseload_visible", False)):
-                kw["before"] = self.caseload_dock
             try:
-                self.main_paned.add(self.editor_pane, **kw)
+                self.main_paned.add(
+                    self.editor_pane, minsize=340, stretch="always")
             except Exception:
                 pass
             self._editor_visible = True
             self.editor_toggle_btn.configure(text="Hide editor")
-        # Place the divider synchronously (not via after(0)) so the panes
-        # don't first paint at a default split and then snap — that double
-        # paint is what looked like the window resizing twice.
+        # Place the divider synchronously so the panes don't paint at a
+        # default split and then snap.
         self._restore_main_sash()
 
     # ----- Window geometry + divider persistence -----
@@ -9810,6 +9985,40 @@ class App:
     def _safe_zoom(self) -> None:
         try:
             self.root.state("zoomed")
+        except Exception:
+            pass
+
+    def _apply_first_run_geometry(self) -> None:
+        """First-launch default window size (NOT maximized): wide enough to
+        show two action buttons side-by-side with the whole toolbar fully
+        visible, and tall enough to show every group plus a roughly-square
+        activity log. Computed from the laid-out widgets so it adapts to
+        the bundled sample groups / font scale, then centered on screen."""
+        try:
+            self.root.update_idletasks()
+            # Width: the wider of the full toolbar row and the 2-column
+            # action grid drives it (both live in the main pane).
+            content_w = max(
+                self._toggle_row_frame.winfo_reqwidth(),
+                self.button_frame.winfo_reqwidth(),
+            )
+            width = content_w + 32  # pane padx + window padx
+
+            # Height: everything in the main pane at its natural height
+            # already shows all groups; the log box sits at its minimum,
+            # so swap that minimum for a roughly-square log.
+            h_min = self.main_pane.winfo_reqheight()
+            log_min = self.log_tabview.winfo_reqheight()
+            desired_log = int(content_w * 0.8)
+            height = h_min - log_min + desired_log + 24
+
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            width = max(480, min(width, int(sw * 0.95)))
+            height = max(560, min(height, int(sh * 0.92)))
+            x = max(0, (sw - width) // 2)
+            y = max(0, (sh - height) // 2 - 20)
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
         except Exception:
             pass
 
@@ -9928,6 +10137,203 @@ class App:
         except Exception:
             pass
 
+    def _group_of_scenario(self, name: str) -> str:
+        """Return the name of the group containing `name`, or '' if it's
+        ungrouped."""
+        for g in self.groups:
+            if name in g.scenarios:
+                return g.name
+        return ""
+
+    def _set_scenario_group(self, name: str, target_group: str) -> None:
+        """Editor group-dropdown handler: reassign `name` to
+        `target_group` ('' = ungrouped). Deferred so the dropdown's own
+        event finishes before we rebuild the editor tree out from under
+        it."""
+        self.root.after(0, lambda: self._do_set_scenario_group(name, target_group))
+
+    def _do_set_scenario_group(self, name: str, target_group: str) -> None:
+        # Flush on-screen edits so self.scenarios names match the editors.
+        try:
+            self._save_yaml()
+        except Exception:
+            pass
+        if name not in self.scenarios:
+            return
+        if self._group_of_scenario(name) == target_group:
+            return  # no change
+        # Remove from any current group, then add to the target (if any).
+        for g in self.groups:
+            if name in g.scenarios:
+                g.scenarios = [s for s in g.scenarios if s != name]
+        if target_group:
+            for g in self.groups:
+                if g.name == target_group:
+                    if name not in g.scenarios:
+                        g.scenarios.append(name)
+                    break
+        self._rebuild_scenario_buttons()
+        try:
+            self._save_yaml()  # rebuilds editor tabs from the new groups
+        except Exception as e:
+            self._append_log(f"Group change failed to save: {e}", error=True)
+            return
+        try:
+            self._select_editor_scenario(name)
+        except Exception:
+            pass
+        self._append_log(
+            f"Moved {name!r} to group {target_group!r}." if target_group
+            else f"Moved {name!r} to Ungrouped.")
+
+    def _new_scenario_in_group(self, group_name: str) -> None:
+        """'+' on a group header: create a new action already assigned to
+        that group, reveal the editor, and switch to its tab."""
+        dialog = ctk.CTkInputDialog(
+            text=f"Name for new action in '{group_name}':", title="New action")
+        raw = dialog.get_input()
+        if raw is None:
+            return
+        name = raw.strip()
+        if not name:
+            self._append_log("New action: empty name; nothing added.")
+            return
+        if name in self.scenarios:
+            self._append_log(f"Action {name!r} already exists.")
+            return
+        from src.scenarios import ScenarioConfig
+        self.scenarios[name] = ScenarioConfig(
+            name=name, hotkey="", close_tab_after=True,
+            notes=[NoteData(
+                interaction_format="Single Interaction",
+                interaction_type="Email to Student",
+                course_code="", subject="", body="",
+                academic_activities=[], submit=True, append_clipboard=False,
+            )],
+        )
+        for g in self.groups:
+            if g.name == group_name:
+                g.scenarios.append(name)
+                break
+        self._rebuild_editor_tabs()
+        self._rebuild_scenario_buttons()
+        try:
+            self._save_yaml()
+        except Exception as e:
+            self._append_log(f"Could not save new action: {e}")
+            return
+        # Reveal the editor (the '+' lives on the always-visible action
+        # panel; the editor may be hidden) so the new tab is visible.
+        if not getattr(self, "_editor_visible", True):
+            try:
+                self._toggle_editor()
+            except Exception:
+                pass
+        try:
+            self._select_editor_scenario(name)
+        except Exception:
+            pass
+
+    def _copy_scenario(self) -> None:
+        """Duplicate the currently-open action as '<name>-copy' (cleared
+        hotkey), placed in the same group, and switch to it."""
+        import copy as _copy
+        cur = getattr(self, "_current_scenario", None)
+        if not cur:
+            self._append_log("No action selected to copy.")
+            return
+        # Flush on-screen edits so the copy matches what's shown.
+        try:
+            self._save_yaml()
+        except Exception:
+            pass
+        base = self.scenarios.get(cur)
+        if base is None:
+            self._append_log(f"Couldn't copy {cur!r} (not found).", error=True)
+            return
+        new_name = f"{cur}-copy"
+        n = 2
+        while new_name in self.scenarios:
+            new_name = f"{cur}-copy{n}"
+            n += 1
+        new_cfg = _copy.deepcopy(base)
+        new_cfg.name = new_name
+        new_cfg.hotkey = ""  # avoid a duplicate global hotkey
+        self.scenarios[new_name] = new_cfg
+        # Place the copy right after the original in the same group.
+        for g in self.groups:
+            if cur in g.scenarios:
+                g.scenarios.insert(g.scenarios.index(cur) + 1, new_name)
+                break
+        self._rebuild_editor_tabs()
+        self._rebuild_scenario_buttons()
+        try:
+            self._save_yaml()
+        except Exception as e:
+            self._append_log(f"Copy failed to save: {e}", error=True)
+            return
+        self._append_log(f"Copied {cur!r} → {new_name!r}.")
+        try:
+            self._select_editor_scenario(new_name)
+        except Exception:
+            pass
+
+    def _copy_group(self, group, dialog=None) -> None:
+        """Duplicate a whole group: copies the group as '<name>-copy' and
+        every action in it as '<action>-copy', then persists and rebuilds."""
+        import copy as _copy
+        if group is None:
+            return
+        # Flush on-screen edits so copies match what's shown.
+        try:
+            self._save_yaml()
+        except Exception:
+            pass
+        # Re-resolve the group from the reloaded list (by name).
+        src = next((g for g in self.groups if g.name == group.name), None)
+        if src is None:
+            self._append_log(
+                f"Couldn't copy group {group.name!r} (not found).", error=True)
+            return
+        existing_g = {g.name for g in self.groups}
+        new_gname = f"{src.name}-copy"
+        n = 2
+        while new_gname in existing_g:
+            new_gname = f"{src.name}-copy{n}"
+            n += 1
+        new_scen_names: list[str] = []
+        for sname in src.scenarios:
+            base = self.scenarios.get(sname)
+            if base is None:
+                continue
+            new_sname = f"{sname}-copy"
+            k = 2
+            while new_sname in self.scenarios:
+                new_sname = f"{sname}-copy{k}"
+                k += 1
+            cfg = _copy.deepcopy(base)
+            cfg.name = new_sname
+            cfg.hotkey = ""  # avoid duplicate global hotkeys
+            self.scenarios[new_sname] = cfg
+            new_scen_names.append(new_sname)
+        self.groups.append(Group(
+            name=new_gname, color=src.color, scenarios=new_scen_names))
+        self._rebuild_editor_tabs()
+        self._rebuild_scenario_buttons()
+        try:
+            self._save_yaml()
+        except Exception as e:
+            self._append_log(f"Group copy failed to save: {e}", error=True)
+            return
+        self._append_log(
+            f"Copied group {src.name!r} → {new_gname!r} "
+            f"({len(new_scen_names)} action(s)).")
+        if dialog is not None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
     def _settings_new_scenario(self, dialog=None) -> None:
         """Settings → New scenario: close Settings, reveal the editor (so
         the new tab is visible), then run the normal new-scenario flow."""
@@ -10024,7 +10430,7 @@ class App:
         except Exception as e:
             self._append_log(f"Loaded but reload failed: {e}", error=True)
             return
-        self._rebuild_editor_tabs()
+        self._rebuild_editor_tabs(force=True)  # content replaced from file
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
         self._append_log(
@@ -10048,7 +10454,7 @@ class App:
             except Exception:
                 pass
         try:
-            self._rebuild_editor_tabs()  # refresh template dropdowns
+            self._rebuild_editor_tabs(force=True)  # refresh template dropdowns
         except Exception:
             pass
         self._append_log(f"Email templates folder: {p}")
@@ -10147,7 +10553,7 @@ class App:
         except Exception as e:
             self._append_log(f"Revert failed: {e}")
             return
-        self._rebuild_editor_tabs()
+        self._rebuild_editor_tabs(force=True)  # discard on-screen drafts
         self._rebuild_scenario_buttons()
         self._append_log("Editor reverted to saved YAML.")
 
@@ -10400,6 +10806,43 @@ class App:
         self.worker.submit_find_student(
             query, new_tab=new_tab, raise_after=raise_after)
 
+    def _email_uses_sample_placeholder(self, scenario: ScenarioConfig) -> bool:
+        """True if the scenario's email still carries the shipped sample
+        placeholder address (in To, signature, or the template body) —
+        i.e. the user hasn't substituted their own email yet."""
+        e = scenario.email
+        if e is None:
+            return False
+        ph = SAMPLE_EMAIL_PLACEHOLDER
+        if ph in (e.to or "") or ph in (e.signature_file or ""):
+            return True
+        if e.body_html_file:
+            try:
+                p = templates_dir() / e.body_html_file
+                if p.exists() and ph in p.read_text(
+                        encoding="utf-8", errors="ignore"):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _confirm_no_placeholder_email(self, scenario: ScenarioConfig) -> bool:
+        """Warn (and require confirmation) when firing an action whose
+        email still uses the sample placeholder address. Returns True to
+        proceed, False to abort."""
+        if not self._email_uses_sample_placeholder(scenario):
+            return True
+        return ask_yes_no_topmost(
+            self.root, "Sample email address not set",
+            f"This action still uses the sample placeholder address "
+            f"'{SAMPLE_EMAIL_PLACEHOLDER}'.\n\n"
+            "It came from the bundled sample templates. Replace it with "
+            "your own address (in the action's To field and signature, "
+            "and inside the email template) before sending.\n\n"
+            "Send anyway?",
+            yes_label="Send anyway", no_label="Cancel",
+        )
+
     def _fire(self, scenario: ScenarioConfig) -> None:
         if self._is_busy:
             self._append_log(
@@ -10409,6 +10852,13 @@ class App:
             return
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
+            return
+        # Guard: bundled sample emails ship a placeholder address. Don't
+        # let one go out without the user swapping in their own email.
+        if not self._confirm_no_placeholder_email(scenario):
+            self._append_log(
+                f"{scenario.name!r}: not fired — sample placeholder email "
+                "address not replaced.")
             return
         override = self.course_var.get().strip()
         self._append_log(f"--- Firing {scenario.name!r} ---")
@@ -12358,31 +12808,41 @@ class App:
             return True
 
         dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Caseload Tool view not set up")
+        dialog.title("Student emails needed — column missing")
         dialog.transient(self.root)
         dialog.attributes("-topmost", True)
         dialog.grab_set()
-        dialog.geometry("540x300")
+        dialog.geometry("580x380")
         dialog.lift()
         dialog.focus_force()
         result = {"value": False}
 
         ctk.CTkLabel(
-            dialog, text="Caseload Tool view not detected",
+            dialog, text="Student emails needed",
             font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
         ).pack(fill="x", padx=20, pady=(18, 6))
         ctk.CTkLabel(
             dialog,
             text=(
-                "Your caseload CSV doesn't include a student-email "
-                "column. The batch can still proceed — emails will be "
-                "looked up student-by-student from Salesforce at send "
-                "time, which is slower and less reliable.\n\n"
-                "Setting up the 'Caseload Tool' view in Salesforce "
-                "adds the Student Email column to the download and "
-                "fixes this permanently."
+                "This action sends email, but your caseload CSV doesn't "
+                "include a student-email column. The batch can still "
+                "proceed — emails will be looked up student-by-student "
+                "from Salesforce at send time, which is slower and less "
+                "reliable."
             ),
-            wraplength=500, justify="left", anchor="w",
+            wraplength=540, justify="left", anchor="w",
+            font=ctk.CTkFont(size=12),
+        ).pack(fill="x", padx=20, pady=(0, 8))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "To fix this permanently:\n"
+                "  1.  In your Salesforce 'Caseload Tool' list view, add "
+                "an Email column (see 'Set up instructions').\n"
+                "  2.  Back here, click '↻ Refresh caseload' to "
+                "re-download the columns with the email field included."
+            ),
+            wraplength=540, justify="left", anchor="w",
             font=ctk.CTkFont(size=12),
         ).pack(fill="x", padx=20, pady=(0, 14))
 
@@ -12393,6 +12853,22 @@ class App:
             try: dialog.destroy()
             except Exception: pass
             self._setup_caseload_tool_view_with_help(self.root)
+
+        def _refresh_now() -> None:
+            # Abort this fire (the CSV needs to re-download first); kick
+            # off the refresh so the next fire sees the email column.
+            result["value"] = False
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+            self._append_log(
+                "Refreshing caseload columns — re-fire the action once "
+                "the download finishes.")
+            try:
+                self._on_caseload_refresh_clicked()
+            except Exception as e:
+                self._append_log(f"Caseload refresh failed: {e}", error=True)
 
         def _proceed() -> None:
             result["value"] = True
@@ -12412,15 +12888,19 @@ class App:
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 16), side="bottom")
         ctk.CTkButton(
-            btn_row, text="Set up now", width=110, command=_setup_now,
+            btn_row, text="Set up instructions", width=150, command=_setup_now,
         ).pack(side="left", padx=4)
         ctk.CTkButton(
-            btn_row, text="Proceed anyway", width=130,
-            command=_proceed, **SECONDARY_BTN_KWARGS,
+            btn_row, text="↻ Refresh caseload", width=150,
+            command=_refresh_now, **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=4)
         ctk.CTkButton(
             btn_row, text="Skip this session", width=140,
             command=_skip_session, **SECONDARY_BTN_KWARGS,
+        ).pack(side="right", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Proceed anyway", width=130,
+            command=_proceed, **SECONDARY_BTN_KWARGS,
         ).pack(side="right", padx=4)
 
         dialog.protocol("WM_DELETE_WINDOW", _proceed)
