@@ -244,6 +244,10 @@ class Settings:
     # Active email-templates folder (absolute path). Empty = the default
     # email_templates folder. Lets the user keep several template sets.
     email_templates_dir: str = ""
+    # EMA Score Report links: per-course map of courseId + task ids, as a
+    # JSON string {courseCode: {"1": {"course_id","task_id"}, ...}}. Seeded
+    # by pasting a score-report URL the first time a task badge is clicked.
+    ema_report_map: str = ""
 
 
 def load_settings() -> Settings:

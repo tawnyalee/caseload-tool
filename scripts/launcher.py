@@ -289,19 +289,6 @@ class BrowserWorker:
         scrape them. on_done({notes, count, timings})."""
         self.q.put(("FETCH_NOTES", query, on_done))
 
-    def submit_probe_assessments(self, on_done: Callable[[dict], None]) -> None:
-        """DEV: probe the active page (an expanded caseload row) for the
-        Performance Assessments table + EMA Score Report links. Temp."""
-        self.q.put(("PROBE_ASSESSMENTS", on_done))
-
-    def submit_fetch_assessment_links(
-        self, query: str, on_done: Callable[[dict], None],
-    ) -> None:
-        """Expand the student's caseload row, open Performance Assessments,
-        and scrape the most-recent EMA Score Report link per task.
-        on_done({tasks: {1: {href, date, name}, ...}, timings})."""
-        self.q.put(("FETCH_ASSESSMENTS", query, on_done))
-
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -514,20 +501,6 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._fetch_student_notes(ctx, query)
-            finally:
-                on_done(res)
-        elif cmd[0] == "PROBE_ASSESSMENTS":  # DEV: find EMA Score Report links
-            _, on_done = cmd
-            res = {}
-            try:
-                res = self._probe_assessments(ctx)
-            finally:
-                on_done(res)
-        elif cmd[0] == "FETCH_ASSESSMENTS":
-            _, query, on_done = cmd
-            res = {}
-            try:
-                res = self._fetch_assessment_links(ctx, query)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -1545,182 +1518,6 @@ class BrowserWorker:
         self.on_status(f"Caseload table didn't load after retries: {last_error}")
         return None, None
 
-    def _probe_assessments(self, ctx) -> dict:
-        """DEV probe: on an expanded caseload row's Performance Assessments
-        tab, find anchors that look like EMA Score Report links (+ sample
-        the table cells). Uses locators so it pierces Lightning shadow DOM.
-        Temporary — drives the real scraper design."""
-        target = self._active_page(ctx)
-        if target is None:
-            return {"error": "no active page"}
-        res: dict = {"url": (target.url or "")[:90]}
-        # All anchors (shadow-pierced), filtered to score-report-ish ones.
-        try:
-            anchors = target.locator("a")
-            res["anchor_total"] = anchors.count()
-            links = anchors.evaluate_all(
-                """els => els.map(a => {
-                     const row = a.closest('tr');
-                     const cells = row ? Array.from(
-                         row.querySelectorAll('td,th')).map(c =>
-                         (c.textContent || '').replace(/\\s+/g,' ').trim()
-                       ).filter(Boolean) : [];
-                     return {
-                       text: (a.textContent || '').replace(/\\s+/g,' ').trim(),
-                       href: a.href || a.getAttribute('href') || '',
-                       title: a.getAttribute('title') || '',
-                       row: cells.slice(0, 8)
-                     };
-                   }).filter(x =>
-                     /ema|score|report|assessment|evaluation/i.test(
-                       x.text + ' ' + x.href + ' ' + x.title))"""
-            )
-            res["links"] = links[:30]
-            res["link_match_count"] = len(links)
-        except Exception as e:
-            res["err_links"] = str(e)
-        # Sample visible table cells that look like assessment rows, to
-        # confirm we're on the right table + learn its shape.
-        try:
-            tds = target.locator("td:visible")
-            res["td_visible"] = tds.count()
-            cells = tds.evaluate_all(
-                """els => els.map(td => ({
-                     t: (td.textContent || '').replace(/\\s+/g,' ').trim(),
-                     key: td.getAttribute('data-col-key-value') || '',
-                     cell: (td.getAttribute('data-cell-value') || '').slice(0,80)
-                   })).filter(c =>
-                     /task\\s*\\d|ROM3|Evaluation|released|EMA|Proposal/i.test(c.t)
-                     || /ema|score|assessment|task/i.test(c.key))"""
-            )
-            res["cells"] = cells[:20]
-        except Exception as e:
-            res["err_cells"] = str(e)
-        return res
-
-    def _fetch_assessment_links(self, ctx, query: str) -> dict:
-        """Isolate the student's caseload row, expand its detail view, open
-        the Performance Assessments tab, and return the most-recent EMA
-        Score Report link per task: {tasks: {1: {href, date, name}, ...}}.
-        """
-        import time as _t
-        timings: dict = {}
-        t0 = _t.time()
-        target, table = self._open_caseload_table(ctx)
-        if table is None:
-            return {"error": "caseload table didn't load", "timings": timings}
-
-        # Narrow the list to just this student via the row filter.
-        try:
-            filt = target.locator(
-                'input[placeholder="Search All Rows..."]'
-            ).filter(visible=True).first
-            if filt.count() > 0:
-                filt.focus()
-                filt.fill("")
-                filt.fill(query)
-                filt.press("Enter")
-                target.wait_for_timeout(1200)
-        except Exception as e:
-            timings["filter_err"] = str(e)
-
-        # Make sure the row's detail view is open, then the Performance
-        # Assessments tab. If the tab isn't visible yet, click the row's
-        # "Toggle Detail View" control to expand it.
-        def _pa_tab():
-            try:
-                t = target.get_by_text(
-                    "Performance Assessments", exact=False).filter(
-                    visible=True).first
-                return t if t.count() > 0 else None
-            except Exception:
-                return None
-
-        if _pa_tab() is None:
-            for sel in ('button[title="Toggle Detail View"]',
-                        '[title="Toggle Detail View"]',
-                        'button[aria-label*="Toggle Detail" i]',
-                        '[aria-label*="Toggle Detail" i]'):
-                try:
-                    tog = target.locator(sel).filter(visible=True).first
-                    if tog.count() > 0:
-                        tog.click(timeout=2000)
-                        target.wait_for_timeout(1000)
-                        timings["expand"] = sel
-                        break
-                except Exception:
-                    continue
-        tab = _pa_tab()
-        if tab is not None:
-            try:
-                tab.click(timeout=2000)
-                target.wait_for_timeout(1200)
-                timings["tab"] = "clicked"
-            except Exception as e:
-                timings["tab_err"] = str(e)
-        else:
-            timings["tab"] = "not found"
-
-        # Scrape EMA Score Report anchors with their row's task + date.
-        js = """
-        els => {
-          const out = [];
-          for (const a of els) {
-            const title = a.getAttribute('title') || '';
-            const text = (a.textContent || '').replace(/\\s+/g,' ').trim();
-            const href = a.href || a.getAttribute('href') || '';
-            if (!/^https?:/i.test(href)) continue;
-            if (!/ema|score|report/i.test(title + ' ' + text)) continue;
-            const row = a.closest('tr');
-            let task = '', name = '', date = '';
-            if (row) {
-              const cells = Array.from(row.querySelectorAll('td,th'))
-                .map(c => (c.textContent || '').replace(/\\s+/g,' ').trim());
-              for (const c of cells) {
-                const m = c.match(/Task\\s*(\\d)/i);
-                if (m) { task = m[1]; name = c; break; }
-              }
-              for (const c of cells) {
-                const d = c.match(/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/);
-                if (d) { date = d[0]; break; }
-              }
-            }
-            if (!date) {
-              const d = text.match(/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/);
-              if (d) date = d[0];
-            }
-            out.push({task, name, date, href, title, text});
-          }
-          return out;
-        }
-        """
-        rows: list = []
-        try:
-            rows = target.locator("a").evaluate_all(js) or []
-        except Exception as e:
-            timings["scrape_err"] = str(e)
-        timings["found"] = len(rows)
-
-        # Group by task, keep the most recent (by date) per task.
-        from datetime import datetime as _dt
-        tasks: dict = {}
-        for r in rows:
-            tnum = (r.get("task") or "").strip()
-            if not tnum:
-                continue
-            try:
-                d = _dt.strptime((r.get("date") or "")[:10], "%m/%d/%Y")
-            except Exception:
-                d = None
-            cur = tasks.get(tnum)
-            if cur is None or (d and (cur["_d"] is None or d > cur["_d"])):
-                tasks[tnum] = {"href": r.get("href"), "date": r.get("date"),
-                               "name": r.get("name"), "_d": d}
-        for v in tasks.values():
-            v.pop("_d", None)
-        timings["total_ms"] = int((_t.time() - t0) * 1000)
-        return {"tasks": tasks, "timings": timings}
-
     def _fetch_student_notes(
         self, ctx, query: str, max_notes: int = 60,
     ) -> dict:
@@ -2575,6 +2372,27 @@ def fmt_note_date(iso: str) -> str:
         return d.strftime("%m/%d %I:%M %p").lstrip("0")
     except Exception:
         return s[:16].replace("T", " ")
+
+
+_EMA_URL_RE = re.compile(
+    r"tasks\.wgu\.edu/student/(\d+)/course/(\d+)/task/(\d+)/score-report",
+    re.I)
+
+
+def parse_ema_url(url: str) -> Optional[dict]:
+    """Pull the ids out of an EMA Score Report URL, e.g.
+    https://tasks.wgu.edu/student/009930908/course/33860018/task/4521/score-report
+    -> {student_id, course_id, task_id}. None if it doesn't match."""
+    m = _EMA_URL_RE.search(url or "")
+    if not m:
+        return None
+    return {"student_id": m.group(1), "course_id": m.group(2),
+            "task_id": m.group(3)}
+
+
+def build_ema_url(student_id: str, course_id: str, task_id: str) -> str:
+    return (f"https://tasks.wgu.edu/student/{student_id}"
+            f"/course/{course_id}/task/{task_id}/score-report")
 
 
 def _attach_tooltip(widget, text: str) -> None:
@@ -7566,9 +7384,10 @@ class CaseloadPanel:
             _attach_tooltip(badge, note)
 
     def _open_task_report_for(self, row: dict, task_num: int) -> None:
-        name, query = self.app._row_name_and_query(row)
-        if query:
-            self.app._open_task_report(query, name, task_num)
+        student_id = self._cell(row, "StudentID")
+        course_code = self._cell(row, "CourseCode")
+        name = self._cell(row, "Name") or student_id
+        self.app._open_task_report(student_id, course_code, task_num, name)
 
     def _copy_text(self, text: str) -> None:
         try:
@@ -8862,13 +8681,6 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.capture_btn.pack(side="left", padx=(8, 0))
-        # TEMP (dev): probe an expanded caseload row for EMA Score Report
-        # links. Remove after the feature is built.
-        self._btn_probe_ema = ctk.CTkButton(
-            toggle_frame, text="🧪 Probe EMA", width=110,
-            command=self._dev_probe_assessments, **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_probe_ema.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -13135,100 +12947,96 @@ class App:
             except Exception:
                 pass
 
-    def _open_task_report(self, query: str, label: str, task_num: int) -> None:
-        """Open the most-recent EMA Score Report for a student's task in a
-        browser tab. Scrapes the caseload row's Performance Assessments on
-        first use per student (cached for the session)."""
-        cache = getattr(self, "_assessment_cache", None)
-        if cache is None:
-            cache = self._assessment_cache = {}
-        tasks = cache.get(query)
-        if tasks is None:
-            if getattr(self, "_is_busy", False):
-                self._append_log("Busy — finish the current run first.")
-                return
-            self._append_log(f"Fetching assessment links for {label}…")
-            done = tk.BooleanVar(value=False)
-            holder = {"res": {}}
+    def _load_ema_map(self) -> dict:
+        import json
+        raw = (getattr(self.settings, "ema_report_map", "") or "").strip()
+        if not raw:
+            return {}
+        try:
+            d = json.loads(raw)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
 
-            def on_done(res):
-                def setm():
-                    holder["res"] = res or {}
-                    done.set(True)
-                try:
-                    self.root.after(0, setm)
-                except Exception:
-                    holder["res"] = res or {}
-                    done.set(True)
+    def _save_ema_map(self, m: dict) -> None:
+        import json
+        self.settings.ema_report_map = json.dumps(m)
+        save_settings(self.settings)
 
-            self.worker.submit_fetch_assessment_links(query, on_done)
-            self.root.wait_variable(done)
-            res = holder["res"]
-            if res.get("error"):
-                self._append_log(
-                    f"Assessment fetch failed: {res['error']}", error=True)
-                return
-            tasks = res.get("tasks") or {}
-            cache[query] = tasks
-            t = res.get("timings", {})
+    def _open_task_report(self, student_id: str, course_code: str,
+                          task_num: int, label: str) -> None:
+        """Open the EMA Score Report for a student's task in the default
+        browser. The URL is built from the student's ID + a per-course map
+        of courseId/taskId. The map is seeded (once per course+task) by
+        pasting a score-report URL the first time — see _seed_ema_and_open."""
+        student_id = (student_id or "").strip()
+        course_code = (course_code or "").strip()
+        if not student_id:
             self._append_log(
-                f"Assessment links for {label}: "
-                f"tasks={sorted(tasks.keys())} "
-                f"(found {t.get('found')}, {t.get('total_ms')}ms)")
-        info = tasks.get(str(task_num))
-        if not info or not info.get("href"):
-            self._append_log(
-                f"No EMA Score Report link for Task {task_num} ({label}).",
+                f"No Student ID for {label}; can't open score report.",
                 error=True)
             return
+        entry = (self._load_ema_map().get(course_code) or {}).get(str(task_num))
+        if entry and entry.get("course_id") and entry.get("task_id"):
+            url = build_ema_url(student_id, entry["course_id"],
+                                entry["task_id"])
+            self._append_log(
+                f"Opening {course_code} Task {task_num} EMA Score Report "
+                f"for {label}.")
+            try:
+                os.startfile(url)
+            except Exception as e:
+                self._append_log(f"Couldn't open link: {e}", error=True)
+            return
+        self._seed_ema_and_open(student_id, course_code, task_num, label)
+
+    def _seed_ema_and_open(self, student_id: str, course_code: str,
+                           task_num: int, label: str) -> None:
+        """First use for a course+task: ask for one score-report URL, learn
+        the courseId/taskId from it (shared by all students in the course),
+        save it, and open this student's report."""
+        dlg = ctk.CTkInputDialog(
+            title=f"EMA Score Report — {course_code or 'course'} "
+                  f"Task {task_num}",
+            text=(f"First time for {course_code or 'this course'} "
+                  f"Task {task_num} — paste its score-report URL once and "
+                  f"it's remembered for every {course_code} student.\n\n"
+                  f"Where to find it:\n"
+                  f"1. In Salesforce, expand the student's caseload row "
+                  f"(far-left arrow).\n"
+                  f"2. Open the “Performance Assessments” tab.\n"
+                  f"3. Click the EMA Score Report link for Task {task_num}.\n"
+                  f"4. Let the new tab finish loading, then copy the URL "
+                  f"from the address bar — it must end in “/score-report” "
+                  f"(ignore any brief “/cb?code=…” sign-in URL) — and paste "
+                  f"it below."))
+        raw = dlg.get_input()
+        if not raw:
+            return
+        parsed = parse_ema_url(raw)
+        if not parsed:
+            self._append_log(
+                "That isn't a tasks.wgu.edu …/score-report URL — nothing "
+                "saved.", error=True)
+            return
+        m = self._load_ema_map()
+        m.setdefault(course_code, {})[str(task_num)] = {
+            "course_id": parsed["course_id"], "task_id": parsed["task_id"]}
+        self._save_ema_map(m)
         self._append_log(
-            f"Opening Task {task_num} score report "
-            f"({info.get('date')}) for {label}.")
+            f"Saved {course_code} Task {task_num} score-report mapping "
+            f"(course {parsed['course_id']}, task {parsed['task_id']}). "
+            f"All {course_code} students' Task {task_num} badges now work.")
+        url = build_ema_url(student_id, parsed["course_id"], parsed["task_id"])
         try:
-            os.startfile(info["href"])
+            os.startfile(url)
         except Exception as e:
             self._append_log(f"Couldn't open link: {e}", error=True)
 
-    def _dev_probe_assessments(self, event=None) -> None:
-        """DEV: probe the active page for EMA Score Report links + the
-        Performance Assessments table. Expand a student's caseload row and
-        open its Performance Assessments tab first, then click this."""
-        done = tk.BooleanVar(value=False)
-        holder = {"res": {}}
-
-        def on_done(res):
-            def setm():
-                holder["res"] = res or {}
-                done.set(True)
-            try:
-                self.root.after(0, setm)
-            except Exception:
-                holder["res"] = res or {}
-                done.set(True)
-
-        self._append_log("[dev] probing assessments / EMA links…")
-        self.worker.submit_probe_assessments(on_done)
-        self.root.wait_variable(done)
-        r = holder["res"]
-        if r.get("error"):
-            self._append_log(f"[dev] probe failed: {r['error']}", error=True)
-            return
-        self._append_log(
-            f"[dev] url={r.get('url')!r} anchors={r.get('anchor_total')} "
-            f"matched={r.get('link_match_count')} td_visible={r.get('td_visible')}")
-        for lk in (r.get("links") or [])[:14]:
-            self._append_log(
-                f"  [link] title={lk.get('title')!r} text={lk.get('text')!r} "
-                f"→ {lk.get('href')}")
-            if lk.get("row"):
-                self._append_log(f"          row={lk.get('row')}")
-        for c in (r.get("cells") or [])[:12]:
-            self._append_log(
-                f"  [cell] key={c.get('key')!r} t={c.get('t')!r}")
-        if r.get("err_links"):
-            self._append_log(f"  [err_links] {r['err_links']}", error=True)
-        if r.get("err_cells"):
-            self._append_log(f"  [err_cells] {r['err_cells']}", error=True)
+    def _clear_ema_map(self) -> None:
+        self.settings.ema_report_map = ""
+        save_settings(self.settings)
+        self._append_log("Cleared saved EMA Score Report links.")
 
     def _persist_font_size(self, channel: str, n: int) -> None:
         if channel in UI_FONT_CHANNELS:
