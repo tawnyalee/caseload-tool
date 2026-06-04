@@ -289,6 +289,19 @@ class BrowserWorker:
         scrape them. on_done({notes, count, timings})."""
         self.q.put(("FETCH_NOTES", query, on_done))
 
+    def submit_probe_assessments(self, on_done: Callable[[dict], None]) -> None:
+        """DEV: probe the active page (an expanded caseload row) for the
+        Performance Assessments table + EMA Score Report links. Temp."""
+        self.q.put(("PROBE_ASSESSMENTS", on_done))
+
+    def submit_fetch_assessment_links(
+        self, query: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Expand the student's caseload row, open Performance Assessments,
+        and scrape the most-recent EMA Score Report link per task.
+        on_done({tasks: {1: {href, date, name}, ...}, timings})."""
+        self.q.put(("FETCH_ASSESSMENTS", query, on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -501,6 +514,20 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._fetch_student_notes(ctx, query)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_ASSESSMENTS":  # DEV: find EMA Score Report links
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_assessments(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "FETCH_ASSESSMENTS":
+            _, query, on_done = cmd
+            res = {}
+            try:
+                res = self._fetch_assessment_links(ctx, query)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -1517,6 +1544,182 @@ class BrowserWorker:
                 continue
         self.on_status(f"Caseload table didn't load after retries: {last_error}")
         return None, None
+
+    def _probe_assessments(self, ctx) -> dict:
+        """DEV probe: on an expanded caseload row's Performance Assessments
+        tab, find anchors that look like EMA Score Report links (+ sample
+        the table cells). Uses locators so it pierces Lightning shadow DOM.
+        Temporary — drives the real scraper design."""
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        res: dict = {"url": (target.url or "")[:90]}
+        # All anchors (shadow-pierced), filtered to score-report-ish ones.
+        try:
+            anchors = target.locator("a")
+            res["anchor_total"] = anchors.count()
+            links = anchors.evaluate_all(
+                """els => els.map(a => {
+                     const row = a.closest('tr');
+                     const cells = row ? Array.from(
+                         row.querySelectorAll('td,th')).map(c =>
+                         (c.textContent || '').replace(/\\s+/g,' ').trim()
+                       ).filter(Boolean) : [];
+                     return {
+                       text: (a.textContent || '').replace(/\\s+/g,' ').trim(),
+                       href: a.href || a.getAttribute('href') || '',
+                       title: a.getAttribute('title') || '',
+                       row: cells.slice(0, 8)
+                     };
+                   }).filter(x =>
+                     /ema|score|report|assessment|evaluation/i.test(
+                       x.text + ' ' + x.href + ' ' + x.title))"""
+            )
+            res["links"] = links[:30]
+            res["link_match_count"] = len(links)
+        except Exception as e:
+            res["err_links"] = str(e)
+        # Sample visible table cells that look like assessment rows, to
+        # confirm we're on the right table + learn its shape.
+        try:
+            tds = target.locator("td:visible")
+            res["td_visible"] = tds.count()
+            cells = tds.evaluate_all(
+                """els => els.map(td => ({
+                     t: (td.textContent || '').replace(/\\s+/g,' ').trim(),
+                     key: td.getAttribute('data-col-key-value') || '',
+                     cell: (td.getAttribute('data-cell-value') || '').slice(0,80)
+                   })).filter(c =>
+                     /task\\s*\\d|ROM3|Evaluation|released|EMA|Proposal/i.test(c.t)
+                     || /ema|score|assessment|task/i.test(c.key))"""
+            )
+            res["cells"] = cells[:20]
+        except Exception as e:
+            res["err_cells"] = str(e)
+        return res
+
+    def _fetch_assessment_links(self, ctx, query: str) -> dict:
+        """Isolate the student's caseload row, expand its detail view, open
+        the Performance Assessments tab, and return the most-recent EMA
+        Score Report link per task: {tasks: {1: {href, date, name}, ...}}.
+        """
+        import time as _t
+        timings: dict = {}
+        t0 = _t.time()
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return {"error": "caseload table didn't load", "timings": timings}
+
+        # Narrow the list to just this student via the row filter.
+        try:
+            filt = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if filt.count() > 0:
+                filt.focus()
+                filt.fill("")
+                filt.fill(query)
+                filt.press("Enter")
+                target.wait_for_timeout(1200)
+        except Exception as e:
+            timings["filter_err"] = str(e)
+
+        # Make sure the row's detail view is open, then the Performance
+        # Assessments tab. If the tab isn't visible yet, click the row's
+        # "Toggle Detail View" control to expand it.
+        def _pa_tab():
+            try:
+                t = target.get_by_text(
+                    "Performance Assessments", exact=False).filter(
+                    visible=True).first
+                return t if t.count() > 0 else None
+            except Exception:
+                return None
+
+        if _pa_tab() is None:
+            for sel in ('button[title="Toggle Detail View"]',
+                        '[title="Toggle Detail View"]',
+                        'button[aria-label*="Toggle Detail" i]',
+                        '[aria-label*="Toggle Detail" i]'):
+                try:
+                    tog = target.locator(sel).filter(visible=True).first
+                    if tog.count() > 0:
+                        tog.click(timeout=2000)
+                        target.wait_for_timeout(1000)
+                        timings["expand"] = sel
+                        break
+                except Exception:
+                    continue
+        tab = _pa_tab()
+        if tab is not None:
+            try:
+                tab.click(timeout=2000)
+                target.wait_for_timeout(1200)
+                timings["tab"] = "clicked"
+            except Exception as e:
+                timings["tab_err"] = str(e)
+        else:
+            timings["tab"] = "not found"
+
+        # Scrape EMA Score Report anchors with their row's task + date.
+        js = """
+        els => {
+          const out = [];
+          for (const a of els) {
+            const title = a.getAttribute('title') || '';
+            const text = (a.textContent || '').replace(/\\s+/g,' ').trim();
+            const href = a.href || a.getAttribute('href') || '';
+            if (!/^https?:/i.test(href)) continue;
+            if (!/ema|score|report/i.test(title + ' ' + text)) continue;
+            const row = a.closest('tr');
+            let task = '', name = '', date = '';
+            if (row) {
+              const cells = Array.from(row.querySelectorAll('td,th'))
+                .map(c => (c.textContent || '').replace(/\\s+/g,' ').trim());
+              for (const c of cells) {
+                const m = c.match(/Task\\s*(\\d)/i);
+                if (m) { task = m[1]; name = c; break; }
+              }
+              for (const c of cells) {
+                const d = c.match(/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/);
+                if (d) { date = d[0]; break; }
+              }
+            }
+            if (!date) {
+              const d = text.match(/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/);
+              if (d) date = d[0];
+            }
+            out.push({task, name, date, href, title, text});
+          }
+          return out;
+        }
+        """
+        rows: list = []
+        try:
+            rows = target.locator("a").evaluate_all(js) or []
+        except Exception as e:
+            timings["scrape_err"] = str(e)
+        timings["found"] = len(rows)
+
+        # Group by task, keep the most recent (by date) per task.
+        from datetime import datetime as _dt
+        tasks: dict = {}
+        for r in rows:
+            tnum = (r.get("task") or "").strip()
+            if not tnum:
+                continue
+            try:
+                d = _dt.strptime((r.get("date") or "")[:10], "%m/%d/%Y")
+            except Exception:
+                d = None
+            cur = tasks.get(tnum)
+            if cur is None or (d and (cur["_d"] is None or d > cur["_d"])):
+                tasks[tnum] = {"href": r.get("href"), "date": r.get("date"),
+                               "name": r.get("name"), "_d": d}
+        for v in tasks.values():
+            v.pop("_d", None)
+        timings["total_ms"] = int((_t.time() - t0) * 1000)
+        return {"tasks": tasks, "timings": timings}
 
     def _fetch_student_notes(
         self, ctx, query: str, max_notes: int = 60,
@@ -3576,7 +3779,7 @@ def prompt_html_template_editor(
     ctk.CTkLabel(
         size_row,
         text="(editor view only — set the sent email's font in the "
-             "scenario's email section)",
+             "action's email section)",
         font=ctk.CTkFont(size=10), text_color=("gray45", "gray65"),
     ).pack(side="left", padx=(10, 0))
 
@@ -5864,7 +6067,7 @@ class ScenarioEditor:
         self.use_vars_var = ctk.BooleanVar(value=False)
         self._use_vars_checkbox = ctk.CTkCheckBox(
             self.frame,
-            text="Use scenario variables (advanced — applies to email + notes below)",
+            text="Use action variables (advanced — applies to email + notes below)",
             variable=self.use_vars_var,
             command=self._on_use_vars_toggled,
         )
@@ -5922,7 +6125,7 @@ class ScenarioEditor:
         row += 1
         self.panel_action_hint = ctk.CTkLabel(
             self.frame,
-            text="Batch scenarios run from the main window — in the panel, "
+            text="Batch actions run from the main window — in the panel, "
                  "filter the view and apply a single action instead.",
             font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
             wraplength=420, justify="left", anchor="w",
@@ -6079,13 +6282,13 @@ class ScenarioEditor:
         frame.grid_columnconfigure(0, weight=1)
         self._vars_section = frame
         ctk.CTkLabel(
-            frame, text="Scenario variables",
+            frame, text="Action variables",
             font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
         ctk.CTkLabel(
             frame,
             text=(
-                "Values you'll be asked for when this scenario fires. "
+                "Values you'll be asked for when this action fires. "
                 "Use {{var_name}} in the email subject/body and any note "
                 "body to drop the typed value in."
             ),
@@ -6556,9 +6759,9 @@ class ScenarioEditor:
             from tkinter import messagebox
             messagebox.showinfo(
                 "Can't delete",
-                "A scenario needs at least one note. Use 'Delete "
-                "scenario' in the editor's action row if you want to "
-                "remove the whole scenario.",
+                "An action needs at least one note. Use 'Delete "
+                "action' in the editor's action row if you want to "
+                "remove the whole action.",
             )
             return
         self.note_editors.remove(ne)
@@ -6892,7 +7095,7 @@ class CaseloadPanel:
         )
         self.clear_sel_btn.grid(row=0, column=1, padx=(0, 4))
         self.fire_sel_btn = ctk.CTkButton(
-            self.action_bar, text="Fire scenario ▸", width=120,
+            self.action_bar, text="Fire action ▸", width=120,
             command=self._on_fire_selected_clicked,
         )
         self.fire_sel_btn.grid(row=0, column=2, padx=(0, 4))
@@ -7352,7 +7555,20 @@ class CaseloadPanel:
             )
             badge.pack(side="left", padx=2)
             note = f"Task {i}: {tip}" + (f" ({date})" if date else "")
+            # Submitted tasks (passed/returned) have an EMA Score Report —
+            # make the badge open the most-recent one in a browser tab.
+            if state in ("passed", "returned"):
+                note += "  ·  click to open the EMA Score Report"
+                badge.configure(cursor="hand2")
+                badge.bind(
+                    "<Button-1>",
+                    lambda e, t=i, rw=row: self._open_task_report_for(rw, t))
             _attach_tooltip(badge, note)
+
+    def _open_task_report_for(self, row: dict, task_num: int) -> None:
+        name, query = self.app._row_name_and_query(row)
+        if query:
+            self.app._open_task_report(query, name, task_num)
 
     def _copy_text(self, text: str) -> None:
         try:
@@ -7841,7 +8057,7 @@ class CaseloadPanel:
             return
         nonbatch = self._panel_action_scenarios()
         if not nonbatch:
-            self.app._append_log("No non-batch scenarios to fire.")
+            self.app._append_log("No non-batch actions to fire.")
             return
         menu = tk.Menu(self.fire_sel_btn, tearoff=0)
         for sc in nonbatch:
@@ -8352,7 +8568,7 @@ class CaseloadPanel:
                     label=sc.name,
                     command=lambda s=sc, r=row: self.app._fire_on_selected(
                         s, [r], near=(x_root, y_root)))
-            menu.add_cascade(label="Fire scenario", menu=fire_menu)
+            menu.add_cascade(label="Fire action", menu=fire_menu)
             # Fire on the whole checked selection, when there is one.
             checked = self._checked_rows()
             if checked:
@@ -8486,7 +8702,10 @@ class App:
         # PanedWindow paints is the thin sash line between them.
         self.main_paned.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
-        self._editor_visible = True
+        # The scenario editor is a focused MODE you enter on demand: it
+        # starts hidden, and opening it hides the main fire pane (keeping
+        # the caseload panel). Editing and firing are separate tasks.
+        self._editor_visible = False
         # Per-(course,scenario) tabs in the log area + flat list of all
         # entries for the persistent CSV. Initialized before building
         # the UI so the tabview helpers can use them.
@@ -8527,9 +8746,6 @@ class App:
         # (popping before the main window paints makes the dialog
         # look orphaned).
         if not self.settings.first_run_complete:
-            # Start a brand-new user with the scenario editor collapsed so
-            # the first view is uncluttered (they can Show editor anytime).
-            self.root.after(0, self._hide_editor_initially)
             self.root.after(400, self._show_first_run_setup)
 
         # Once the worker has the browser open, auto-refresh the
@@ -8543,14 +8759,27 @@ class App:
         pane = ctk.CTkFrame(self.main_paned)
         pane.grid_columnconfigure(0, weight=1)
         self.main_pane = pane
-        self.main_paned.add(pane, minsize=260, stretch="always")
+        # stretch="never": the main pane keeps its width when the window is
+        # resized — extra horizontal space goes to the caseload viewer.
+        self.main_paned.add(pane, minsize=260, stretch="never")
 
-        # Status
+        # Status + busy/refresh notification, pinned to the TOP so the
+        # caseload-refresh / run status is always visible up top.
         self.status_var = ctk.StringVar(value="Launching browser...")
+        topbar = ctk.CTkFrame(pane, fg_color="transparent")
+        topbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        topbar.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            pane, textvariable=self.status_var,
+            topbar, textvariable=self.status_var,
             font=ctk.CTkFont(size=13), anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        ).grid(row=0, column=0, sticky="ew")
+        self.busy_label = ctk.CTkLabel(
+            topbar, text="", anchor="e", justify="right",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="transparent",
+            text_color=("#7a4f00", "#ffd166"), corner_radius=6,
+        )
+        self.busy_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         # Find student — searches the in-DOM Caseload table.
         # HIDDEN from view (2026-05-31): the caseload panel's own search
@@ -8593,12 +8822,18 @@ class App:
         toggle_frame = ctk.CTkFrame(pane, fg_color="transparent")
         toggle_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 0))
         self.editor_toggle_btn = ctk.CTkButton(
-            toggle_frame, text="Hide editor", width=120, command=self._toggle_editor,
+            toggle_frame, text="✎ Edit actions", width=140,
+            command=self._toggle_editor, **SECONDARY_BTN_KWARGS,
         )
         self.editor_toggle_btn.pack(side="left")
+        self._btn_add_group = ctk.CTkButton(
+            toggle_frame, text="+ Add group", width=110,
+            command=self._add_group, **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_add_group.pack(side="left", padx=(8, 0))
         self.caseload_toggle_btn = ctk.CTkButton(
             toggle_frame, text="Hide caseload", width=120,
-            command=self._toggle_caseload,
+            command=self._toggle_caseload, **SECONDARY_BTN_KWARGS,
         )
         self.caseload_toggle_btn.pack(side="left", padx=(8, 0))
         self.caseload_refresh_btn = ctk.CTkButton(
@@ -8607,12 +8842,6 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.caseload_refresh_btn.pack(side="left", padx=(8, 0))
-        self._btn_templates = ctk.CTkButton(
-            toggle_frame, text="📁 Templates",
-            width=110, command=self._on_open_templates_folder,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_templates.pack(side="left", padx=(8, 0))
         # Settings button — opens a small modal for user preferences.
         # Currently just the advanced-mode toggle; designed to grow.
         self._btn_settings = ctk.CTkButton(
@@ -8633,17 +8862,14 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.capture_btn.pack(side="left", padx=(8, 0))
-        # Busy indicator — right-aligned spinner + text. Empty when
-        # idle; high-contrast yellow background when active so it's
-        # impossible to miss in the row of action buttons.
-        self.busy_label = ctk.CTkLabel(
-            toggle_frame, text="", anchor="e", justify="right",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="transparent",
-            text_color=("#7a4f00", "#ffd166"),
-            corner_radius=6,
+        # TEMP (dev): probe an expanded caseload row for EMA Score Report
+        # links. Remove after the feature is built.
+        self._btn_probe_ema = ctk.CTkButton(
+            toggle_frame, text="🧪 Probe EMA", width=110,
+            command=self._dev_probe_assessments, **SECONDARY_BTN_KWARGS,
         )
-        self.busy_label.pack(side="right", padx=(8, 0), fill="x", expand=True)
+        self._btn_probe_ema.pack(side="left", padx=(8, 0))
+        # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
         self._toggle_row_frame = toggle_frame
@@ -8721,11 +8947,9 @@ class App:
             return
         self._toggle_row_mode = mode
         if mode == "wide":
-            self._btn_templates.configure(text="📁 Templates", width=110)
             self._btn_settings.configure(text="⚙ Settings", width=110)
             self.capture_btn.configure(text="🔬 Capture", width=100)
         else:
-            self._btn_templates.configure(text="📁", width=40)
             self._btn_settings.configure(text="⚙", width=40)
             self.capture_btn.configure(text="🔬", width=40)
 
@@ -8791,12 +9015,6 @@ class App:
             for i, (name, sc) in enumerate(scenario_items):
                 btn = _scenario_btn(self.button_frame, name, sc)
                 btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
-            ctk.CTkButton(
-                self.button_frame, text="+ Add group",
-                command=self._add_group, height=28,
-                **SECONDARY_BTN_KWARGS,
-            ).grid(row=(len(scenario_items) + 1) // 2, column=0, columnspan=2,
-                   sticky="ew", padx=6, pady=(10, 4))
             return
 
         # With groups → sectioned layout.
@@ -8872,14 +9090,7 @@ class App:
             # Trailing inner pad so the last row doesn't touch the border.
             ctk.CTkFrame(box, fg_color="transparent", height=4).grid(
                 row=1 + (len(valid) + 1) // 2, column=0, columnspan=2)
-
-        # "+ Add group" trailing button.
-        ctk.CTkButton(
-            self.button_frame, text="+ Add group",
-            command=self._add_group, height=28,
-            **SECONDARY_BTN_KWARGS,
-        ).grid(row=row, column=0, columnspan=2,
-               sticky="ew", padx=6, pady=(10, 4))
+        # ("+ Add group" now lives in the Edit-actions toolbar row.)
 
     def _toggle_group(self, group_name: str) -> None:
         """Flip a group's collapsed flag and re-render the button
@@ -9023,7 +9234,7 @@ class App:
         )
         preview_label.pack(fill="x", padx=20, pady=(8, 2))
         preview_btn = ctk.CTkButton(
-            dialog, text="example scenario  (F3)",
+            dialog, text="example action  (F3)",
             width=200, height=36, state="disabled",
         )
         preview_btn.pack(anchor="w", padx=20, pady=(0, 8))
@@ -9046,7 +9257,7 @@ class App:
         # below, AFTER the bottom button bar so the buttons always win
         # the space contest and stay visible even when cramped).
         ctk.CTkLabel(
-            dialog, text="Scenarios in this group",
+            dialog, text="Actions in this group",
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w",
         ).pack(fill="x", padx=20, pady=(8, 0))
@@ -9143,8 +9354,8 @@ class App:
         ctk.CTkLabel(
             dialog,
             text=(
-                "If a scenario is in another group, checking it here "
-                "moves it to this one (a scenario can only be in one "
+                "If an action is in another group, checking it here "
+                "moves it to this one (an action can only be in one "
                 "group at a time)."
             ),
             font=ctk.CTkFont(size=10, slant="italic"),
@@ -9279,19 +9490,70 @@ class App:
         self.root.after(0, self._restore_main_sash)
 
     def _toggle_caseload(self) -> None:
-        """Show/hide the rightmost caseload pane. Caseload is always the
-        last pane, so re-showing it is a plain add() (appends to the
-        right of main/editor)."""
+        """Show/hide the rightmost caseload pane. Showing it GROWS the
+        window to the right by the viewer's width (so the main pane keeps
+        its size); hiding it shrinks the window back."""
+        DEFAULT_W = 380
         if self._caseload_visible:
+            # Remember the viewer's current width to restore on re-show,
+            # then shrink the window by it.
+            try:
+                w = self.caseload_dock.winfo_width()
+                if w > 50:
+                    self._caseload_last_w = w
+            except Exception:
+                w = getattr(self, "_caseload_last_w", DEFAULT_W)
             self.main_paned.forget(self.caseload_dock)
             self.caseload_toggle_btn.configure(text="Show caseload")
             self._caseload_visible = False
+            self._grow_window_width(-int(w or DEFAULT_W))
         else:
+            w = int(getattr(self, "_caseload_last_w", DEFAULT_W) or DEFAULT_W)
+            # Capture the main pane's width so we can keep it fixed.
+            try:
+                main_w = self.main_pane.winfo_width()
+            except Exception:
+                main_w = 0
+            self._grow_window_width(+w)
             self.main_paned.add(
                 self.caseload_dock, minsize=300, stretch="always")
             self.caseload_toggle_btn.configure(text="Hide caseload")
             self._caseload_visible = True
-        self.root.after(0, self._restore_main_sash)
+            # Keep the main (or editor) pane at its prior width; the new
+            # window width goes to the caseload viewer.
+            if main_w > 80:
+                try:
+                    self.root.update_idletasks()
+                    n_sash = len(self.main_paned.panes()) - 1
+                    if n_sash >= 1:
+                        self.main_paned.sash_place(n_sash - 1, main_w, 1)
+                except Exception:
+                    self._restore_main_sash()
+            else:
+                self._restore_main_sash()
+            return
+        self._restore_main_sash()
+
+    def _grow_window_width(self, delta: int) -> None:
+        """Widen/narrow the main window by `delta` px, clamped on-screen.
+        No-op when maximized."""
+        try:
+            if self.root.state() == "zoomed":
+                return
+            geo = self.root.geometry()  # "WxH+X+Y"
+            m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geo)
+            if not m:
+                return
+            w, h, x, y = (int(m.group(1)), int(m.group(2)),
+                          int(m.group(3)), int(m.group(4)))
+            sw = self.root.winfo_screenwidth()
+            new_w = max(420, min(w + delta, sw))
+            # Nudge left if the wider window would run off the right edge.
+            if x + new_w > sw:
+                x = max(0, sw - new_w)
+            self.root.geometry(f"{new_w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
     def _refresh_caseload_panel(self) -> None:
         """Repopulate the caseload panel from the current cache. Safe to
@@ -9311,7 +9573,8 @@ class App:
         pane.grid_columnconfigure(0, weight=1)
         pane.grid_rowconfigure(0, weight=1)
         self.editor_pane = pane
-        self.main_paned.add(pane, minsize=340, stretch="always")
+        # NOT added to main_paned here — the editor starts hidden and is
+        # added by _toggle_editor when the user opens it (focused mode).
 
         # Phase 3 editor area: stacked per-group rows of tab-style
         # buttons (self.editor_tabs) above a single shared content
@@ -9359,13 +9622,19 @@ class App:
         save_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 4))
         self._save_row_frame = save_frame
         self._save_row_mode = None
+        # Done — leave the focused editor mode and return to the main view.
+        self._btn_done_editor = ctk.CTkButton(
+            save_frame, text="✓ Done", command=self._toggle_editor,
+            width=90, height=34, **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_done_editor.pack(side="left", padx=(4, 12), pady=2)
         self._btn_new = ctk.CTkButton(
-            save_frame, text="+ New scenario",
+            save_frame, text="+ New action",
             command=self._new_scenario, width=140, height=34,
         )
         self._btn_new.pack(side="left", padx=4, pady=2)
         self._btn_delete = ctk.CTkButton(
-            save_frame, text="Delete scenario",
+            save_frame, text="Delete action",
             command=self._delete_scenario, width=140, height=34,
             **SECONDARY_BTN_KWARGS,
         )
@@ -9403,8 +9672,8 @@ class App:
             return
         self._save_row_mode = mode
         if mode == "wide":
-            self._btn_new.configure(text="+ New scenario", width=140)
-            self._btn_delete.configure(text="Delete scenario", width=140)
+            self._btn_new.configure(text="+ New action", width=140)
+            self._btn_delete.configure(text="Delete action", width=140)
             self._btn_save.configure(text="Save", width=90)
         elif mode == "medium":
             self._btn_new.configure(text="+", width=40)
@@ -9620,32 +9889,67 @@ class App:
         self._build_editor_tab_strips()
 
     def _hide_editor_initially(self) -> None:
-        """Collapse the editor on first launch (called once for a new
-        user). No-op if it's already hidden."""
-        if getattr(self, "_editor_visible", False):
+        """No-op now that the editor starts hidden; kept so the first-run
+        call site stays valid."""
+        return
+
+    def _hide_main_pane(self) -> None:
+        try:
+            self.main_paned.forget(self.main_pane)
+        except Exception:
+            pass
+
+    def _show_main_pane(self) -> None:
+        """Re-add the main fire pane as the leftmost pane."""
+        kw = dict(minsize=260, stretch="never")
+        ref = None
+        if self._editor_visible:
+            ref = self.editor_pane
+        elif (getattr(self, "_caseload_visible", False)
+              and getattr(self, "caseload_dock", None) is not None):
+            ref = self.caseload_dock
+        try:
+            if ref is not None:
+                self.main_paned.add(self.main_pane, before=ref, **kw)
+            else:
+                self.main_paned.add(self.main_pane, **kw)
+        except Exception:
             try:
-                self._toggle_editor()
+                self.main_paned.add(self.main_pane, **kw)
             except Exception:
                 pass
 
     def _toggle_editor(self) -> None:
+        """Enter/leave the focused editor MODE. Opening the editor hides
+        the main fire pane (keeping the caseload panel); closing it brings
+        the main pane back. The editor's own Done button also calls this."""
         if self._editor_visible:
-            self.main_paned.forget(self.editor_pane)
-            self.editor_toggle_btn.configure(text="Show editor")
+            # Leave editor → restore the main fire pane.
+            try:
+                self.main_paned.forget(self.editor_pane)
+            except Exception:
+                pass
             self._editor_visible = False
+            self._show_main_pane()
+            self.editor_toggle_btn.configure(text="✎ Edit actions")
         else:
-            # Re-insert BEFORE the caseload pane so the order stays
-            # main | editor | caseload (add() alone would append it
-            # after caseload). Only valid when caseload is currently
-            # shown — you can't insert before a forgotten pane.
-            kw = dict(minsize=340, stretch="always")
+            # Enter editor → hide the main pane, show editor (before the
+            # caseload pane so order stays editor | caseload).
+            self._hide_main_pane()
+            kw = dict(minsize=340, stretch="never")
             if (getattr(self, "caseload_dock", None) is not None
                     and getattr(self, "_caseload_visible", False)):
                 kw["before"] = self.caseload_dock
-            self.main_paned.add(self.editor_pane, **kw)
-            self.editor_toggle_btn.configure(text="Hide editor")
+            try:
+                self.main_paned.add(self.editor_pane, **kw)
+            except Exception:
+                pass
             self._editor_visible = True
-        self.root.after(0, self._restore_main_sash)
+            self.editor_toggle_btn.configure(text="Hide editor")
+        # Place the divider synchronously (not via after(0)) so the panes
+        # don't first paint at a default split and then snap — that double
+        # paint is what looked like the window resizing twice.
+        self._restore_main_sash()
 
     # ----- Window geometry + divider persistence -----
 
@@ -9776,16 +10080,16 @@ class App:
     def _new_scenario(self) -> None:
         """Prompt for a name, create a scenario with sensible defaults,
         persist, rebuild tabs/buttons, and switch to the new tab."""
-        dialog = ctk.CTkInputDialog(text="Name for new scenario:", title="New scenario")
+        dialog = ctk.CTkInputDialog(text="Name for new action:", title="New action")
         raw = dialog.get_input()
         if raw is None:
             return
         name = raw.strip()
         if not name:
-            self._append_log("New scenario: empty name; nothing added.")
+            self._append_log("New action: empty name; nothing added.")
             return
         if name in self.scenarios:
-            self._append_log(f"Scenario {name!r} already exists.")
+            self._append_log(f"Action {name!r} already exists.")
             return
         from src.scenarios import ScenarioConfig
         self.scenarios[name] = ScenarioConfig(
@@ -9802,7 +10106,7 @@ class App:
         try:
             self._save_yaml()  # persist immediately so the new tab survives a restart
         except Exception as e:
-            self._append_log(f"Could not save new scenario: {e}")
+            self._append_log(f"Could not save new action: {e}")
             return
         # Switch to the freshly-created scenario. With the grid-based
         # content swap this is immediate (no CTkTabview layout race),
@@ -9831,8 +10135,8 @@ class App:
         """Settings → Load from file: pick a .yaml and load it."""
         from tkinter import filedialog
         path = filedialog.askopenfilename(
-            title="Load scenarios file",
-            filetypes=[("Scenario files", "*.yaml *.yml"), ("All files", "*.*")],
+            title="Load actions file",
+            filetypes=[("Action files", "*.yaml *.yml"), ("All files", "*.*")],
         )
         if path:
             self._load_scenarios_from_file(Path(path), dialog)
@@ -9849,18 +10153,18 @@ class App:
             pass
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(
-            title="Save scenarios to file",
+            title="Save actions to file",
             defaultextension=".yaml",
             initialfile="scenarios.yaml",
-            filetypes=[("Scenario files", "*.yaml *.yml"), ("All files", "*.*")],
+            filetypes=[("Action files", "*.yaml *.yml"), ("All files", "*.*")],
         )
         if not path:
             return
         try:
             Path(path).write_bytes(SCENARIOS_YAML.read_bytes())
-            self._append_log(f"Saved scenarios to {path}.")
+            self._append_log(f"Saved actions to {path}.")
         except Exception as e:
-            self._append_log(f"Save scenarios failed: {e}", error=True)
+            self._append_log(f"Save actions failed: {e}", error=True)
 
     def _load_sample_scenarios(self, dialog=None) -> None:
         """Settings → Load samples: restore the bundled sample scenarios."""
@@ -9872,21 +10176,21 @@ class App:
         src_path = Path(src_path)
         if not src_path.exists():
             self._append_log(
-                f"Load scenarios: file not found ({src_path}).", error=True)
+                f"Load actions: file not found ({src_path}).", error=True)
             return
         try:
             loaded = load_scenarios(src_path)
             load_groups(src_path)
         except Exception as e:
             self._append_log(
-                f"Load scenarios: '{src_path.name}' isn't a valid scenarios "
+                f"Load actions: '{src_path.name}' isn't a valid actions "
                 f"file ({e}).", error=True)
             return
         n = len(loaded)
         if not ask_yes_no_topmost(
-            self.root, "Load scenarios?",
-            f"Replace your current scenarios with {n} scenario(s) from "
-            f"'{src_path.name}'?\n\nYour current scenarios are backed up "
+            self.root, "Load actions?",
+            f"Replace your current actions with {n} action(s) from "
+            f"'{src_path.name}'?\n\nYour current actions are backed up "
             f"to scenarios.yaml.bak first.",
             yes_label="Load", no_label="Cancel",
         ):
@@ -9900,7 +10204,7 @@ class App:
         try:
             SCENARIOS_YAML.write_bytes(src_path.read_bytes())
         except Exception as e:
-            self._append_log(f"Load scenarios failed: {e}", error=True)
+            self._append_log(f"Load actions failed: {e}", error=True)
             return
         try:
             self.scenarios = load_scenarios()
@@ -9912,8 +10216,8 @@ class App:
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
         self._append_log(
-            f"Loaded {n} scenario(s) from '{src_path.name}'. "
-            "Previous scenarios backed up to scenarios.yaml.bak.")
+            f"Loaded {n} action(s) from '{src_path.name}'. "
+            "Previous actions backed up to scenarios.yaml.bak.")
         if dialog is not None:
             try:
                 dialog.grab_release(); dialog.destroy()
@@ -10004,12 +10308,12 @@ class App:
         brings the scenario back."""
         name = getattr(self, "_current_scenario", None)
         if not name or name not in self.scenarios:
-            self._append_log("No scenario tab selected.")
+            self._append_log("No action tab selected.")
             return
         from tkinter import messagebox
         if not messagebox.askyesno(
-            "Delete scenario",
-            f"Delete scenario {name!r}?\n\n"
+            "Delete action",
+            f"Delete action {name!r}?\n\n"
             "This only updates the editor — click 'Save changes' to "
             "persist, or 'Revert' to undo.",
         ):
@@ -10018,7 +10322,7 @@ class App:
         self._rebuild_editor_tabs()
         self._rebuild_scenario_buttons()
         self._append_log(
-            f"Scenario {name!r} marked for deletion. "
+            f"Action {name!r} marked for deletion. "
             "Click 'Save changes' to persist or 'Revert' to undo."
         )
 
@@ -10061,7 +10365,7 @@ class App:
         notes_label = ", ".join(f"Note {n}" for n in off)
         if batch:
             msg = (
-                f"Heads up — {notes_label} in this scenario "
+                f"Heads up — {notes_label} in this action "
                 f"{'have' if len(off) > 1 else 'has'} 'Submit and close "
                 f"automatically' unchecked.\n\n"
                 "The form will be filled for every student in the batch "
@@ -10093,11 +10397,11 @@ class App:
         for old_name, ed in list(self.scenario_editors.items()):
             new_name = ed.current_name or old_name
             if not new_name:
-                self._append_log(f"!! Empty scenario name (was {old_name!r}); aborting.")
+                self._append_log(f"!! Empty action name (was {old_name!r}); aborting.")
                 return
             if new_name in seen:
                 self._append_log(
-                    f"!! Duplicate scenario name {new_name!r}; aborting save. "
+                    f"!! Duplicate action name {new_name!r}; aborting save. "
                     "Pick unique names then try again."
                 )
                 return
@@ -10161,7 +10465,7 @@ class App:
         self._rebuild_scenario_buttons()
         self._restart_hotkeys()
         self._append_log(
-            "Saved scenarios.yaml; tabs, buttons, and hotkeys refreshed.")
+            "Actions saved; tabs, buttons, and hotkeys refreshed.")
         # Surface the unchecked-submit summary right after save so a
         # stray uncheck doesn't hide until the next batch fire produces
         # FALSE rows. One log line per offending scenario.
@@ -10326,7 +10630,7 @@ class App:
             )
             if value is None:
                 self._append_log(
-                    f"Prompt {p.var!r} cancelled; scenario not fired."
+                    f"Prompt {p.var!r} cancelled; action not fired."
                 )
                 return None
             prompt_vars[p.var] = value
@@ -10376,11 +10680,11 @@ class App:
         elif scenario.find_first:
             chosen = prompt_find_and_pick(self.root, self._list_matches_blocking)
             if not chosen:
-                self._append_log("Find cancelled; scenario not fired.")
+                self._append_log("Find cancelled; action not fired.")
                 return
             if not self._click_match_blocking(chosen):
                 self._append_log(
-                    f"Could not navigate to {chosen!r}; scenario not fired."
+                    f"Could not navigate to {chosen!r}; action not fired."
                 )
                 return
             chosen_name = chosen
@@ -10416,7 +10720,7 @@ class App:
                 prefill = f"{prefill}{sep}{clipboard}"
             edited = prompt_additional_text(self.root, label, prefill)
             if edited is None:
-                self._append_log(f"{label} edit cancelled; scenario not fired.")
+                self._append_log(f"{label} edit cancelled; action not fired.")
                 return
             custom_bodies[i] = edited
 
@@ -10428,7 +10732,7 @@ class App:
             student_ctx = self._get_student_context_blocking(name_hint=chosen_name)
             if student_ctx is None:
                 self._append_log(
-                    "Couldn't read student context for email; scenario not fired."
+                    "Couldn't read student context for email; action not fired."
                 )
                 return
             from src import outlook_email
@@ -10541,7 +10845,7 @@ class App:
             )
             messagebox.showerror(
                 "Filter column(s) not in Caseload view",
-                f"This scenario filters on column(s) that aren't in your "
+                f"This action filters on column(s) that aren't in your "
                 f"current Caseload export:\n\n  • " +
                 "\n  • ".join(missing) +
                 "\n\n"
@@ -10796,7 +11100,7 @@ class App:
             return
         if scenario.batch is not None:
             self._append_log(
-                f"{scenario.name!r} is a batch scenario; fire it from the "
+                f"{scenario.name!r} is a batch action; fire it from the "
                 "main window, not the panel selection."
             )
             return
@@ -10845,7 +11149,7 @@ class App:
             who = (self._row_name_and_query(rows[0])[0] if n == 1
                    else f"{n} selected students")
             if not ask_yes_no_topmost(
-                self.root, "Fire scenario?",
+                self.root, "Fire action?",
                 f"Fire {scenario.name!r} on {who}?",
                 yes_label="Fire", no_label="Cancel", at=near,
             ):
@@ -11477,12 +11781,12 @@ class App:
         template_path = templates_dir() / email_cfg.body_html_file
         if not template_path.exists():
             self._append_log(
-                f"Email template not found: {template_path}. Scenario aborted."
+                f"Email template not found: {template_path}. Action aborted."
             )
             messagebox.showerror(
                 "Email template missing",
                 f"Couldn't find template:\n{template_path}\n\n"
-                "Check the scenario's body_html_file and the templates folder.",
+                "Check the action's body_html_file and the templates folder.",
             )
             return False
 
@@ -11693,9 +11997,9 @@ class App:
             dialog,
             text=(
                 "Shows additional features most users don't need:\n\n"
-                "  •  Scenario variables  (advanced template substitution)\n"
-                "  •  Inline images  (per-scenario email attachments)\n"
-                "  •  Email font / size override  (per-scenario)\n"
+                "  •  Action variables  (advanced template substitution)\n"
+                "  •  Inline images  (per-action email attachments)\n"
+                "  •  Email font / size override  (per-action)\n"
                 "  •  Email override  (To: redirect, for testing)\n"
                 "  •  Append clipboard contents  (per-note toggle)\n"
                 "  •  📁 Templates folder + Open log buttons\n"
@@ -11710,7 +12014,7 @@ class App:
         ctk.CTkLabel(
             dialog,
             text=(
-                "If a scenario already uses any of these features, those "
+                "If an action already uses any of these features, those "
                 "fields stay visible regardless of this setting so you "
                 "can see and edit them."
             ),
@@ -11758,14 +12062,14 @@ class App:
         ctk.CTkFrame(dialog, height=1, fg_color=("gray70", "gray35")).pack(
             fill="x", padx=20, pady=(2, 8))
         ctk.CTkLabel(
-            dialog, text="Scenarios",
+            dialog, text="Actions",
             font=ctk.CTkFont(size=13, weight="bold"), anchor="w",
         ).pack(fill="x", padx=20, pady=(0, 2))
         ctk.CTkLabel(
             dialog,
-            text="Create a new scenario, load a scenarios file someone "
+            text="Create a new action, load an actions file someone "
                  "shared, or restore the built-in samples. Your current "
-                 "scenarios are backed up first.",
+                 "actions are backed up first.",
             wraplength=510, justify="left", anchor="w",
             text_color=("gray45", "gray60"), font=ctk.CTkFont(size=11),
         ).pack(fill="x", padx=32, pady=(0, 6))
@@ -12165,7 +12469,7 @@ class App:
         ctk.CTkLabel(
             mode_frame,
             text=(
-                "Shows scenario variables, email font overrides, the "
+                "Shows action variables, email font overrides, the "
                 "🔬 Capture network-recording tool, etc."
             ),
             font=ctk.CTkFont(size=11),
@@ -12334,16 +12638,8 @@ class App:
         except Exception:
             pass
 
-        # 📁 Templates (raw folder access) and Open log (the log file) are
-        # extra controls a first-time user rarely needs — hide in basic.
-        try:
-            if advanced:
-                self._btn_templates.pack(
-                    side="left", padx=(8, 0), before=self._btn_settings)
-            else:
-                self._btn_templates.pack_forget()
-        except Exception:
-            pass
+        # Open log (the log file) is an extra control a first-time user
+        # rarely needs — hide in basic mode.
         try:
             if advanced:
                 self._btn_open_log.pack(side="left", padx=(8, 0))
@@ -12373,7 +12669,7 @@ class App:
             self.capture_btn.configure(text="⏹ Stop capture")
             self._append_log(
                 "Network capture STARTED. Fire a note manually (use a "
-                "scenario or click Submit in Salesforce yourself). "
+                "action or click Submit in Salesforce yourself). "
                 "Click ⏹ Stop capture when done."
             )
             return
@@ -12838,6 +13134,101 @@ class App:
                 p._refresh_notes_font()
             except Exception:
                 pass
+
+    def _open_task_report(self, query: str, label: str, task_num: int) -> None:
+        """Open the most-recent EMA Score Report for a student's task in a
+        browser tab. Scrapes the caseload row's Performance Assessments on
+        first use per student (cached for the session)."""
+        cache = getattr(self, "_assessment_cache", None)
+        if cache is None:
+            cache = self._assessment_cache = {}
+        tasks = cache.get(query)
+        if tasks is None:
+            if getattr(self, "_is_busy", False):
+                self._append_log("Busy — finish the current run first.")
+                return
+            self._append_log(f"Fetching assessment links for {label}…")
+            done = tk.BooleanVar(value=False)
+            holder = {"res": {}}
+
+            def on_done(res):
+                def setm():
+                    holder["res"] = res or {}
+                    done.set(True)
+                try:
+                    self.root.after(0, setm)
+                except Exception:
+                    holder["res"] = res or {}
+                    done.set(True)
+
+            self.worker.submit_fetch_assessment_links(query, on_done)
+            self.root.wait_variable(done)
+            res = holder["res"]
+            if res.get("error"):
+                self._append_log(
+                    f"Assessment fetch failed: {res['error']}", error=True)
+                return
+            tasks = res.get("tasks") or {}
+            cache[query] = tasks
+            t = res.get("timings", {})
+            self._append_log(
+                f"Assessment links for {label}: "
+                f"tasks={sorted(tasks.keys())} "
+                f"(found {t.get('found')}, {t.get('total_ms')}ms)")
+        info = tasks.get(str(task_num))
+        if not info or not info.get("href"):
+            self._append_log(
+                f"No EMA Score Report link for Task {task_num} ({label}).",
+                error=True)
+            return
+        self._append_log(
+            f"Opening Task {task_num} score report "
+            f"({info.get('date')}) for {label}.")
+        try:
+            os.startfile(info["href"])
+        except Exception as e:
+            self._append_log(f"Couldn't open link: {e}", error=True)
+
+    def _dev_probe_assessments(self, event=None) -> None:
+        """DEV: probe the active page for EMA Score Report links + the
+        Performance Assessments table. Expand a student's caseload row and
+        open its Performance Assessments tab first, then click this."""
+        done = tk.BooleanVar(value=False)
+        holder = {"res": {}}
+
+        def on_done(res):
+            def setm():
+                holder["res"] = res or {}
+                done.set(True)
+            try:
+                self.root.after(0, setm)
+            except Exception:
+                holder["res"] = res or {}
+                done.set(True)
+
+        self._append_log("[dev] probing assessments / EMA links…")
+        self.worker.submit_probe_assessments(on_done)
+        self.root.wait_variable(done)
+        r = holder["res"]
+        if r.get("error"):
+            self._append_log(f"[dev] probe failed: {r['error']}", error=True)
+            return
+        self._append_log(
+            f"[dev] url={r.get('url')!r} anchors={r.get('anchor_total')} "
+            f"matched={r.get('link_match_count')} td_visible={r.get('td_visible')}")
+        for lk in (r.get("links") or [])[:14]:
+            self._append_log(
+                f"  [link] title={lk.get('title')!r} text={lk.get('text')!r} "
+                f"→ {lk.get('href')}")
+            if lk.get("row"):
+                self._append_log(f"          row={lk.get('row')}")
+        for c in (r.get("cells") or [])[:12]:
+            self._append_log(
+                f"  [cell] key={c.get('key')!r} t={c.get('t')!r}")
+        if r.get("err_links"):
+            self._append_log(f"  [err_links] {r['err_links']}", error=True)
+        if r.get("err_cells"):
+            self._append_log(f"  [err_cells] {r['err_cells']}", error=True)
 
     def _persist_font_size(self, channel: str, n: int) -> None:
         if channel in UI_FONT_CHANNELS:
