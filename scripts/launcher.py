@@ -6292,18 +6292,6 @@ class ScenarioEditor:
             row=row, column=0, sticky="w", padx=(28, 8), pady=(0, 8))
         self.panel_action_hint.grid_remove()  # shown only in batch mode
 
-        # Essential-Action awareness: when on, firing this (single) action
-        # checks the student's open Essential Actions at fire time and
-        # offers to attach one to the note (+ optional close). Opt-in
-        # because it adds a couple seconds (open the EA tab + read).
-        row += 1
-        self.attach_ea_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            self.frame,
-            text="Offer to attach an Essential Action at fire time",
-            variable=self.attach_ea_var,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 8))
-
         # Send-email toggle + email section (sub-frame visible only
         # when toggle is on). Toggle commands grid_remove/.grid so
         # the row collapses to nothing when emails aren't used.
@@ -6319,6 +6307,18 @@ class ScenarioEditor:
         self._email_section_row = row
         self._build_email_section()
         # Visibility set by load() based on scenario.email != None.
+
+        # Essential-Action attach toggle — lives in the note section since
+        # it governs how this action's note is filed (tied to an EA, with
+        # an optional close, chosen at fire time). Opt-in (the check adds a
+        # couple seconds: open the record's EA tab + read).
+        row += 1
+        self.attach_ea_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            self.frame,
+            text="Offer to attach an Essential Action to the note at fire time",
+            variable=self.attach_ea_var,
+        ).grid(row=row, column=0, sticky="w", padx=8, pady=(6, 2))
 
         # Notes live in their own container so add/delete can just
         # pack/destroy children without disturbing the outer grid rows.
@@ -12064,6 +12064,22 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
+            return
+
+        # EA-aware action on a SINGLE student → route through the
+        # per-student fire path, which surfaces the Essential Actions
+        # attach dialog. (Mini-batch over multiple rows doesn't do the
+        # per-student EA attach.)
+        if getattr(scenario, "attach_essential_action", False) and len(rows) == 1:
+            name, query = self._row_name_and_query(rows[0])
+            override = self.course_var.get().strip()
+            self._set_busy(f"Running {scenario.name}…")
+            try:
+                self._fire_per_student(
+                    scenario, override,
+                    prenav_query=query, prenav_label=name)
+            finally:
+                self._set_idle()
             return
 
         # Pre-flight submit-unchecked warning (batch wording — the impact
