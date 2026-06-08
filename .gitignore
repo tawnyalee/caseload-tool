@@ -32,6 +32,8 @@ note_log.csv
 caseload.csv
 # Backups/temp written by the download anti-clobber guard (also PII).
 caseload.csv.*
+# Single-instance lock file (runtime).
+launcher.lock
 
 # The user's live scenarios (their personal batches/scenarios/emails).
 # Only the bundled sample, default_scenarios.yaml, is tracked. The legacy

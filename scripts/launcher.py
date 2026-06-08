@@ -14428,6 +14428,15 @@ class App:
         except Exception:
             pass
         self.worker.shutdown()
+        # Wait briefly for the worker to close Playwright cleanly, so the
+        # process doesn't exit mid-teardown (which makes the driver print an
+        # EPIPE). Bounded so closing never hangs.
+        try:
+            t = getattr(self.worker, "thread", None)
+            if t is not None:
+                t.join(timeout=4)
+        except Exception:
+            pass
         self.root.destroy()
 
     # ----- Status / log -----
@@ -14928,7 +14937,54 @@ class App:
         self.root.mainloop()
 
 
+_INSTANCE_LOCK_FH = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Best-effort single-instance guard via an OS file lock. Returns True
+    if we acquired it (or couldn't check — fail open), False if another
+    launcher instance already holds it. The lock is released automatically
+    by the OS on exit/crash, so a force-killed instance never wedges it.
+
+    Running two instances against the same persistent browser profile is
+    what produces the Playwright EPIPE (broken pipe) at launch — one
+    driver's pipe dies fighting over the profile."""
+    global _INSTANCE_LOCK_FH
+    try:
+        import msvcrt
+    except Exception:
+        return True  # non-Windows / no msvcrt — don't block launch
+    try:
+        lock_path = CASELOAD_CSV_PATH.parent / "launcher.lock"
+        fh = open(lock_path, "a+")
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            fh.close()
+            return False  # another instance holds the lock
+        _INSTANCE_LOCK_FH = fh  # keep open for the process lifetime
+        return True
+    except Exception:
+        return True  # any error → fail open (never block on the guard)
+
+
 def main() -> None:
+    if not _acquire_single_instance_lock():
+        try:
+            import tkinter.messagebox as _mb
+            _r = tk.Tk()
+            _r.withdraw()
+            _r.attributes("-topmost", True)
+            _mb.showwarning(
+                "Caseload Notes already running",
+                "Another Caseload Notes window is already open.\n\n"
+                "Close it first (check the taskbar) before launching again. "
+                "Running two at once breaks the shared browser session.")
+            _r.destroy()
+        except Exception:
+            print("Caseload Notes is already running — close the other "
+                  "window first.", file=sys.stderr)
+        return
     App().run()
 
 
