@@ -133,6 +133,13 @@ CASELOAD_CSV_PATH = USER_CONFIG_DIR / "caseload.csv"
 DEFAULT_CASELOAD_URL = "https://srm.lightning.force.com/lightning/n/Caseload_App_Page"
 CASELOAD_URL = os.getenv("CASELOAD_URL", DEFAULT_CASELOAD_URL).strip()
 
+# WGU's Essential Actions dashboard (cross-caseload list of open EAs).
+# Scraped to surface EAs in the viewer. Override via .env if needed.
+DEFAULT_ESSENTIAL_ACTIONS_URL = (
+    "https://srm.lightning.force.com/lightning/n/Essential_Actions")
+ESSENTIAL_ACTIONS_URL = os.getenv(
+    "ESSENTIAL_ACTIONS_URL", DEFAULT_ESSENTIAL_ACTIONS_URL).strip()
+
 
 def _seed_user_scenarios_yaml() -> None:
     """First-run setup for the user's scenario file, in priority order:

@@ -297,6 +297,13 @@ class BrowserWorker:
         on_done({eas:[{reason,course,event_progress,intervention}]})."""
         self.q.put(("READ_EA", on_done))
 
+    def submit_read_ea_dashboard(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Scrape the cross-caseload Essential Actions DASHBOARD.
+        on_done({eas:[{student_id,name,reason,...}]})."""
+        self.q.put(("READ_EA_DASHBOARD", on_done))
+
     def submit_find_student(self, query: str, new_tab: bool = False,
                             raise_after: Optional[bool] = None) -> None:
         """Navigate to a student record. When `new_tab` is True the
@@ -521,6 +528,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._read_essential_actions(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "READ_EA_DASHBOARD":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._read_ea_dashboard(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "FIND":
@@ -2160,6 +2174,33 @@ class BrowserWorker:
             return {"eas": read_essential_actions(target)}
         except Exception as e:
             return {"error": str(e)}
+
+    def _read_ea_dashboard(self, ctx) -> dict:
+        """Navigate to the Essential Actions dashboard, scroll-load + read
+        all EAs, then return to the caseload list so subsequent finds/fires
+        start from the right page."""
+        from src.config import ESSENTIAL_ACTIONS_URL
+        from src.student_lookup import read_ea_dashboard_rows
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        if not ESSENTIAL_ACTIONS_URL:
+            return {"error": "ESSENTIAL_ACTIONS_URL not set"}
+        err, rows = "", []
+        try:
+            target.goto(ESSENTIAL_ACTIONS_URL, wait_until="domcontentloaded")
+            target.wait_for_timeout(800)
+            rows = read_ea_dashboard_rows(target)
+        except Exception as e:
+            err = str(e)
+        try:
+            if CASELOAD_URL:
+                target.goto(CASELOAD_URL, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        if err:
+            return {"error": err}
+        return {"eas": rows}
 
     def _handle_run(
         self, ctx, scenario: ScenarioConfig, override: str,
@@ -7375,6 +7416,12 @@ class CaseloadPanel:
             filt_actions, text="Clear", width=70, command=self._clear_filters,
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
+        # Quick toggle: only students with an open Essential Action.
+        self._ea_only_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            filt_actions, text="Only open EAs", variable=self._ea_only_var,
+            font=ctk.CTkFont(size=11), command=self.populate,
+        ).pack(side="left", padx=(14, 0))
         self.filters_wrap.grid_remove()  # collapsed by default
 
         # Vertical split: the table on top, the student detail pane
@@ -7728,18 +7775,29 @@ class CaseloadPanel:
         )
         self.detail_scroll.grid(row=1, column=0, sticky="nsew",
                                 padx=4, pady=(0, 6))
-        self.detail_scroll.grid_columnconfigure(0, weight=1)
+        # Two columns: basic info (left) + Essential Actions (right). Notes
+        # span both, below.
+        self.detail_scroll.grid_columnconfigure(0, weight=3)
+        self.detail_scroll.grid_columnconfigure(1, weight=2)
         self.qv_body = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-        self.qv_body.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 4))
+        self.qv_body.grid(row=0, column=0, sticky="new", padx=4, pady=(2, 4))
         self.qv_body.grid_columnconfigure(1, weight=1)
+        # Essential Actions panel — to the right of the basic info.
+        self.qv_ea_frame = ctk.CTkFrame(
+            self.detail_scroll, fg_color=("gray90", "gray22"), corner_radius=6)
+        self.qv_ea_frame.grid(row=0, column=1, sticky="new", padx=(4, 4),
+                              pady=(2, 4))
+        self.qv_ea_frame.grid_columnconfigure(0, weight=1)
         self.notes_title = ctk.CTkLabel(
             self.detail_scroll, text="Notes", anchor="w",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.notes_title.grid(row=1, column=0, sticky="w", padx=6, pady=(2, 0))
+        self.notes_title.grid(row=1, column=0, columnspan=2, sticky="w",
+                              padx=6, pady=(2, 0))
         self.notes_holder = ctk.CTkFrame(
             self.detail_scroll, fg_color="transparent")
-        self.notes_holder.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.notes_holder.grid(row=2, column=0, columnspan=2, sticky="ew",
+                               padx=2, pady=2)
         self.notes_holder.grid_columnconfigure(0, weight=1)
         # Ctrl +/- and Ctrl+wheel resize the note text while reading.
         bind_font_hotkeys("notes", self.detail_scroll)
@@ -7837,10 +7895,60 @@ class CaseloadPanel:
         # this is all the context needed; load full notes only if more is
         # wanted.
         r = self._qv_latest_note(r, row)
+        # Essential Actions for this student (right-hand panel).
+        self._qv_render_ea(row)
         # New student → reset the notes area to the hint.
         self._notes_hint()
         # Make sure the whole quick view is visible by default.
         self._ensure_detail_height()
+
+    def _qv_render_ea(self, row) -> None:
+        """Fill the right-hand Essential Actions panel for this student
+        (from the dashboard scrape, keyed by Student ID)."""
+        for w in self.qv_ea_frame.winfo_children():
+            w.destroy()
+        sid = self._cell(row, "StudentID")
+        ea = (getattr(self.app, "_ea_by_sid", {}) or {}).get(sid)
+        ctk.CTkLabel(
+            self.qv_ea_frame, text="Essential Action", anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
+        if not ea:
+            ctk.CTkLabel(
+                self.qv_ea_frame, text="none open", anchor="w",
+                font=ctk.CTkFont(size=12), text_color=("gray45", "gray60"),
+            ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+            return
+        rr = 1
+        reason = ea.get("reason", "")
+        if reason:
+            ctk.CTkLabel(
+                self.qv_ea_frame, text=reason, anchor="w", justify="left",
+                wraplength=240, font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=rr, column=0, sticky="ew", padx=8, pady=(0, 2))
+            rr += 1
+        meta = []
+        if ea.get("event_progress"):
+            meta.append(ea["event_progress"])
+        if ea.get("followup_date"):
+            meta.append(f"follow-up {ea['followup_date']}")
+        if ea.get("date_added"):
+            meta.append(f"added {ea['date_added']}")
+        if meta:
+            ctk.CTkLabel(
+                self.qv_ea_frame, text="  ·  ".join(meta), anchor="w",
+                justify="left", wraplength=240, font=ctk.CTkFont(size=11),
+                text_color=("gray40", "gray65"),
+            ).grid(row=rr, column=0, sticky="ew", padx=8, pady=(0, 2))
+            rr += 1
+        interv = ea.get("intervention", "")
+        if interv:
+            ctk.CTkLabel(
+                self.qv_ea_frame, text=interv, anchor="w", justify="left",
+                wraplength=240, font=ctk.CTkFont(size=11),
+                text_color=("gray35", "gray70"),
+            ).grid(row=rr, column=0, sticky="ew", padx=8, pady=(0, 6))
 
     def _qv_latest_note(self, r, row) -> int:
         """Render the latest course note (CSV `LatestCourseNote`) with its
@@ -8955,6 +9063,9 @@ class CaseloadPanel:
             base = [r for r in base
                     if self._status_match(
                         r.get("LatestTaskStatus", ""), self._status_filter)]
+        if getattr(self, "_ea_only_var", None) is not None and \
+                self._ea_only_var.get():
+            base = [r for r in base if (r.get("EssentialAction") or "").strip()]
         q = self._query.strip().lower()
         view = ([r for r in base
                  if any(q in str(v).lower() for v in r.values())]
@@ -9132,6 +9243,16 @@ class CaseloadPanel:
             txt = f"{total} rows · {age}"
         else:
             txt = age
+        # Essential Actions freshness (scraped separately from the dashboard).
+        ea_mt = getattr(self.app, "_ea_mtime", None)
+        if ea_mt is not None:
+            ea_mins = (datetime.now() - ea_mt).total_seconds() / 60
+            ea_age = ("just now" if ea_mins < 1
+                      else f"{int(ea_mins)} min ago" if ea_mins < 60
+                      else f"{int(ea_mins // 60)} hr ago")
+            txt += f"  ·  EAs {ea_age}"
+        else:
+            txt += "  ·  EAs not loaded"
         color = ("gray40", "gray65")
         if mt is not None:
             mins = (datetime.now() - mt).total_seconds() / 60
@@ -12372,6 +12493,67 @@ class App:
         self.root.wait_variable(done_var)
         return holder["eas"]
 
+    def _read_ea_dashboard_blocking(self) -> list:
+        """Scrape the cross-caseload EA dashboard, blocking until done."""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"eas": []}
+
+        def on_done(res) -> None:
+            def set_main() -> None:
+                holder["eas"] = (res or {}).get("eas") or []
+                if (res or {}).get("error"):
+                    self._append_log(
+                        f"EA dashboard scrape failed: {res['error']}",
+                        error=True)
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["eas"] = (res or {}).get("eas") or []
+                done_var.set(True)
+
+        self.worker.submit_read_ea_dashboard(on_done)
+        self.root.wait_variable(done_var)
+        return holder["eas"]
+
+    def _apply_ea_scrape(self, eas: list) -> None:
+        """Index the scraped EAs by Student ID (one per student — the
+        dashboard is designed that way), warn loudly if a student appears
+        twice, stamp the freshness time, and refresh the panel."""
+        from datetime import datetime
+        by_sid: dict = {}
+        dups: list = []
+        for ea in (eas or []):
+            sid = (ea.get("student_id") or "").strip()
+            if not sid:
+                continue
+            if sid in by_sid:
+                dups.append(ea.get("name") or sid)
+                continue  # keep the first
+            by_sid[sid] = ea
+        self._ea_by_sid = by_sid
+        self._ea_mtime = datetime.now()
+        for who in dups:
+            self._append_log(
+                f"⚠ Essential Actions dashboard listed {who!r} more than "
+                "once — showing only the first. The design expects one EA "
+                "per student; check this student.", error=True)
+        self._append_log(
+            f"Essential Actions: {len(by_sid)} student(s) with an open EA.")
+        self._apply_ea_to_rows()
+        self._refresh_caseload_panel()
+
+    def _apply_ea_to_rows(self) -> None:
+        """Inject the scraped EA reason into each cached caseload row as a
+        synthetic 'EssentialAction' column (matched by Student ID), so it
+        shows + filters in the viewer. Re-run after every cache reload."""
+        rows = self._caseload_rows or []
+        by_sid = getattr(self, "_ea_by_sid", {}) or {}
+        for r in rows:
+            sid = str(r.get("StudentID", "") or r.get("Student ID", "")).strip()
+            ea = by_sid.get(sid)
+            r["EssentialAction"] = (ea.get("reason", "") if ea else "")
+
     def _choose_ea_attachment(self, eas: list) -> tuple:
         """Fire-time dialog: show the student's open EAs and let the user
         attach ONE to this note (+ optional close), or file normally.
@@ -13186,21 +13368,37 @@ class App:
         if not self.worker.ready_event.is_set():
             self.root.after(500, self._poll_worker_then_auto_download)
             return
-        self._set_busy("Auto-refreshing caseload CSV…")
+        self._set_busy("Auto-refreshing caseload + Essential Actions…")
         self._append_log("Auto-refreshing caseload CSV...")
+
+        def on_ea_done(res) -> None:
+            def apply() -> None:
+                if (res or {}).get("error"):
+                    self._append_log(
+                        f"EA dashboard scrape failed: {res['error']}",
+                        error=True)
+                self._apply_ea_scrape((res or {}).get("eas") or [])
+                self._set_idle()
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                self._set_idle()
 
         def on_done(success: bool, message: str) -> None:
             def set_main() -> None:
                 if success:
                     self._append_log(f"Caseload CSV: {message}")
                     self._reload_caseload_cache(silent=False)
+                    # Scrape the Essential Actions dashboard in the same pass.
+                    self._append_log("Scraping Essential Actions dashboard…")
+                    self.worker.submit_read_ea_dashboard(on_ea_done)
                 else:
                     self._append_log(
                         f"Caseload CSV auto-download failed: {message}. "
                         "You can retry with ↻ Caseload. Until then, "
                         "batches will fall back to the DOM scrape."
                     )
-                self._set_idle()
+                    self._set_idle()
             try:
                 self.root.after(0, set_main)
             except Exception:
@@ -14046,7 +14244,7 @@ class App:
         if not self.worker.ready_event.is_set():
             self._append_log("Browser not ready yet — wait and try again.")
             return
-        self._set_busy("Refreshing caseload CSV…")
+        self._set_busy("Refreshing caseload + Essential Actions…")
         self._append_log("Refreshing caseload CSV (manual)...")
         try:
             success, message = self._download_caseload_csv_blocking()
@@ -14054,6 +14252,9 @@ class App:
                 self._append_log(f"Caseload CSV: {message}")
             else:
                 self._append_log(f"Caseload CSV refresh failed: {message}")
+            # Scrape the Essential Actions dashboard in the same refresh.
+            self._append_log("Scraping Essential Actions dashboard…")
+            self._apply_ea_scrape(self._read_ea_dashboard_blocking())
         finally:
             self._set_idle()
 
@@ -14379,6 +14580,9 @@ class App:
                     "emails will use the slower per-student row scrape. "
                     "Set up Caseload Tool view in ⚙ Settings to fix."
                 )
+        # Re-attach scraped Essential Actions to the freshly-loaded rows
+        # (reload rebuilds rows from the CSV, dropping the synthetic column).
+        self._apply_ea_to_rows()
         self._refresh_caseload_panel()
         self._check_required_caseload_columns(rows, silent=silent)
         return True

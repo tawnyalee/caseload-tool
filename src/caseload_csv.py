@@ -50,6 +50,8 @@ DISPLAY_TO_CSV: dict[str, str] = {
     "Program Name": "ProgramName",
     "Remaining CUs": "TermRemainingCU",
     "Last Assigned CI Contact": "MyCourseContact",
+    # Synthetic column injected from the Essential Actions dashboard scrape.
+    "Essential Action": "EssentialAction",
 }
 
 

@@ -400,6 +400,59 @@ def open_ea_note_form(page: Page, reason: str, course: str,
         return False
 
 
+def read_ea_dashboard_rows(page: Page, max_iters: int = 120) -> list[dict]:
+    """On the Essential Actions DASHBOARD page: scroll-load every row and
+    read each EA. Returns
+    [{student_id, name, reason, course, event_progress, followup_date,
+      intervention, date_added}]. Empty if the grid never loads / no EAs.
+    The dashboard grid is light-DOM (td[data-label=...]), so plain
+    locators read it directly."""
+    sid_sel = 'td[data-label="Student ID"]'
+    try:
+        page.locator(sid_sel).first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass  # possibly zero EAs — fall through and return []
+    rows = page.locator("tr").filter(has=page.locator(sid_sel))
+    # Scroll the last row into view until the count stops growing.
+    last, stable = -1, 0
+    for _ in range(max_iters):
+        cnt = rows.count()
+        if cnt == last:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable = 0
+        last = cnt
+        if cnt > 0:
+            try:
+                rows.nth(cnt - 1).scroll_into_view_if_needed(timeout=1500)
+            except Exception:
+                pass
+        page.wait_for_timeout(300)
+    out: list[dict] = []
+    n = rows.count()
+    for i in range(n):
+        row = rows.nth(i)
+        try:
+            sid = _ea_cell(row, "Student ID")
+            if not sid:
+                continue
+            out.append({
+                "student_id": sid,
+                "name": _ea_cell(row, "Student Name"),
+                "reason": _ea_cell(row, "Reason"),
+                "course": _ea_cell(row, "Course Code"),
+                "event_progress": _ea_cell(row, "Event Progress"),
+                "followup_date": _ea_cell(row, "Follow-Up Date"),
+                "intervention": _ea_cell(row, "Intervention"),
+                "date_added": _ea_cell(row, "Date Added to List"),
+            })
+        except Exception:
+            continue
+    return out
+
+
 def detect_course_code(page: Page, student_name: str) -> Optional[str]:
     """Backward-compatible thin wrapper: returns just the course code,
     or None if not found."""
