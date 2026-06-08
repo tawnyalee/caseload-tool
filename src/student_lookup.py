@@ -291,13 +291,23 @@ _EA_TABLE_SEL = '.cEssentialActionDataTable'
 
 
 def _ea_activate_tab(page: Page) -> None:
-    """Click the record's 'Essential Actions' scoped tab so its datatable
-    renders. No-op if the tab isn't present / already active."""
+    """Click the record's 'Essential Actions' scoped tab and wait until its
+    datatable renders — a readiness check rather than a blind sleep, so it
+    returns as soon as the table is visible (usually well under a second).
+    No-op if the tab isn't present."""
     try:
         tab = page.locator(_EA_TAB_SEL).filter(visible=True).first
-        if tab.count() > 0:
-            tab.click()
-            page.wait_for_timeout(900)
+        if tab.count() == 0:
+            return
+        tab.click()
+        try:
+            # Returns the instant the EA component is visible; the brief
+            # settle lets the datatable's rows paint before we read them.
+            page.locator(_EA_TABLE_SEL).first.wait_for(
+                state="visible", timeout=3000)
+            page.wait_for_timeout(150)
+        except Exception:
+            page.wait_for_timeout(300)  # fallback if the table never matched
     except Exception:
         pass
 

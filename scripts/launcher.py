@@ -2180,7 +2180,9 @@ class BrowserWorker:
                     f"Couldn't open the Essential Action note form for "
                     f"{ea_reason!r}. Note not filed.")
                 return False
-            target.wait_for_timeout(800)
+            # Small settle; fill_note then waits for the form's Submit
+            # button to be visible, so no long blind sleep is needed.
+            target.wait_for_timeout(200)
         self.on_status(f"Running {scenario.name!r}...")
         try:
             all_submitted = run_scenario(
