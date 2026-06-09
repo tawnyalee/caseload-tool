@@ -10676,41 +10676,55 @@ class App:
         save_frame = ctk.CTkFrame(pane, fg_color="transparent")
         save_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 4))
         self._save_row_frame = save_frame
+        # 3 columns keep the bar aligned UNDER THE FORM (not the whole window):
+        # col 0 = left spacer (= the picker pane's width), col 1 = the buttons
+        # inside a capped inner frame (so Save/Revert sit at the form's right
+        # edge), col 2 = a flexible spacer that absorbs the extra width when
+        # maximized. Widths are synced in _align_save_row.
+        save_frame.grid_columnconfigure(0, weight=0)
+        save_frame.grid_columnconfigure(1, weight=0)
+        save_frame.grid_columnconfigure(2, weight=1)
+        inner = ctk.CTkFrame(save_frame, fg_color="transparent")
+        inner.grid(row=0, column=1, sticky="ew")
+        self._save_row_inner = inner
         self._save_row_mode = None
         # Done — leave the focused editor mode and return to the main view.
         self._btn_done_editor = ctk.CTkButton(
-            save_frame, text="✓ Done", command=self._toggle_editor,
+            inner, text="✓ Done", command=self._toggle_editor,
             width=90, height=34, **SECONDARY_BTN_KWARGS,
         )
         self._btn_done_editor.pack(side="left", padx=(4, 12), pady=2)
         self._btn_new = ctk.CTkButton(
-            save_frame, text="+ New action",
+            inner, text="+ New action",
             command=self._new_scenario, width=140, height=34,
         )
         self._btn_new.pack(side="left", padx=4, pady=2)
         self._btn_delete = ctk.CTkButton(
-            save_frame, text="Delete action",
+            inner, text="Delete action",
             command=self._delete_scenario, width=140, height=34,
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_delete.pack(side="left", padx=4, pady=2)
         self._btn_copy = ctk.CTkButton(
-            save_frame, text="Copy", command=self._copy_scenario,
+            inner, text="Copy", command=self._copy_scenario,
             width=90, height=34, **SECONDARY_BTN_KWARGS,
         )
         self._btn_copy.pack(side="left", padx=4, pady=2)
         self._btn_save = ctk.CTkButton(
-            save_frame, text="Save",
+            inner, text="Save",
             command=self._save_yaml, width=90, height=34,
         )
         self._btn_save.pack(side="right", padx=4, pady=2)
         self._btn_revert = ctk.CTkButton(
-            save_frame, text="↺",
+            inner, text="↺",
             command=self._revert_editor, width=40, height=34,
             font=ctk.CTkFont(size=18), **SECONDARY_BTN_KWARGS,
         )
         self._btn_revert.pack(side="right", padx=4, pady=2)
-        save_frame.bind("<Configure>", self._relayout_save_row)
+        inner.bind("<Configure>", self._relayout_save_row)
+        # Keep the bar aligned to the form as the window / sash resizes.
+        self._editor_tabs_holder.bind(
+            "<Configure>", lambda e: self._align_save_row(), add="+")
 
     def _cap_editor_width(self, event=None) -> None:
         """Cap the editor form's width to ~a comfortable line length so the
@@ -10736,6 +10750,23 @@ class App:
             self.editor_content.grid_columnconfigure(0, minsize=target)
         except Exception:
             pass
+        self._align_save_row()
+
+    def _align_save_row(self) -> None:
+        """Line the save/Done footer up under the FORM: left spacer = the
+        picker pane's width, the button column = the same cap as the form, so
+        Save/Revert sit at the form's bottom-right corner instead of drifting
+        to the window's right edge when the window is wide/maximized."""
+        try:
+            left = self._editor_tabs_holder.winfo_width()
+            cap = getattr(self, "_editor_col0_w", None)
+            if not cap or left <= 1:
+                return
+            # +3 ≈ the paned sash width between the picker and the form.
+            self._save_row_frame.grid_columnconfigure(0, minsize=left + 3)
+            self._save_row_frame.grid_columnconfigure(1, minsize=cap, weight=0)
+        except Exception:
+            pass
 
     def _relayout_save_row(self, event=None) -> None:
         """Swap the save-row buttons between full labels and compact
@@ -10747,7 +10778,7 @@ class App:
         Revert is always the undo glyph."""
         try:
             w = (event.width if event is not None
-                 else self._save_row_frame.winfo_width())
+                 else self._save_row_inner.winfo_width())
         except Exception:
             return
         if w <= 1:
