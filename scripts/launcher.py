@@ -1257,15 +1257,16 @@ class BrowserWorker:
         info = lookup_caseload_student(target, name) if name else {}
         first, _, last = name.partition(" ")
         return {
-            "full_name": name,
-            "first_name": first,
+            "full_name": _capitalize_name(name),
+            "first_name": _capitalize_name(first),
             # Preferred name from the caseload row, else the first name.
-            "preferred_name": info.get("preferred_name", "") or first,
-            "last_name": last,
+            "preferred_name": _capitalize_name(
+                info.get("preferred_name", "") or first),
+            "last_name": _capitalize_name(last),
             "student_email": info.get("student_email", ""),
             "student_id": info.get("student_id", ""),
             "course_code": info.get("course_code", ""),
-            "pm_name": info.get("pm_name", ""),
+            "pm_name": _capitalize_name(info.get("pm_name", "")),
             "pm_email": info.get("pm_email", ""),
         }
 
@@ -2927,6 +2928,42 @@ def parse_task_status(val: str) -> tuple[str, str, int]:
     if not m:
         return "submitted", s[:10], 0
     return "submitted", m.group(1), int(m.group(2))
+
+
+# Active name-capitalization mode (kept in sync with the user's setting by
+# App._sync_name_cap_mode). Module-level so both variable builders — the
+# App-side CSV one and the BrowserWorker-side DOM one (no settings access) —
+# share it without threading the setting through.
+_NAME_CAP_MODE = "standard"
+
+
+def _capitalize_name(name: str, mode: Optional[str] = None) -> str:
+    """Normalize a name's capitalization for use in template variables.
+    `mode` (defaults to the global _NAME_CAP_MODE):
+      'off'      — return the name exactly as stored;
+      'lower'    — only fix LOWERCASE entry errors ('john' → 'John'); leave
+                   ALL-CAPS and mixed case alone;
+      'standard' — also normalize ALL-CAPS to Title case ('JANE' → 'Jane'),
+                   while PRESERVING intentional mixed case (McDonald,
+                   O'Brien, Mary-Jane stay as-is).
+    Works per letter-run so hyphen/apostrophe parts are handled
+    (mary-jane → Mary-Jane)."""
+    if not name:
+        return name
+    m = mode or _NAME_CAP_MODE
+    if m == "off":
+        return name
+    if m == "lower":
+        return re.sub(r"\b[a-z]", lambda mo: mo.group(0).upper(), name)
+
+    # 'standard': title-case any run that's entirely lower OR entirely upper;
+    # leave mixed-case runs untouched so deliberate caps survive.
+    def _fix(mo):
+        w = mo.group(0)
+        if w.islower() or w.isupper():
+            return w[:1].upper() + w[1:].lower()
+        return w
+    return re.sub(r"[A-Za-z]+", _fix, name)
 
 
 # Task badge appearance per state. (mark, fg_color, text_color). 'passed'
@@ -9641,6 +9678,7 @@ class App:
         # Loaded once at startup; saved via the Settings dialog when
         # the user toggles. Default state hides advanced features.
         self.settings: Settings = load_settings()
+        self._sync_name_cap_mode()  # share the name-casing pref with builders
         # Overall UI scale (CustomTkinter widget scaling) — apply before
         # widgets are built.
         try:
@@ -13422,19 +13460,19 @@ class App:
         name = _first("Name")
         first, _, last = name.partition(" ")
         return {
-            "full_name": name,
-            "first_name": first,
+            "full_name": _capitalize_name(name),
+            "first_name": _capitalize_name(first),
             # Preferred name, falling back to the first name when blank.
-            "preferred_name": _first(
+            "preferred_name": _capitalize_name(_first(
                 "stuprename", "Student Preferred Name",
-                "PreferredName", "Preferred Name") or first,
-            "last_name": last,
+                "PreferredName", "Preferred Name") or first),
+            "last_name": _capitalize_name(last),
             "student_email": _first_present_value(
                 row, _CSV_STUDENT_EMAIL_COLS,
             ),
             "student_id": _first("StudentID", "Student ID"),
             "course_code": _first("CourseCode", "Course Code"),
-            "pm_name": _first("MentorName", "Program Mentor"),
+            "pm_name": _capitalize_name(_first("MentorName", "Program Mentor")),
             "pm_email": _first_present_value(row, _CSV_PM_EMAIL_COLS),
             "program_name": _first("ProgramName", "Program Name"),
         }
@@ -14250,6 +14288,27 @@ class App:
             values=list(_TS_MODE_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Name capitalization — how student/PM names are cased in template
+        # variables (papers over CSV data-entry casing errors).
+        nc_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        nc_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(nc_row, text="Capitalize names in templates:").pack(
+            side="left")
+        _NC_MODE_LABELS = {
+            "Off (use CSV as-is)": "off",
+            "Fix lowercase only": "lower",
+            "Standard form": "standard",
+        }
+        _NC_MODE_TO_LABEL = {v: k for k, v in _NC_MODE_LABELS.items()}
+        cur_nc = (getattr(self.settings, "name_capitalization",
+                          "standard") or "standard")
+        nc_var = ctk.StringVar(
+            value=_NC_MODE_TO_LABEL.get(cur_nc, "Standard form"))
+        ctk.CTkComboBox(
+            nc_row, width=180, variable=nc_var, state="readonly",
+            values=list(_NC_MODE_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
 
@@ -14282,6 +14341,10 @@ class App:
             # Live task pass/fail scrape mode (Off / startup / every refresh).
             self.settings.task_status_scrape_mode = _TS_MODE_LABELS.get(
                 ts_var.get().strip(), "restart")
+            # Name capitalization mode (off / lower / standard).
+            self.settings.name_capitalization = _NC_MODE_LABELS.get(
+                nc_var.get().strip(), "standard")
+            self._sync_name_cap_mode()  # apply immediately to the builders
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if changed:
@@ -15354,6 +15417,14 @@ class App:
             except Exception:
                 pass
         self.worker.submit_fetch_task_status(sid, on_done)
+
+    def _sync_name_cap_mode(self) -> None:
+        """Push the user's name-capitalization preference into the module
+        global the name-variable builders read (the BrowserWorker one has no
+        settings access). Call at startup + after the setting changes."""
+        global _NAME_CAP_MODE
+        _NAME_CAP_MODE = (getattr(self.settings, "name_capitalization",
+                                  "standard") or "standard")
 
     def _minimize_browser(self) -> None:
         """Minimize the launcher's browser once the startup caseload load is

@@ -269,6 +269,14 @@ class Settings:
     #   "restart" — one background pass after the startup auto-refresh only
     #   "refresh" — a background pass after startup AND every ↻ refresh
     task_status_scrape_mode: str = "restart"
+    # How student/PM NAMES are capitalized when rendered into note/email
+    # variables ({{first_name}}, {{preferred_name}}, {{pm_name}}, …), to
+    # paper over CSV data-entry casing errors:
+    #   "off"      — use the name exactly as stored in the CSV
+    #   "lower"    — only fix lowercase ('john' → 'John'); leave ALL-CAPS
+    #   "standard" — also normalize ALL-CAPS to Title case, preserving
+    #                intentional mixed case (McDonald, O'Brien)
+    name_capitalization: str = "standard"
 
 
 def load_settings() -> Settings:
