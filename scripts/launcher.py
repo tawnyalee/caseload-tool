@@ -5959,6 +5959,33 @@ def prompt_batch_email_review(
     return result_box["value"], chosen_template_box["value"], edits
 
 
+def _build_checkbox_images():
+    """Build (unchecked, checked) 16px checkbox PhotoImages in the CTk
+    style — an outlined box, and a filled blue box with a white tick. The
+    CALLER must keep a reference (else Tk GCs them and they render blank).
+    Needs a live Tk root. Shared by the caseload viewer's select-all header
+    and the batch-review popup so both look identical."""
+    from PIL import Image, ImageDraw, ImageTk
+    dark = ctk.get_appearance_mode() == "Dark"
+    blue = "#1f6aa5" if dark else "#3a7ebf"
+    border = "#6b6e70" if dark else "#979da2"
+    size, scale = 16, 4  # supersample then downscale for smooth edges
+    S = size * scale
+    pad, rad, bw = 1 * scale, 4 * scale, 2 * scale
+    un = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    ImageDraw.Draw(un).rounded_rectangle(
+        [pad, pad, S - pad, S - pad], radius=rad, outline=border, width=bw)
+    ch = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(ch)
+    d.rounded_rectangle(
+        [pad, pad, S - pad, S - pad], radius=rad, fill=blue, outline=blue)
+    d.line(
+        [(S * 0.27, S * 0.52), (S * 0.44, S * 0.69), (S * 0.74, S * 0.32)],
+        fill="white", width=bw, joint="curve")
+    return (ImageTk.PhotoImage(un.resize((size, size), Image.LANCZOS)),
+            ImageTk.PhotoImage(ch.resize((size, size), Image.LANCZOS)))
+
+
 def prompt_batch_review(
     parent,
     scenario_name: str,
@@ -5998,6 +6025,23 @@ def prompt_batch_review(
     )
     cols_label.pack(fill="x", padx=12, pady=(0, 4))
 
+    # Master select-all box: the SAME little checkbox the caseload viewer
+    # uses in its header, sitting to the LEFT of a gray "Student (N)" tag.
+    # Click toggles all rows — or clears them if they're already all
+    # selected — mirroring the viewer's _toggle_select_all. The image refs
+    # are kept on the dialog so Tk doesn't GC them (→ blank).
+    _chk_un, _chk_ch = _build_checkbox_images()
+    dialog._batch_chk_imgs = (_chk_un, _chk_ch)
+
+    sel_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    sel_row.pack(fill="x", padx=12, pady=(0, 4))
+    sel_all_box = ctk.CTkLabel(sel_row, text="", image=_chk_ch, cursor="hand2")
+    sel_all_box.pack(side="left", padx=(4, 8))
+    ctk.CTkLabel(
+        sel_row, text=f"Student ({len(rows)})",
+        fg_color=("gray85", "gray25"), corner_radius=6,
+    ).pack(side="left", ipadx=8, ipady=2)
+
     scroll = ctk.CTkScrollableFrame(dialog)
     scroll.pack(fill="both", expand=True, padx=12, pady=4)
 
@@ -6006,6 +6050,21 @@ def prompt_batch_review(
     def update_count_label() -> None:
         n = sum(1 for v in checked_vars if v.get())
         confirm_btn.configure(text=f"Confirm {n}")
+        # Master box reflects the rows: filled only when ALL are checked.
+        all_on = bool(checked_vars) and n == len(checked_vars)
+        try:
+            sel_all_box.configure(image=_chk_ch if all_on else _chk_un)
+        except Exception:
+            pass
+
+    def toggle_all(_event=None) -> None:
+        # Select all, or clear if already all selected (mirrors the viewer).
+        new = not (bool(checked_vars) and all(v.get() for v in checked_vars))
+        for v in checked_vars:
+            v.set(new)
+        update_count_label()
+
+    sel_all_box.bind("<Button-1>", toggle_all)
 
     for row in rows:
         v = ctk.BooleanVar(value=True)
@@ -8728,33 +8787,7 @@ class CaseloadPanel:
         tick when checked, an outlined box when not. Kept on the instance
         so Tk retains the reference (else they'd be GC'd and render
         blank). Colours follow the current light/dark appearance."""
-        from PIL import Image, ImageDraw, ImageTk
-        dark = ctk.get_appearance_mode() == "Dark"
-        blue = "#1f6aa5" if dark else "#3a7ebf"
-        border = "#6b6e70" if dark else "#979da2"
-        size, scale = 16, 4  # supersample then downscale for smooth edges
-        S = size * scale
-        pad, rad, bw = 1 * scale, 4 * scale, 2 * scale
-
-        un = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-        ImageDraw.Draw(un).rounded_rectangle(
-            [pad, pad, S - pad, S - pad], radius=rad,
-            outline=border, width=bw,
-        )
-
-        ch = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-        d = ImageDraw.Draw(ch)
-        d.rounded_rectangle(
-            [pad, pad, S - pad, S - pad], radius=rad, fill=blue, outline=blue,
-        )
-        d.line(
-            [(S * 0.27, S * 0.52), (S * 0.44, S * 0.69), (S * 0.74, S * 0.32)],
-            fill="white", width=bw, joint="curve",
-        )
-        self._img_unchecked = ImageTk.PhotoImage(
-            un.resize((size, size), Image.LANCZOS))
-        self._img_checked = ImageTk.PhotoImage(
-            ch.resize((size, size), Image.LANCZOS))
+        self._img_unchecked, self._img_checked = _build_checkbox_images()
 
     def _chk_img(self, checked: bool):
         return self._img_checked if checked else self._img_unchecked
