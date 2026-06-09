@@ -12378,6 +12378,19 @@ class App:
         eas: list = []
         edit_idxs = [i for i, n in enumerate(scenario.notes)
                      if n.enter_additional_text]
+        # A main-window fire has no caseload row, so there's no course_hint
+        # and the fire-time note dialog's Course field would be blank (the
+        # right-click path gets the code from the row). Detect the active
+        # student's course code up front — same lookup the worker uses at
+        # submit — but only when a dialog will actually show and we don't
+        # already have a code.
+        if edit_idxs and not course_hint and not override:
+            try:
+                _ctx = self._get_student_context_blocking(name_hint=chosen_name)
+                if _ctx and _ctx.get("course_code"):
+                    course_hint = _ctx["course_code"]
+            except Exception:
+                pass
         for pos, i in enumerate(edit_idxs):
             n = scenario.notes[i]
             label = f"Note {i + 1}"
