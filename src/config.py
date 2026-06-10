@@ -240,6 +240,12 @@ class Settings:
     # Warn (red activity-log line) before a batch/selection fire when the
     # cached caseload CSV is older than this many MINUTES. 0 = never warn.
     caseload_stale_minutes: int = 720  # 12 h
+    # Caseload history: minimum HOURS between local snapshots (src/history.py).
+    # A reload only records a new sample once this much time has passed since
+    # the last one; within the window a fresher CSV updates the last sample in
+    # place. 24 = once a day (the data changes ~daily); lower (e.g. 6/8) samples
+    # more often. Departure detection stays day-grained regardless.
+    history_capture_interval_hours: int = 24
     # Overall UI scale (CustomTkinter widget scaling); 1.0 = 100%.
     ui_scale: float = 1.0
     # Per-area text sizes (pt). 0 = use the built-in default for that area.

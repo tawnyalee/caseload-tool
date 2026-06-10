@@ -14805,6 +14805,27 @@ class App:
             values=list(_TS_MODE_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Caseload history snapshot frequency (src/history.py). How often a
+        # local snapshot of the dynamic fields (Momentum, task status, …) is
+        # recorded; the data changes ~daily so "Daily" is plenty, but a user
+        # can sample more often. "Off" disables history capture entirely.
+        hist_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        hist_row.pack(fill="x", padx=32, pady=(0, 10))
+        ctk.CTkLabel(hist_row, text="Caseload history snapshots:").pack(
+            side="left")
+        _HIST_LABELS = {
+            "Off": 0, "Every 6 h": 6, "Every 8 h": 8,
+            "Every 12 h": 12, "Daily": 24,
+        }
+        _HIST_TO_LABEL = {v: k for k, v in _HIST_LABELS.items()}
+        cur_hist = int(getattr(
+            self.settings, "history_capture_interval_hours", 24) or 0)
+        hist_var = ctk.StringVar(value=_HIST_TO_LABEL.get(cur_hist, "Daily"))
+        ctk.CTkComboBox(
+            hist_row, width=130, variable=hist_var, state="readonly",
+            values=list(_HIST_LABELS.keys()),
+        ).pack(side="left", padx=(8, 0))
+
         # Name capitalization — how student/PM names are cased in template
         # variables (papers over CSV data-entry casing errors).
         nc_row = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -14858,6 +14879,9 @@ class App:
             # Live task pass/fail scrape mode (Off / startup / every refresh).
             self.settings.task_status_scrape_mode = _TS_MODE_LABELS.get(
                 ts_var.get().strip(), "restart")
+            # Caseload history snapshot interval (Off=0 / 6 / 8 / 12 / 24 h).
+            self.settings.history_capture_interval_hours = _HIST_LABELS.get(
+                hist_var.get().strip(), 24)
             # Name capitalization mode (off / lower / standard).
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")
@@ -15690,27 +15714,30 @@ class App:
         # the panel is already rendered, and a DB failure must not break the
         # reload). Runs on the silent startup reload too — that's the
         # once-a-day capture baseline.
-        try:
-            summary = history.record_snapshot(
-                rows, self._caseload_csv_mtime,
-                note="startup" if silent else "manual",
-            )
-            self._last_history_summary = summary
-            if not silent and summary.get("status") in ("captured", "updated"):
-                n = summary.get("row_count", 0)
-                dep = summary.get("departure_count", 0)
-                msg = f"History: {summary['status']} {n} rows."
-                if dep:
-                    fu = sum(1 for d in summary["departures"]
-                             if d["classification"] == "followup")
-                    msg += (f"  {dep} departed since last seen "
-                            f"({fu} need follow-up).")
-                self._append_log(msg)
-            elif not silent and summary.get("warning"):
-                self._append_log(summary["warning"], error=True)
-        except Exception as e:
-            if not silent:
-                self._append_log(f"(history snapshot skipped: {e})")
+        interval_h = int(getattr(
+            self.settings, "history_capture_interval_hours", 24) or 0)
+        if interval_h > 0:  # 0 = history capture disabled in Settings
+            try:
+                summary = history.record_snapshot(
+                    rows, self._caseload_csv_mtime, interval_hours=interval_h,
+                    note="startup" if silent else "manual",
+                )
+                self._last_history_summary = summary
+                if not silent and summary.get("status") in ("captured", "updated"):
+                    n = summary.get("row_count", 0)
+                    dep = summary.get("departure_count", 0)
+                    msg = f"History: {summary['status']} {n} rows."
+                    if dep:
+                        fu = sum(1 for d in summary["departures"]
+                                 if d["classification"] == "followup")
+                        msg += (f"  {dep} departed since last seen "
+                                f"({fu} need follow-up).")
+                    self._append_log(msg)
+                elif not silent and summary.get("warning"):
+                    self._append_log(summary["warning"], error=True)
+            except Exception as e:
+                if not silent:
+                    self._append_log(f"(history snapshot skipped: {e})")
         return True
 
     def _read_clipboard_content(self) -> str:
