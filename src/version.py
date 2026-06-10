@@ -5,4 +5,4 @@ Bump per release:
 - MINOR for new user-facing features
 - PATCH for bug fixes / internal cleanup
 """
-__version__ = "0.8.1"
+__version__ = "0.9.0"
