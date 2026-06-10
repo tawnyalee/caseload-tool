@@ -404,6 +404,14 @@ class BrowserWorker:
         on_done({ok, value, error})."""
         self.q.put(("SET_FOLLOWUP_DATE", query, date_str, on_done))
 
+    def submit_set_followup_note(
+        self, query: str, note_text: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """Row-filter the Caseload list to `query` (a Student ID) and set
+        that student's Followup Note cell to `note_text`.
+        on_done({ok, value, error})."""
+        self.q.put(("SET_FOLLOWUP_NOTE", query, note_text, on_done))
+
     def submit_read_caseload_columns(
         self, on_done: Callable[[list[dict]], None],
     ) -> None:
@@ -682,6 +690,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._set_followup_date(ctx, query, date_str)
+            finally:
+                on_done(res)
+        elif cmd[0] == "SET_FOLLOWUP_NOTE":
+            _, query, note_text, on_done = cmd
+            res = {}
+            try:
+                res = self._set_followup_note(ctx, query, note_text)
             finally:
                 on_done(res)
         elif cmd[0] == "READ_CASELOAD_COLUMNS":
@@ -2170,6 +2185,38 @@ class BrowserWorker:
         except Exception as e:
             res = {"ok": False, "value": "", "error": str(e)}
         # Restore the filter so the live list is whole again.
+        try:
+            if fi is not None and fi.count() > 0:
+                fi.click(); fi.fill(""); fi.press("Enter")
+                target.wait_for_timeout(400)
+        except Exception:
+            pass
+        return res
+
+    def _set_followup_note(self, ctx, query: str, note_text: str) -> dict:
+        """Row-filter the live Caseload list to `query` (a Student ID), set
+        that row's Followup Note to `note_text`, then restore the filter."""
+        from src.student_lookup import set_followup_note
+        q = (query or "").strip()
+        if not q:
+            return {"ok": False, "error": "no student id"}
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return {"ok": False, "error": "caseload table didn't load"}
+        fi = None
+        try:
+            fi = target.locator(
+                'input[placeholder="Search All Rows..."]'
+            ).filter(visible=True).first
+            if fi.count() > 0:
+                fi.click(); fi.fill(q); fi.press("Enter")
+                _wait_grid_settled(target, 1200)
+        except Exception as e:
+            return {"ok": False, "error": f"row filter failed: {e}"}
+        try:
+            res = set_followup_note(target, note_text)
+        except Exception as e:
+            res = {"ok": False, "value": "", "error": str(e)}
         try:
             if fi is not None and fi.count() > 0:
                 fi.click(); fi.fill(""); fi.press("Enter")
@@ -8670,6 +8717,38 @@ class CaseloadPanel:
         ctk.CTkButton(
             frame, text="Set", width=46, command=do_set,
         ).grid(row=0, column=3, padx=2)
+
+        # Follow-up note row (writes back to Salesforce; commit = blur). Own
+        # sub-frame so the entry can stretch full width between label + Set.
+        cur_note = self._cell(row, "CourseFollowupNote")
+        note_row = ctk.CTkFrame(frame, fg_color="transparent")
+        note_row.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(2, 0))
+        ctk.CTkLabel(
+            note_row, text="Follow-up note", anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).pack(side="left", padx=(4, 6))
+
+        def do_set_note() -> None:
+            txt = note_entry.get().strip()
+
+            def _applied_note(res) -> None:
+                if res.get("ok"):
+                    try:
+                        row["CourseFollowupNote"] = txt
+                        self.populate()
+                    except Exception:
+                        pass
+
+            self.app._set_followup_note_for(sid, txt, on_apply=_applied_note)
+
+        ctk.CTkButton(
+            note_row, text="Set", width=46, command=do_set_note,
+        ).pack(side="right", padx=2)
+        note_entry = ctk.CTkEntry(note_row, placeholder_text="follow-up note…")
+        if cur_note:
+            note_entry.insert(0, cur_note)
+        note_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
         return r + 1
 
     def _qv_field(self, r, row, label, key, kind) -> int:
@@ -15789,6 +15868,45 @@ class App:
 
         self._append_log(f"Setting follow-up date {date_str} for {sid}…")
         self.worker.submit_set_followup_date(sid, date_str, on_done)
+
+    def _set_followup_note_for(self, student_id: str, note_text: str,
+                               on_apply=None) -> None:
+        """WRITE the student's Salesforce Followup Note via the live caseload
+        list. Blocks the UI briefly (real write). on_apply(res) on the UI
+        thread. An empty note clears it."""
+        sid = (student_id or "").strip()
+        note_text = (note_text or "").strip()
+        if not sid:
+            return
+        if getattr(self, "_is_busy", False):
+            self._append_log("Busy — try again when the current task finishes.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet.")
+            return
+        self._set_busy(f"Setting follow-up note for {sid}…")
+
+        def on_done(res):
+            def apply():
+                self._set_idle()
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Set follow-up note failed: {(res or {}).get('error')}",
+                        error=True)
+                else:
+                    self._append_log(f"Follow-up note set for {sid}.")
+                if on_apply:
+                    try:
+                        on_apply(res or {})
+                    except Exception:
+                        pass
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                self._set_idle()
+
+        self._append_log(f"Setting follow-up note for {sid}…")
+        self.worker.submit_set_followup_note(sid, note_text, on_done)
 
     def _fetch_task_status_for(self, student_id: str, on_apply) -> None:
         """On-demand: fetch a student's real per-task pass/fail from the

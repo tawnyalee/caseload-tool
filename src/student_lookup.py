@@ -460,6 +460,89 @@ def set_followup_date(page: Page, date_str: str) -> dict:
             "no value after commit — the commit trigger may differ"}
 
 
+def set_followup_note(page: Page, note_text: str) -> dict:
+    """Set the Followup Note cell on the Caseload LIST to `note_text`. The
+    CALLER must have row-filtered the list to ONE student first.
+
+    Mirrors set_followup_date, but the note editor is a plain <textarea>
+    (probed) and commit is Tab/blur ONLY — NOT Enter, which would insert a
+    newline. Re-reads div.uiOutputRichText to confirm. Returns
+    {ok, value, error}. Requires the Followup Note column to be visible."""
+    cell = page.locator('td[data-label="Followup Note"]').first
+    try:
+        if cell.count() == 0:
+            return {"ok": False, "value": "",
+                    "error": "Followup Note column not visible in the list"}
+    except Exception as e:
+        return {"ok": False, "value": "", "error": str(e)}
+    # Open the inline editor: the 'Add followup note' button, else the cell.
+    opened = False
+    try:
+        add = cell.locator('button[title^="Add followup note"]')
+        if add.count() > 0:
+            add.first.click()
+            opened = True
+    except Exception:
+        pass
+    if not opened:
+        try:
+            cell.click()
+        except Exception:
+            pass
+    # Fill the revealed textarea.
+    try:
+        ta = cell.locator('textarea').first
+        ta.wait_for(state="visible", timeout=3000)
+        ta.click()
+        ta.fill(note_text)
+    except Exception as e:
+        return {"ok": False, "value": "",
+                "error": f"note editor didn't appear: {e}"}
+    # Commit: the grid commits inline on BLUR. Tab can land on the in-cell
+    # 'Clear' button (focus never leaves the cell → no commit), so blur the
+    # textarea directly AND click a neutral spot outside the cell to force
+    # focus out. (Enter is avoided — it would add a newline in a textarea.)
+    try:
+        ta.evaluate("el => el.blur()")
+    except Exception:
+        pass
+    try:
+        fb = page.locator(
+            'input[placeholder="Search All Rows..."]'
+        ).filter(visible=True).first
+        if fb.count() > 0:
+            fb.click()
+    except Exception:
+        pass
+    # Re-read the committed note (retry briefly while the read-state renders).
+    clearing = not (note_text or "").strip()
+    value = ""
+    for _ in range(6):
+        try:
+            out = cell.locator('div.uiOutputRichText')
+            if out.count() > 0:
+                value = (out.first.inner_text() or "").strip()
+            if not value:
+                ta2 = cell.locator('textarea')
+                if ta2.count() > 0:
+                    value = (ta2.first.input_value() or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            break
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+    # An intentional clear commits an empty cell, so an empty read-back IS the
+    # success case — don't treat it as "commit trigger may differ".
+    if clearing:
+        return {"ok": True, "value": "", "error": ""}
+    return {"ok": bool(value), "value": value,
+            "error": "" if value else
+            "no note after commit — the commit trigger may differ"}
+
+
 # ----- Essential Actions (EA) -----
 _EA_TAB_SEL = '[data-tab-value="EssentialActionsTab"]'
 _EA_TABLE_SEL = '.cEssentialActionDataTable'
