@@ -522,6 +522,17 @@ class BrowserWorker:
                     self._raise_browser_window()
                 except Exception:
                     pass
+                # Texting (Mongoose) lives on a separate site the app drives in
+                # its OWN context. Open it now, at startup, in a dedicated tab:
+                # a user-opened new tab while Salesforce is the main page hangs
+                # at about:blank, but a Playwright-driven new_page()+goto() here
+                # loads fine, and the texting feature needs a persistent
+                # Mongoose tab anyway. focus=False so it doesn't pull focus from
+                # the Salesforce login. Best-effort — never block startup.
+                try:
+                    self._open_mongoose(ctx, focus=False)
+                except Exception:
+                    pass
                 while True:
                     cmd = self.q.get()
                     if cmd is self.SHUTDOWN:
@@ -2263,30 +2274,39 @@ class BrowserWorker:
 
     MONGOOSE_DASHBOARD_URL = "https://sms.mongooseresearch.com/legacy-dashboard"
 
-    def _open_mongoose(self, ctx) -> dict:
+    def _open_mongoose(self, ctx, *, focus: bool = True) -> dict:
         """Open (or focus) the Mongoose texting dashboard in the launcher's OWN
         persistent context, so the probe / texting automation can see it.
         Reuses an existing mongoose tab if one is already open; otherwise spawns
-        a fresh page and navigates. Brings the tab to the foreground. Returns
-        {ok, url} or {error}."""
+        a fresh page and navigates. `focus` brings the tab to the foreground —
+        pass focus=False at startup so it doesn't steal focus from the
+        Salesforce login. Returns {ok, url} or {error}.
+
+        NOTE: a USER-opened new tab while Salesforce is the main page hangs at
+        about:blank (the known popup hang — see the startup TODO). A
+        Playwright-driven new_page()+goto() does NOT, because the goto is the
+        action that unsticks it. So the reliable time to spawn this is startup;
+        afterwards this just focuses the already-open tab."""
         # Reuse an existing Mongoose tab if present.
         for page in ctx.pages:
             try:
                 if not page.is_closed() and "mongoose" in (page.url or "").lower():
-                    try:
-                        page.bring_to_front()
-                    except Exception:
-                        pass
+                    if focus:
+                        try:
+                            page.bring_to_front()
+                        except Exception:
+                            pass
                     return {"ok": True, "url": page.url or ""}
             except Exception:
                 continue
         try:
             page = ctx.new_page()
             page.goto(self.MONGOOSE_DASHBOARD_URL, wait_until="domcontentloaded")
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
+            if focus:
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
             return {"ok": True, "url": page.url or ""}
         except Exception as e:
             return {"error": str(e)}
