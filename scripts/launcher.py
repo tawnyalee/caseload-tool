@@ -2250,18 +2250,42 @@ class BrowserWorker:
         return {"by_sid": by_sid, "count": len(by_sid)}
 
     def _probe_text(self, ctx) -> dict:
-        """TEMP dev probe: capture the live Cadence "Send Text" composer DOM.
-        The texting send mechanism (Cadence / Sales Engagement) is unknown, so
-        this captures BROADLY: any visible dialog/panel, form fields
-        (textarea / input / combobox / contenteditable), every visible button
-        label, and any element whose tag/class/aria mentions
-        text/sms/message/cadence/send/schedule. Open the Cadence text composer
-        for a student FIRST (and, to capture template/schedule pickers, open
-        those too), then click probe. → temp/text_probe.html
-        Returns {buttons, matchTags, html, counts}."""
-        target = self._active_page(ctx)
+        """TEMP dev probe: capture the live Mongoose ("Cadence") texting
+        composer DOM. The send mechanism is unknown, so this captures BROADLY:
+        any visible dialog/panel, form fields (textarea / input / combobox /
+        contenteditable), every visible button label, and any element whose
+        tag/class/aria mentions text/sms/message/cadence/send/schedule. Open
+        the Mongoose inbox + compose view for a student FIRST (and, to capture
+        template/schedule pickers, open those too), then click probe.
+        → temp/text_probe.html. Returns {url, buttons, matchTags, html, counts}.
+
+        NOTE: does NOT use _active_page — that deliberately PREFERS the
+        Salesforce tab, which would shadow the Mongoose tab. We pick the
+        Mongoose page (sms.mongooseresearch.com) directly, else fall back to
+        the most-recent responsive page; the returned `url` lets the UI warn
+        if it ended up on the wrong site."""
+        target = fallback = None
+        for page in reversed(ctx.pages):
+            try:
+                if page.is_closed():
+                    continue
+                url = page.url or ""
+                _ = page.locator("html").count()  # responsive probe
+            except Exception:
+                continue
+            if fallback is None:
+                fallback = page
+            if "mongoose" in url.lower():
+                target = page
+                break
+        target = target or fallback
         if target is None:
             return {"error": "no active page"}
+        captured_url = ""
+        try:
+            captured_url = target.url or ""
+        except Exception:
+            pass
         js = r'''
         () => {
           const KEEP=['class','data-label','title','role','aria-label',
@@ -2361,6 +2385,7 @@ class BrowserWorker:
         try:
             data = target.evaluate(js)
             if isinstance(data, dict):
+                data["url"] = captured_url
                 return data
             return {"error": "no data"}
         except Exception as e:
@@ -15673,10 +15698,12 @@ class App:
         self.log.configure(state="disabled")
 
     def _dev_probe_text(self) -> None:
-        """TEMP dev probe: dump the live Cadence "Send Text" composer DOM so we
-        can find the texting selectors (message body, recipient, template +
-        schedule pickers, Send/Schedule buttons). Open the Cadence text
-        composer for a student first, then click. → temp/text_probe.html"""
+        """TEMP dev probe: dump the live Mongoose ("Cadence") texting composer
+        DOM so we can find the texting selectors (message body, recipient,
+        template + schedule pickers, Send/Schedule buttons). Open a Mongoose
+        inbox (sms.mongooseresearch.com) IN THE LAUNCHER'S OWN browser window
+        and bring up the compose view first, then click.
+        → temp/text_probe.html"""
         try:
             if not self.worker.ready_event.is_set():
                 self._append_log("Browser not ready yet.")
@@ -15684,8 +15711,8 @@ class App:
         except Exception:
             return
         self._append_log(
-            "Probing Cadence texting… open the 'Send Text' composer for a "
-            "student first (and any template/schedule picker you want captured).")
+            "Probing Mongoose texting… in THE LAUNCHER'S browser window, open a "
+            "Mongoose inbox (sms.mongooseresearch.com) + compose view first.")
 
         def on_done(res):
             def show():
@@ -15694,6 +15721,14 @@ class App:
                         f"Text probe failed: {(res or {}).get('error')}",
                         error=True)
                     return
+                url = res.get("url") or ""
+                self._append_log(f"Captured page: {url or '(unknown)'}")
+                if "mongoose" not in url.lower():
+                    self._append_log(
+                        "⚠ That is NOT a Mongoose page — the probe captured "
+                        "another tab. Open sms.mongooseresearch.com in the "
+                        "LAUNCHER'S OWN browser window (not Vivaldi/another "
+                        "browser), then probe again.", error=True)
                 c = res.get("counts") or {}
                 self._append_log(
                     f"Text probe: text_hits={c.get('hits')} "
