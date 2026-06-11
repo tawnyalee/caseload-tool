@@ -5,11 +5,18 @@ separate site the app drives in its own browser context. Templates and
 variables are handled HERE (not Mongoose's own templates) — we render the
 final plain-text body and inject it into Mongoose's compose box.
 
-This module is the browser-free core: template rendering, timezone grouping,
-and the student-local -> team-timezone schedule math. All of it is unit-
-testable without Playwright. The Playwright driver that fills the Mongoose
-compose modal builds on the DOM map captured in temp/text_probe.html (see the
-`mongoose_texting_dom` memory) and is added separately.
+The browser-free core (template rendering, timezone grouping, student-local ->
+team-timezone schedule math) is unit-tested in tests/test_text_message.py.
+
+The Playwright driver further down fills the Mongoose compose modal per the DOM
+map in the `mongoose_texting_dom` memory. SCAFFOLD STATUS: the recipient join
+(search by Mobile) and the field selectors are confirmed from live captures,
+but the full click-through (step transitions, Datepicker fill, final Send /
+Schedule) has NOT yet been run end-to-end against the live site. The driver
+therefore defaults to commit=False: it composes + advances to the confirm /
+schedule step and STOPS for the user to review and click Send/Schedule (mirrors
+note_form's submit=False and the email reviewer). Set commit=True to automate
+the final click once verified.
 
 Scheduling model (see `texting_milestone_scope` memory): one Mongoose compose
 sends to all its recipients at ONE absolute time, entered in the TEAM's tz. To
@@ -18,9 +25,10 @@ compose per zone, each at the target local hour converted to the team's tz.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from src import email_template
@@ -158,3 +166,177 @@ def team_iana_from_abbr(tz_abbr: str) -> Optional[str]:
     """Resolve the team's tz abbreviation (read from Mongoose's
     `.timezone-label`, e.g. 'EDT') to an IANA zone for the schedule math."""
     return TZ_ABBR_TO_IANA.get((tz_abbr or "").strip())
+
+
+_NON_DIGITS = re.compile(r"\D+")
+
+
+def normalize_phone(raw: str) -> str:
+    """Strip a phone number to bare digits, dropping a leading US country code.
+    Mongoose accepts both '5551234567' and '(336) 213-2291'; we normalize to 10
+    digits for a consistent search term. Returns '' if there aren't 10 digits."""
+    digits = _NON_DIGITS.sub("", raw or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else ""
+
+
+# ---------------------------------------------------------------------------
+# Playwright driver for the Mongoose compose modal.
+#
+# Selectors come from the live captures (see `mongoose_texting_dom` memory).
+# Confirmed from the DOM: the Compose button, inbox-select, the recipient
+# autocomplete (search by Mobile -> v-list-item options), the message textarea,
+# the Send Now / Schedule buttons, and the schedule Date/Time controls.
+# NOT yet run end-to-end live: exact step transitions, Datepicker fill, the
+# final Send/Schedule click. Hence commit=False by default.
+# ---------------------------------------------------------------------------
+
+from playwright.sync_api import Page  # noqa: E402
+from playwright.sync_api import TimeoutError as PWTimeout  # noqa: E402
+
+
+@dataclass
+class TextMessage:
+    body: str                                   # final plain text (already rendered)
+    recipients_mobile: list[str] = field(default_factory=list)  # raw or normalized
+    inbox_label: str = ""                       # e.g. "C769 Inbox"; "" = whatever's selected
+    schedule: Optional[ScheduleSlot] = None     # None = Send Now path
+    commit: bool = False                        # False = stop at confirm/schedule for review
+
+
+def _noop(_msg: str) -> None:
+    pass
+
+
+def _click_button(page: Page, name: str, *, timeout_ms: int = 10_000) -> None:
+    """Click a Vuetify button by its visible text/accessible name."""
+    page.get_by_role("button", name=name, exact=True).filter(
+        visible=True
+    ).first.click(timeout=timeout_ms)
+
+
+def open_compose(page: Page, *, timeout_ms: int = 15_000) -> None:
+    """Click Compose and wait for the compose modal to appear."""
+    _click_button(page, "Compose", timeout_ms=timeout_ms)
+    page.locator(".compose-modal").filter(visible=True).first.wait_for(
+        state="visible", timeout=timeout_ms
+    )
+
+
+def select_inbox(page: Page, inbox_label: str, *, timeout_ms: int = 6_000) -> None:
+    """On the "Select Inbox" step, click the inbox whose label matches.
+    No-op if the modal opened straight to the compose step (inbox preselected
+    because we launched from that inbox's URL)."""
+    if not inbox_label:
+        return
+    try:
+        item = page.locator(".inbox-select").filter(
+            has_text=inbox_label, visible=True
+        )
+        item.first.wait_for(state="visible", timeout=timeout_ms)
+        item.first.click()
+    except PWTimeout:
+        pass  # already past the inbox step
+
+
+def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
+    """Type a (normalized) mobile number into the recipient search and click the
+    first matching result. Returns True if a result was added. The caller should
+    have normalized the number; a full 10-digit search should yield one match."""
+    term = normalize_phone(mobile) or (mobile or "").strip()
+    if not term:
+        return False
+    box = page.get_by_placeholder("Search by First, Last, ID, or Mobile")
+    if box.count() == 0:
+        box = page.get_by_label("Search by First, Last, ID, or Mobile")
+    box = box.filter(visible=True).first
+    box.click()
+    box.fill(term)
+    # Results render in an overlay listbox of .v-list-item options.
+    option = page.locator(
+        '.v-overlay-container .v-list-item[role="option"], '
+        '.v-autocomplete__content .v-list-item'
+    ).filter(visible=True)
+    try:
+        option.first.wait_for(state="visible", timeout=timeout_ms)
+    except PWTimeout:
+        return False
+    option.first.click()
+    return True
+
+
+def set_message(page: Page, body: str) -> None:
+    """Fill the compose message textarea with the rendered body."""
+    ta = page.locator('textarea[aria-label="compose-message textarea"]').filter(
+        visible=True
+    ).first
+    ta.wait_for(state="visible", timeout=10_000)
+    ta.fill(body or "")
+
+
+def fill_schedule(page: Page, slot: ScheduleSlot) -> None:
+    """Fill the Schedule step's Date + Time controls from a ScheduleSlot
+    (already expressed in the team's tz)."""
+    date_input = page.locator(
+        'input.dp__input[aria-label="Datepicker input"]'
+    ).filter(visible=True).first
+    date_input.wait_for(state="visible", timeout=10_000)
+    date_input.fill(slot.date_str)
+    # Time: three native <select>s — hours (1-12), minutes (00-59), AM/PM.
+    page.locator("select.vc-time-select-hours").first.select_option(
+        label=str(slot.hour12)
+    )
+    page.locator("select.vc-time-select-minutes").first.select_option(
+        label=f"{slot.minute:02d}"
+    )
+    # AM/PM select carries option values "true" (AM) / "false" (PM).
+    page.locator('select:has(option[value="true"])').first.select_option(
+        value=("true" if slot.ampm.upper() == "AM" else "false")
+    )
+
+
+def send_text(
+    page: Page, msg: TextMessage, *, on_status: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Drive the Mongoose compose modal: open -> select inbox -> add
+    recipient(s) -> set message -> advance to confirm -> Send Now or fill
+    Schedule. Stops before the final commit click unless msg.commit is True.
+
+    Returns True if it reached the confirm/schedule step without error (whether
+    or not the final click was made). Raises on a hard driver failure."""
+    say = on_status or _noop
+    open_compose(page)
+    select_inbox(page, msg.inbox_label)
+
+    added = 0
+    for raw in msg.recipients_mobile:
+        if add_recipient(page, raw):
+            added += 1
+        else:
+            say(f"  text: no Mongoose match for {raw!r} — skipped")
+    if added == 0:
+        raise RuntimeError("No recipients could be added to the text.")
+    say(f"  text: {added} recipient(s) added")
+
+    set_message(page, msg.body)
+
+    # Advance from compose to the confirm step.
+    _click_button(page, "Preview")
+
+    if msg.schedule is None:
+        say("  text: composed — review and click Send Now" if not msg.commit
+            else "  text: sending now…")
+        if msg.commit:
+            _click_button(page, "Send Now")
+        return True
+
+    # Schedule path: open the schedule step, fill date/time.
+    _click_button(page, "Schedule")
+    fill_schedule(page, msg.schedule)
+    say(f"  text: scheduled for {msg.schedule.student_local_str} "
+        f"(student-local) — review and click Schedule" if not msg.commit
+        else f"  text: scheduling for {msg.schedule.student_local_str}…")
+    if msg.commit:
+        _click_button(page, "Schedule")
+    return True

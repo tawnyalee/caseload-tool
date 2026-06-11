@@ -28,6 +28,15 @@ def test_over_length():
     assert tm.over_length("x" * 310) == 4
 
 
+def test_normalize_phone():
+    assert tm.normalize_phone("(336) 213-2291") == "3362132291"
+    assert tm.normalize_phone("5551234567") == "5551234567"
+    assert tm.normalize_phone("1-555-123-4567") == "5551234567"
+    assert tm.normalize_phone("+1 (555) 123-4567") == "5551234567"
+    assert tm.normalize_phone("123") == ""        # too few digits
+    assert tm.normalize_phone("") == ""
+
+
 def test_group_by_timezone():
     students = [
         {"name": "A", "timezone": "EST"},
