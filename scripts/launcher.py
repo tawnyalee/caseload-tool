@@ -5971,6 +5971,8 @@ def prompt_batch_text_review(
         hdr = (f"To:  {e['name']}"
                + (f"   ·   {e['mobile']}" if e.get("mobile") else "  ·  (no mobile)")
                + f"\n{'Schedule' if scheduled else 'Send'}:  {e['when_str']}")
+        if e.get("recipients_str"):
+            hdr += f"\nRecipients:  {e['recipients_str']}"
         if e.get("issues"):
             hdr += f"\n⚠ {', '.join(e['issues'])}"
         preview_hdr.configure(text=hdr)
@@ -13866,23 +13868,50 @@ class App:
                     f"{e}", error=True)
                 return
 
-        # Build a per-student entry: rendered body + recipient + schedule slot.
-        entries: list[dict] = []
+        # Batch texts are NOT personalized — one shared message per group. Group
+        # the matched students by (inbox, timezone): the inbox is course-scoped
+        # and one Mongoose compose sends ONE body at ONE time, so each
+        # (course-inbox, timezone) becomes a single multi-recipient scheduled
+        # compose. (Personalized bulk would need Mongoose merge fields — later.)
+        prompt_vars = prompt_vars or {}
+        groups: dict = {}
+        order: list = []
         for row in matched:
-            variables = self._text_vars_from_row(row)
-            variables.update(prompt_vars or {})
-            body = tm.render_message(body_tmpl, variables)
+            rv = self._text_vars_from_row(row)
+            course = rv["course_code"]
+            inbox_label = tcfg.inbox_label or (
+                f"{course} Inbox" if course else "")
+            tz = (row.get("Timezone") or "").strip()
             mobile = tm.normalize_phone(row.get("MobilePhone") or "")
+            name = rv["full_name"] or row.get("Name", "")
+            key = (inbox_label, tz)
+            g = groups.get(key)
+            if g is None:
+                g = {"inbox_label": inbox_label, "tz": tz, "course": course,
+                     "mobiles": [], "names": [], "no_mobile": []}
+                groups[key] = g
+                order.append(key)
+            g["names"].append(name)
+            if mobile:
+                g["mobiles"].append(mobile)
+            else:
+                g["no_mobile"].append(name)
+
+        # One review entry per group: the shared (generic) message + slot.
+        scheduled = bool(tcfg.schedule)
+        entries: list[dict] = []
+        for key in order:
+            g = groups[key]
+            gvars = {"course_code": g["course"]}  # group-level vars only
+            gvars.update(prompt_vars)
+            body = tm.render_message(body_tmpl, gvars)
             issues: list[str] = []
-            if not mobile:
-                issues.append("no mobile")
             when_str, sch_payload, sched_name = "now", None, ""
             if tcfg.schedule:
-                tzc = row.get("Timezone") or ""
                 slot = tm.compute_schedule_slot(
-                    tzc, self.TEAM_IANA, target_hour=tcfg.target_hour)
+                    g["tz"], self.TEAM_IANA, target_hour=tcfg.target_hour)
                 if slot is None:
-                    issues.append(f"unknown tz {tzc!r}")
+                    issues.append(f"unknown tz {g['tz']!r}")
                 else:
                     when_str = f"{slot.student_local_str} (local)"
                     sch_payload = {
@@ -13890,24 +13919,28 @@ class App:
                         "minute": slot.minute, "ampm": slot.ampm,
                         "student_local_str": slot.student_local_str,
                     }
-                    sched_name = (f"{variables['course_code']} "
-                                  f"{variables['first_name']}").strip() \
-                        or "Scheduled text"
+                    sched_name = f"{g['course']} batch".strip() or "Scheduled text"
+            if not g["mobiles"]:
+                issues.append("no recipients with a mobile")
+            elif g["no_mobile"]:
+                issues.append(f"{len(g['no_mobile'])} without a mobile")
             if tm.over_length(body):
                 issues.append(f"{tm.over_length(body)} over limit")
-            inbox_label = tcfg.inbox_label or (
-                f"{variables['course_code']} Inbox"
-                if variables["course_code"] else "")
+            if "{{" in body and "}}" in body:
+                # Batch is generic — a leftover {{var}} (e.g. {{first_name}})
+                # won't be personalized; surface it so it's caught in review.
+                issues.append("unresolved {{variable}} — batch isn't personalized")
+            label = f"{g['inbox_label'] or 'inbox?'}  ·  {g['tz'] or 'tz?'}"
             entries.append({
-                "name": variables["full_name"] or row.get("Name", ""),
-                "student_id": variables["student_id"],
-                "course_code": variables["course_code"],
-                "mobile": mobile, "when_str": when_str, "body": body,
-                "inbox_label": inbox_label, "schedule": sch_payload,
-                "schedule_name": sched_name, "issues": issues,
+                "name": label,
+                "course_code": g["course"],
+                "mobile": f"{len(g['mobiles'])} recipient(s)",
+                "recipients_str": ", ".join(g["names"]),
+                "when_str": when_str, "body": body, "issues": issues,
+                "inbox_label": g["inbox_label"], "schedule": sch_payload,
+                "schedule_name": sched_name, "mobiles": g["mobiles"],
             })
 
-        scheduled = bool(tcfg.schedule)
         filter_summary = ", ".join(
             f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
             for f in scenario.batch.filters if f.get("column"))
@@ -13921,73 +13954,44 @@ class App:
             self._append_log("Batch text: 0 selected; nothing to do.")
             return
 
-        # Group students who can share ONE compose: identical rendered body +
-        # inbox + schedule slot. Personalized messages differ per student (so
-        # 1 compose each), but a GENERIC message collapses to a single
-        # multi-recipient compose per (inbox, schedule) — far fewer composes.
-        groups: dict = {}
-        order: list = []
-        skipped = 0
-        for idx in selected:
-            e = entries[idx]
-            blocking = [i for i in e["issues"]
-                        if i == "no mobile" or i.startswith("unknown tz")]
-            if blocking:
-                self._append_log(
-                    f"  text: skipped {e['name']} ({', '.join(blocking)}).",
-                    error=True)
-                skipped += 1
-                continue
-            sch = e["schedule"]
-            key = (e["body"], e["inbox_label"],
-                   (sch["date_str"], sch["hour12"], sch["minute"], sch["ampm"])
-                   if sch else None)
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(e)
-
-        if not order:
-            self._append_log("Batch text: nothing sendable.")
-            return
-        total_recip = sum(len(groups[k]) for k in order)
-        ngroups = len(order)
-        if ngroups < total_recip:
-            self._append_log(
-                f"Batch text: grouped into {ngroups} compose(s) for "
-                f"{total_recip} recipient(s) (identical messages share a send).")
-
-        # Lock the browser for the whole non-interactive send loop (the review
+        # One compose per selected group. Lock the browser for the loop (review
         # already happened, so the scrim hides nothing the user needs).
         self._lock_browser_for_run()
         sent = 0
+        ngroups = len(selected)
         try:
-            for gi, key in enumerate(order, 1):
-                g = groups[key]
-                e0 = g[0]
-                mobiles = [x["mobile"] for x in g]
-                names = ", ".join(x["name"] for x in g)
+            for n, idx in enumerate(selected, 1):
+                e = entries[idx]
+                if not e["mobiles"]:
+                    self._append_log(
+                        f"  text {n}/{ngroups}: skipped {e['name']} "
+                        "(no recipients with a mobile).", error=True)
+                    continue
+                if any(i.startswith("unknown tz") for i in e["issues"]):
+                    self._append_log(
+                        f"  text {n}/{ngroups}: skipped {e['name']} "
+                        "(unknown timezone).", error=True)
+                    continue
                 payload = {
-                    "body": e0["body"], "recipients": mobiles,
-                    "inbox_label": e0["inbox_label"], "schedule": e0["schedule"],
-                    "schedule_name": e0["schedule_name"], "commit": True,
+                    "body": e["body"], "recipients": e["mobiles"],
+                    "inbox_label": e["inbox_label"], "schedule": e["schedule"],
+                    "schedule_name": e["schedule_name"], "commit": True,
                 }
                 self._append_log(
-                    f"  text {gi}/{ngroups}: {len(mobiles)} recipient(s) "
-                    f"[{names}] ({e0['when_str']})…")
+                    f"  text {n}/{ngroups}: {e['name']} — "
+                    f"{len(e['mobiles'])} recipient(s) ({e['when_str']})…")
                 res = self._send_text_blocking(payload)
                 if not res or res.get("error"):
                     self._append_log(
-                        f"  text failed [{names}]: {(res or {}).get('error')}",
-                        error=True)
+                        f"  text failed [{e['name']}]: "
+                        f"{(res or {}).get('error')}", error=True)
                 else:
-                    sent += len(mobiles)
+                    sent += len(e["mobiles"])
         finally:
             self._unlock_browser_after_run()
         self._append_log(
-            f"Batch text complete: {sent} recipient(s) in {ngroups} compose(s) "
-            f"{'scheduled' if scheduled else 'sent'}"
-            + (f"; {skipped} skipped." if skipped else "."))
+            f"Batch text complete: {sent} recipient(s) in "
+            f"{len(selected)} group(s) {'scheduled' if scheduled else 'sent'}.")
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
