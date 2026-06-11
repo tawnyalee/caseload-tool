@@ -2272,6 +2272,13 @@ class BrowserWorker:
         last_count, stable = 0, 0
         MAX_ITERS = 200
         for _ in range(MAX_ITERS):
+            # Yield to the user: this background scroll-load is the slow part
+            # (~5-9s), and the worker is single-threaded, so a note/email/text
+            # action fired mid-scrape would otherwise wait for the whole thing.
+            # The moment any user command is queued, bail out — the caller
+            # re-runs the scrape once the worker is free again.
+            if not self.q.empty():
+                return {"interrupted": True}
             rows = table.locator("tr")
             count = rows.count()
             if count == last_count:
@@ -16685,6 +16692,21 @@ class App:
 
         def on_done(res):
             def apply():
+                # Yielded to a user action mid-scrape — don't apply anything,
+                # just re-run shortly so pass/fail still completes once the
+                # worker is free. (on_complete deliberately NOT fired here; it
+                # only matters at startup, which never interrupts.)
+                if res and res.get("interrupted"):
+                    self._append_log(
+                        "Task pass/fail scan paused for your action — resuming…")
+                    try:
+                        self.root.after(
+                            1500,
+                            lambda: self.worker.submit_scrape_all_task_status(
+                                on_done))
+                    except Exception:
+                        pass
+                    return
                 if not res or res.get("error"):
                     m = (res or {}).get("error")
                     if m:
