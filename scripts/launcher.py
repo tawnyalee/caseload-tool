@@ -390,6 +390,13 @@ class BrowserWorker:
         browser context (so the probe / texting automation can see it)."""
         self.q.put(("OPEN_MONGOOSE", on_done))
 
+    def submit_test_text(
+        self, mobile: str, body: str, on_done: Callable[[dict], None],
+    ) -> None:
+        """TEMP dev: drive the Mongoose compose modal for one test recipient
+        (commit=False — stops at the confirm step for review)."""
+        self.q.put(("TEST_TEXT", mobile, body, on_done))
+
     def submit_set_followup_date(
         self, query: str, date_str: str, on_done: Callable[[dict], None],
     ) -> None:
@@ -675,6 +682,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._open_mongoose(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "TEST_TEXT":
+            _, mobile, body, on_done = cmd
+            res = {}
+            try:
+                res = self._test_text(ctx, mobile, body)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2302,6 +2316,40 @@ class BrowserWorker:
                 except Exception:
                     pass
             return {"ok": True, "url": page.url or ""}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _mongoose_page(self, ctx):
+        """Return the open Mongoose tab in the launcher's context, or None.
+        (Do NOT use _active_page — it prefers the Salesforce tab.)"""
+        for page in ctx.pages:
+            try:
+                if not page.is_closed() and "mongoose" in (page.url or "").lower():
+                    return page
+            except Exception:
+                continue
+        return None
+
+    def _test_text(self, ctx, mobile: str, body: str) -> dict:
+        """TEMP dev: drive the Mongoose compose modal for one test recipient
+        with commit=False (stops at the confirm step for review). Lets us verify
+        the compose driver's click-through end-to-end against the live site."""
+        page = self._mongoose_page(ctx)
+        if page is None:
+            return {"error": "No Mongoose tab open — click 🐭 Open Mongoose first."}
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        from src import text_message as tm
+        msg = tm.TextMessage(
+            body=body or "Test message — please ignore.",
+            recipients_mobile=[mobile],
+            commit=False,
+        )
+        try:
+            tm.send_text(page, msg, on_status=self.on_status)
+            return {"ok": True}
         except Exception as e:
             return {"error": str(e)}
 
@@ -10356,6 +10404,15 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_open_mongoose.pack(side="left", padx=(8, 0))
+        # TEMP dev helper (remove after texting verification): drive the Mongoose
+        # compose modal for one test recipient (commit=False — stops at the
+        # confirm step for review). Click 🐭 Open Mongoose first.
+        self._btn_test_text = ctk.CTkButton(
+            toggle_frame, text="🧪 Test Text",
+            width=120, command=self._dev_test_text,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_test_text.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -15791,6 +15848,44 @@ class App:
             except Exception:
                 pass
         self.worker.submit_open_mongoose(on_done)
+
+    def _dev_test_text(self) -> None:
+        """TEMP dev: verify the Mongoose compose driver end-to-end. Prompts for a
+        test mobile number, then drives open -> recipient -> message -> Preview
+        (commit=False: stops at the confirm step so nothing is sent). Open
+        🐭 Open Mongoose and land on an inbox first."""
+        try:
+            if not self.worker.ready_event.is_set():
+                self._append_log("Browser not ready yet.")
+                return
+        except Exception:
+            return
+        dlg = ctk.CTkInputDialog(
+            title="Test Text",
+            text=("Mobile number to text (a test contact). The driver stops at "
+                  "the confirm step — nothing is sent.\n\n"
+                  "Open 🐭 Open Mongoose and navigate to an inbox first."),
+        )
+        mobile = (dlg.get_input() or "").strip()
+        if not mobile:
+            return
+        self._append_log(f"Test Text: driving compose for {mobile}…")
+
+        def on_done(res):
+            def show():
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Test Text failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                self._append_log(
+                    "Test Text: reached confirm/schedule step — review the "
+                    "Mongoose modal (nothing sent).")
+            try:
+                self.root.after(0, show)
+            except Exception:
+                pass
+        self.worker.submit_test_text(mobile, "Test message — please ignore.", on_done)
 
     def _dev_probe_text(self) -> None:
         """TEMP dev probe: dump the live Mongoose ("Cadence") texting composer
