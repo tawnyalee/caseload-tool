@@ -372,17 +372,6 @@ class BrowserWorker:
         or {error}."""
         self.q.put(("FETCH_TASK_STATUS", query, on_done))
 
-    def submit_probe_ea(self, on_done: Callable[[dict], None]) -> None:
-        """TEMP dev probe: capture the live Essential Actions tab DOM."""
-        self.q.put(("PROBE_EA", on_done))
-
-    def submit_probe_task_scrape(
-        self, on_done: Callable[[dict], None],
-    ) -> None:
-        """TEMP dev timing probe: measure how long the deferred '2a' bulk
-        task-status scrape would cost (scroll-load + one bulk read)."""
-        self.q.put(("PROBE_TASK_SCRAPE", on_done))
-
     def submit_scrape_all_task_status(
         self, on_done: Callable[[dict], None],
     ) -> None:
@@ -391,10 +380,10 @@ class BrowserWorker:
         on_done({by_sid: {sid: {tnum: {...}}}, count}) or {error}."""
         self.q.put(("SCRAPE_ALL_TASK_STATUS", on_done))
 
-    def submit_probe_followup(self, on_done: Callable[[dict], None]) -> None:
-        """TEMP dev probe: capture the caseload Followup Date/Note cells +
-        any open inline editor (for building followup-field writes)."""
-        self.q.put(("PROBE_FOLLOWUP", on_done))
+    def submit_probe_text(self, on_done: Callable[[dict], None]) -> None:
+        """TEMP dev probe: capture the live Cadence "Send Text" composer DOM
+        (for building the texting send selectors)."""
+        self.q.put(("PROBE_TEXT", on_done))
 
     def submit_set_followup_date(
         self, query: str, date_str: str, on_done: Callable[[dict], None],
@@ -657,20 +646,6 @@ class BrowserWorker:
                 res = self._fetch_task_status(ctx, query)
             finally:
                 on_done(res)
-        elif cmd[0] == "PROBE_EA":
-            _, on_done = cmd
-            res = {}
-            try:
-                res = self._probe_ea(ctx)
-            finally:
-                on_done(res)
-        elif cmd[0] == "PROBE_TASK_SCRAPE":
-            _, on_done = cmd
-            res = {}
-            try:
-                res = self._probe_task_scrape(ctx)
-            finally:
-                on_done(res)
         elif cmd[0] == "SCRAPE_ALL_TASK_STATUS":
             _, on_done = cmd
             res = {}
@@ -678,11 +653,11 @@ class BrowserWorker:
                 res = self._scrape_all_task_status(ctx)
             finally:
                 on_done(res)
-        elif cmd[0] == "PROBE_FOLLOWUP":
+        elif cmd[0] == "PROBE_TEXT":
             _, on_done = cmd
             res = {}
             try:
-                res = self._probe_followup(ctx)
+                res = self._probe_text(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2274,130 +2249,16 @@ class BrowserWorker:
             return {"error": f"bulk task read failed: {e}"}
         return {"by_sid": by_sid, "count": len(by_sid)}
 
-    def _probe_task_scrape(self, ctx) -> dict:
-        """TEMP dev TIMING probe for the deferred '2a' bulk task-status
-        scrape. Measures the two costs a refresh-time scrape would add:
-          (1) scroll-loading the whole live Caseload list (the dominant
-              cost — Lightning lazy-loads rows on scroll), and
-          (2) ONE bulk read of every task cell's color/title across all
-              loaded rows (the marginal read cost).
-        Returns the timing breakdown + a per-state tally so we can decide
-        whether 2a runs on every ↻ or behind an opt-in button. Run with the
-        browser already on the all-columns Caseload list view."""
-        t_start = time.perf_counter()
-        target, table = self._open_caseload_table(ctx)
-        if table is None:
-            return {"error": "caseload table didn't load"}
-        t_nav = time.perf_counter() - t_start
-
-        # Clear any active row filter so we scroll the WHOLE caseload.
-        try:
-            fi = target.locator(
-                'input[placeholder="Search All Rows..."]'
-            ).filter(visible=True).first
-            if fi.count() > 0:
-                fi.click(); fi.fill(""); fi.press("Enter")
-                _wait_grid_settled(target, 1500)
-        except Exception:
-            pass
-
-        # (1) Scroll-load: drive the last <tr> into view until the row
-        # count is stable for two checks (the same loop the CSV-less row
-        # reader uses, so the timing transfers directly to a real 2a).
-        t_scroll0 = time.perf_counter()
-        last_count, stable, iters = 0, 0, 0
-        MAX_ITERS = 200
-        for _ in range(MAX_ITERS):
-            iters += 1
-            rows = table.locator("tr")
-            count = rows.count()
-            if count == last_count:
-                stable += 1
-                if stable >= 2:
-                    break
-            else:
-                stable = 0
-            last_count = count
-            try:
-                rows.nth(count - 1).scroll_into_view_if_needed(timeout=2000)
-            except Exception:
-                pass
-            try:
-                target.wait_for_timeout(400)
-            except Exception:
-                pass
-        t_scroll = time.perf_counter() - t_scroll0
-
-        # (2) Bulk read: ONE round-trip reads every task cell's color class
-        # + title across all loaded rows and tallies state per the same
-        # color map lookup_task_status uses.
-        t_read0 = time.perf_counter()
-        try:
-            stats = table.evaluate(r'''(tbl) => {
-              const color={cellColorGreen:'passed',cellColorRed:'returned',
-                cellColorBlue:'pending'};
-              const rows=tbl.querySelectorAll('tr');
-              const tally={passed:0,returned:0,pending:0,submitted:0};
-              let cells=0, students=0, rowsWithSid=0, rowsHaveStatusNoSid=0;
-              const samples=[];
-              for(const r of rows){
-                // Student ID for the join: a cell whose text is exactly a
-                // 9-10 digit number (robust to column position/offsets).
-                let sid='';
-                for(const td of r.querySelectorAll('td')){
-                  const t=(td.textContent||'').trim();
-                  if(/^\d{9,10}$/.test(t)){ sid=t; break; }
-                }
-                const spans=r.querySelectorAll("span[class*='cellColor']");
-                let rowHas=false; const rowStates={};
-                for(const s of spans){
-                  const title=s.getAttribute('title')||'';
-                  const m=title.match(/Task\s*(\d+)\s*:/);
-                  if(!m) continue;
-                  cells++; rowHas=true;
-                  const cls=s.className||'';
-                  let st='submitted';
-                  for(const k in color){
-                    if(cls.indexOf(k)>=0){st=color[k];break;} }
-                  tally[st]=(tally[st]||0)+1;
-                  rowStates[m[1]]=st;
-                }
-                if(rowHas){
-                  students++;
-                  if(sid){ rowsWithSid++;
-                    if(samples.length<3) samples.push({sid, tasks:rowStates});
-                  } else { rowsHaveStatusNoSid++; }
-                }
-              }
-              return {cells, students, tally, totalRows: rows.length,
-                rowsWithSid, rowsHaveStatusNoSid, samples};
-            }''')
-        except Exception as e:
-            return {"error": f"bulk read failed: {e}",
-                    "t_nav": round(t_nav, 2),
-                    "t_scroll": round(t_scroll, 2)}
-        t_read = time.perf_counter() - t_read0
-        t_total = time.perf_counter() - t_start
-
-        return {
-            "t_nav": round(t_nav, 2),
-            "t_scroll": round(t_scroll, 2),
-            "t_read": round(t_read, 3),
-            "t_total": round(t_total, 2),
-            "iters": iters,
-            "rows": (stats or {}).get("totalRows", 0),
-            "students_with_status": (stats or {}).get("students", 0),
-            "task_cells": (stats or {}).get("cells", 0),
-            "tally": (stats or {}).get("tally", {}),
-            "rows_with_sid": (stats or {}).get("rowsWithSid", 0),
-            "status_no_sid": (stats or {}).get("rowsHaveStatusNoSid", 0),
-            "samples": (stats or {}).get("samples", []),
-        }
-
-    def _probe_ea(self, ctx) -> dict:
-        """TEMP dev probe: deep-walk the active page (incl. shadow DOM) to
-        capture the Essential Actions component, its rows, and any OPEN
-        dropdown menu's items. Returns {menuItems, eaTags, html, counts}."""
+    def _probe_text(self, ctx) -> dict:
+        """TEMP dev probe: capture the live Cadence "Send Text" composer DOM.
+        The texting send mechanism (Cadence / Sales Engagement) is unknown, so
+        this captures BROADLY: any visible dialog/panel, form fields
+        (textarea / input / combobox / contenteditable), every visible button
+        label, and any element whose tag/class/aria mentions
+        text/sms/message/cadence/send/schedule. Open the Cadence text composer
+        for a student FIRST (and, to capture template/schedule pickers, open
+        those too), then click probe. → temp/text_probe.html
+        Returns {buttons, matchTags, html, counts}."""
         target = self._active_page(ctx)
         if target is None:
             return {"error": "no active page"}
@@ -2406,9 +2267,11 @@ class BrowserWorker:
           const KEEP=['class','data-label','title','role','aria-label',
             'data-row-key-value','data-target-selection-name','data-tab-value',
             'name','value','data-aura-class','href','aria-haspopup','aria-expanded',
-            'placeholder','for','type','checked','data-value','data-field'];
+            'placeholder','for','type','checked','data-value','data-field',
+            'maxlength','data-name'];
           const cls=el=>String((el.className&&el.className.baseVal!==undefined)
             ?el.className.baseVal:(el.className||''));
+          function vis(el){try{return el.offsetParent!==null||el.getClientRects().length>0;}catch(e){return false;}}
           function ser(el,d){
             if(!el||d>30) return '';
             const tag=(el.tagName||'').toLowerCase();
@@ -2441,53 +2304,41 @@ class BrowserWorker:
             })(document);
             return r;
           }
-          const menuItems=[...new Set(deepAll(el=>{
+          const RX=/text|sms|message|cadence|send|sales.?engagement|hvs|schedul/i;
+          // Every visible button/menuitem label — find "Send Text", "Send",
+          // "Schedule", template pickers, etc.
+          const buttons=[...new Set(deepAll(el=>{
+            if(!vis(el))return false;
             const role=el.getAttribute&&el.getAttribute('role');
-            const c=cls(el);
-            return role==='menuitem'||el.tagName==='LIGHTNING-MENU-ITEM'||
-              /menuItem|slds-dropdown__item|uiMenuItem|slds-listbox__option/i.test(c);
-          }).map(el=>(el.textContent||'').trim().slice(0,90)).filter(Boolean))];
-          const eaEls=deepAll(el=>{
+            return el.tagName==='BUTTON'||el.tagName==='LIGHTNING-BUTTON'||
+              role==='button'||role==='menuitem'||
+              el.tagName==='LIGHTNING-MENU-ITEM';
+          }).map(el=>((el.getAttribute&&el.getAttribute('aria-label'))||
+            el.textContent||'').trim().slice(0,60)).filter(Boolean))].slice(0,120);
+          // Elements that look texting-related by tag/class/aria.
+          const hits=deepAll(el=>{
             const t=(el.tagName||'').toLowerCase();
-            return t.includes('essential')||/EssentialAction/i.test(cls(el));
+            const al=(el.getAttribute&&el.getAttribute('aria-label'))||'';
+            return RX.test(t)||RX.test(cls(el))||RX.test(al);
           });
-          const eaTags=[...new Set(eaEls.map(el=>
+          const matchTags=[...new Set(hits.map(el=>
             el.tagName.toLowerCase()+' .'+cls(el).split(/\s+/).slice(0,3).join('.')
-          ))].slice(0,50);
+          ))].slice(0,60);
           let html='';
-          const outer=eaEls.find(el=>!eaEls.some(o=>o!==el&&o.contains(el)));
-          if(outer) html+='=== EA COMPONENT (deep) ===\n'+ser(outer,0);
-          const menus=deepAll(el=>{
-            const role=el.getAttribute&&el.getAttribute('role');
-            const c=cls(el);
-            return role==='menu'||
-              /slds-dropdown(?!_)|uiMenuList|dropdown__list|slds-listbox/i.test(c);
-          });
-          const open=menus.filter(m=>{
-            try{return m.offsetParent!==null||m.getClientRects().length>0;}
-            catch(e){return false;}
-          });
-          for(const m of open.slice(0,3)) html+='\n=== OPEN MENU (deep) ===\n'+ser(m,0);
-          // Any open modal/dialog (the note form behind "Add Note to EA").
-          const dialogs=deepAll(el=>{
+          // Visible dialogs / panels / docked composer.
+          const dialogs=deepAll(el=>{ if(!vis(el))return false;
             const role=el.getAttribute&&el.getAttribute('role'); const c=cls(el);
-            return role==='dialog'||/slds-modal__container|slds-modal__content/i.test(c);
+            return role==='dialog'||
+              /slds-modal__container|slds-modal__content|slds-docked|dockable|slds-panel|cadence|sendText|sms/i.test(c);
           });
-          const odlg=dialogs.filter(m=>{
-            try{return m.offsetParent!==null||m.getClientRects().length>0;}
-            catch(e){return false;}
-          });
-          for(const dd of odlg.slice(0,2)) html+='\n=== OPEN DIALOG (deep) ===\n'+ser(dd,0);
-          // Find the note form by its FIELDS wherever they render (the
-          // "Add Note to EA" form may not be a role=dialog). Climb a few
-          // levels from each visible editable/combobox and dump that
-          // container so we capture labels + the body/course/activity fields.
-          function vis(el){try{return el.offsetParent!==null||el.getClientRects().length>0;}catch(e){return false;}}
+          const topD=dialogs.filter(m=>!dialogs.some(o=>o!==m&&o.contains(m)));
+          for(const dd of topD.slice(0,3)) html+='\n=== DIALOG / PANEL ===\n'+ser(dd,0);
+          // Form fields (the message body, recipient, template, schedule),
+          // climbed a few levels to grab their labels + surrounding controls.
           function climb(el,n){let p=el;for(let i=0;i<n&&p&&p.parentElement;i++)p=p.parentElement;return p;}
           const FLD=['TEXTAREA','LIGHTNING-TEXTAREA','LIGHTNING-INPUT',
             'LIGHTNING-COMBOBOX','LIGHTNING-GROUPED-COMBOBOX',
-            'LIGHTNING-INPUT-RICH-TEXT','LIGHTNING-DUAL-LISTBOX',
-            'LIGHTNING-CHECKBOX-GROUP'];
+            'LIGHTNING-INPUT-RICH-TEXT','SELECT'];
           const fields=deepAll(el=>{ if(!vis(el))return false;
             const role=el.getAttribute&&el.getAttribute('role');
             return FLD.includes(el.tagName)||role==='combobox'||
@@ -2495,122 +2346,23 @@ class BrowserWorker:
           const seenC=new Set(); let nForm=0;
           for(const f of fields.slice(0,60)){ const c=climb(f,6);
             if(!c||seenC.has(c))continue; seenC.add(c);
-            html+='\n=== FORM CONTAINER ===\n'+ser(c,0); nForm++;
-            if(nForm>=8)break; }
-          // List/grid pages (the EA DASHBOARD): capture data grids +
-          // standard list-view managers wherever they render.
-          const grids=deepAll(el=>el.tagName==='LIGHTNING-DATATABLE'||
-            (el.getAttribute&&el.getAttribute('role')==='grid')||
-            /forceListViewManager|listViewContainer|cEssentialAction/i.test(cls(el)));
-          const topGrids=grids.filter(g=>!grids.some(o=>o!==g&&o.contains(g)));
-          let nGrid=0;
-          for(const g of topGrids.slice(0,4)){
-            html+='\n=== GRID / LIST ===\n'+ser(g,0); nGrid++; }
-          return {menuItems:menuItems.slice(0,80), eaTags,
-            html:html.slice(0,700000),
-            counts:{ea:eaEls.length, menus:menus.length, open:open.length,
-              dialogs:odlg.length, fields:fields.length, forms:nForm,
-              grids:nGrid}};
+            html+='\n=== FIELD CONTAINER ===\n'+ser(c,0); nForm++;
+            if(nForm>=10)break; }
+          // Texting-related hits not already inside a dialog we dumped.
+          const topHits=hits.filter(h=>vis(h)&&!hits.some(o=>o!==h&&o.contains(h)));
+          let nHit=0;
+          for(const h of topHits.slice(0,6)){
+            html+='\n=== MATCH (text/sms/cadence) ===\n'+ser(h,0); nHit++; }
+          return {buttons, matchTags, html:html.slice(0,700000),
+            counts:{hits:hits.length, dialogs:topD.length,
+              fields:fields.length, field_containers:nForm, match_blocks:nHit}};
         }
         '''
-        # NO auto-click now: we're capturing a form the user has already
-        # opened (clicking anything could disturb it). Just snapshot the
-        # current page — the FORM CONTAINER capture finds the note form by
-        # its fields wherever it renders.
         try:
             data = target.evaluate(js)
             if isinstance(data, dict):
-                data["opened"] = "(captured current page; no auto-open)"
                 return data
             return {"error": "no data"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _probe_followup(self, ctx) -> dict:
-        """TEMP dev probe for the Followup Date/Note inline-edit DOM. Run on
-        the Caseload LIST view. To capture the EDITOR, click into a Followup
-        Date or Note cell FIRST (open the calendar/input), then click probe.
-        Captures: list headers (followup ones), the followup cells, any
-        visible inline editor (input / datepicker / calendar), and the
-        inline-edit docked Save footer. → temp/followup_probe.html"""
-        target = self._active_page(ctx)
-        if target is None:
-            return {"error": "no active page"}
-        js = r'''
-        () => {
-          const KEEP=['class','data-label','title','role','aria-label',
-            'data-row-key-value','name','value','data-aura-class','placeholder',
-            'type','aria-expanded','data-field','aria-colindex','data-column-key'];
-          const cls=el=>String((el.className&&el.className.baseVal!==undefined)
-            ?el.className.baseVal:(el.className||''));
-          function ser(el,d){
-            if(!el||d>25) return '';
-            const tag=(el.tagName||'').toLowerCase();
-            if(['script','style','svg','path','iframe','img'].includes(tag)) return '';
-            let s='<'+tag;
-            const at=el.attributes;
-            if(at) for(let ai=0;ai<at.length;ai++){ const a=at[ai];
-              if(a&&KEEP.includes(a.name))
-                s+=' '+a.name+'="'+String(a.value||'').slice(0,80).replace(/"/g,'')+'"';
-            }
-            s+='>';
-            const serNode=(n)=>{
-              if(n.nodeType===3){const tx=n.textContent.trim();
-                return tx?tx.slice(0,160):'';}
-              if(n.nodeType!==1) return '';
-              return ser(n,d+1);
-            };
-            if(el.shadowRoot) s+='\n#shadow{\n'+
-              [...el.shadowRoot.childNodes].map(serNode).join('')+'}\n';
-            for(const c of el.childNodes) s+=serNode(c);
-            return s+'</'+tag+'>\n';
-          }
-          function deepAll(pred){
-            const r=[];
-            (function w(root){
-              for(const el of root.querySelectorAll('*')){
-                try{if(pred(el))r.push(el);}catch(e){}
-                if(el.shadowRoot) w(el.shadowRoot);
-              }
-            })(document);
-            return r;
-          }
-          const vis=el=>{try{return el.offsetParent!==null||
-            el.getClientRects().length>0;}catch(e){return false;}};
-          const headers=[...new Set(deepAll(el=>el.tagName==='TH')
-            .map(th=>(th.textContent||'').trim()).filter(Boolean))];
-          // Followup cells by data-label.
-          const fcells=deepAll(el=>{const dl=el.getAttribute&&
-            el.getAttribute('data-label');return dl&&/follow.?up/i.test(dl);});
-          // Visible inline editors: inputs, datepicker, calendar, cell editor.
-          const editors=deepAll(el=>{const t=el.tagName,c=cls(el),
-            role=el.getAttribute&&el.getAttribute('role');
-            return t==='INPUT'||t==='TEXTAREA'||t==='LIGHTNING-INPUT'||
-              t==='LIGHTNING-DATEPICKER'||t==='LIGHTNING-PRIMITIVE-CELL-EDITOR'||
-              (role==='grid'&&/datepicker/i.test(c))||
-              /datepicker|slds-datepicker|cellEditor|inline.?edit|slds-table_edit|popupTarget/i.test(c);
-            }).filter(vis);
-          // Inline-edit docked Save/Cancel footer.
-          const footers=deepAll(el=>/docked|inlineEdit|slds-docked-form-footer/i
-            .test(cls(el))||(el.getAttribute&&
-            /Save|Cancel/.test(el.getAttribute('title')||''))).filter(vis);
-          let html='=== HEADERS ('+headers.length+') ===\n'+headers.join(' | ')+'\n';
-          for(const f of fcells.slice(0,4))
-            html+='\n=== FOLLOWUP CELL ['+(f.getAttribute('data-label')||'')+
-              '] ===\n'+ser(f,0);
-          for(const e of editors.slice(0,6))
-            html+='\n=== VISIBLE EDITOR ['+e.tagName.toLowerCase()+'] ===\n'+ser(e,0);
-          for(const ft of footers.slice(0,3))
-            html+='\n=== DOCKED/SAVE ===\n'+ser(ft,0);
-          return {headers:headers.filter(h=>/follow.?up/i.test(h)),
-            all_header_count:headers.length, followup_cells:fcells.length,
-            editors_visible:editors.length, footers:footers.length,
-            html:html.slice(0,500000)};
-        }
-        '''
-        try:
-            data = target.evaluate(js)
-            return data if isinstance(data, dict) else {"error": "no data"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -10504,34 +10256,16 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self.capture_btn.pack(side="left", padx=(8, 0))
-        # TEMP dev probe (remove after EA exploration): captures the live
-        # Essential Actions tab (component + rows + open dropdown) to a file
-        # so we can find the real selectors. Open the EA tab + a row's
-        # dropdown, then click this.
-        self._btn_probe_ea = ctk.CTkButton(
-            toggle_frame, text="🧪 Probe EA",
-            width=110, command=self._dev_probe_ea,
+        # TEMP dev probe (remove after texting exploration): capture the live
+        # Cadence "Send Text" composer DOM so we can build the texting send
+        # selectors. Open the Cadence text composer for a student first
+        # (template/schedule pickers too, if you want them captured), then click.
+        self._btn_probe_text = ctk.CTkButton(
+            toggle_frame, text="🧪 Probe Text",
+            width=120, command=self._dev_probe_text,
             **SECONDARY_BTN_KWARGS,
         )
-        self._btn_probe_ea.pack(side="left", padx=(8, 0))
-        # TEMP dev TIMING probe (remove after the 2a decision): measures how
-        # long a refresh-time bulk task-status scrape would cost. Put the
-        # browser on the all-columns Caseload list view, then click.
-        self._btn_probe_2a = ctk.CTkButton(
-            toggle_frame, text="⏱ Probe 2a",
-            width=110, command=self._dev_probe_task_scrape,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_probe_2a.pack(side="left", padx=(8, 0))
-        # TEMP dev probe (remove with the others): capture the caseload
-        # Followup Date/Note inline-edit DOM. On the Caseload list, click into
-        # a Followup cell to open its editor, then click this.
-        self._btn_probe_flup = ctk.CTkButton(
-            toggle_frame, text="🧪 Probe Flup",
-            width=120, command=self._dev_probe_followup,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_probe_flup.pack(side="left", padx=(8, 0))
+        self._btn_probe_text.pack(side="left", padx=(8, 0))
         # (Busy/refresh indicator now lives in the top bar — see topbar.)
         # Collapse the rightmost toolbar buttons to emoji-only when the
         # bar gets too narrow (they're the first to clip).
@@ -15938,12 +15672,11 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def _dev_probe_task_scrape(self) -> None:
-        """TEMP dev TIMING probe for the deferred '2a' bulk task-status
-        scrape. Put the app's browser on the all-columns Caseload list view
-        first, then click. Logs how long a refresh-time bulk scrape costs,
-        broken into nav / scroll-load / bulk-read, so we can decide whether
-        2a runs on every ↻ or behind an opt-in button."""
+    def _dev_probe_text(self) -> None:
+        """TEMP dev probe: dump the live Cadence "Send Text" composer DOM so we
+        can find the texting selectors (message body, recipient, template +
+        schedule pickers, Send/Schedule buttons). Open the Cadence text
+        composer for a student first, then click. → temp/text_probe.html"""
         try:
             if not self.worker.ready_event.is_set():
                 self._append_log("Browser not ready yet.")
@@ -15951,139 +15684,43 @@ class App:
         except Exception:
             return
         self._append_log(
-            "Timing 2a bulk task scrape… (browser must be on the "
-            "all-columns Caseload list view)")
+            "Probing Cadence texting… open the 'Send Text' composer for a "
+            "student first (and any template/schedule picker you want captured).")
 
         def on_done(res):
             def show():
                 if not res or res.get("error"):
                     self._append_log(
-                        f"2a probe failed: {(res or {}).get('error')}",
-                        error=True)
-                    return
-                t = res
-                self._append_log(
-                    f"2a scrape timing → total {t.get('t_total')}s  "
-                    f"(nav {t.get('t_nav')}s · scroll {t.get('t_scroll')}s "
-                    f"in {t.get('iters')} iters · read {t.get('t_read')}s)")
-                tally = t.get("tally") or {}
-                self._append_log(
-                    f"  rows={t.get('rows')} "
-                    f"students_with_status={t.get('students_with_status')} "
-                    f"task_cells={t.get('task_cells')} · "
-                    f"passed={tally.get('passed', 0)} "
-                    f"returned={tally.get('returned', 0)} "
-                    f"pending={tally.get('pending', 0)} "
-                    f"submitted={tally.get('submitted', 0)}")
-                # SID-join check: how many status rows got a Student ID, plus
-                # a few samples so we can confirm the join before building 2a.
-                self._append_log(
-                    f"  SID join: rows_with_sid={t.get('rows_with_sid')} "
-                    f"status_but_no_sid={t.get('status_no_sid')}")
-                for s in (t.get("samples") or []):
-                    tasks = s.get("tasks") or {}
-                    pretty = " ".join(
-                        f"T{k}={v}" for k, v in sorted(tasks.items()))
-                    self._append_log(f"    sid {s.get('sid')} → {pretty}")
-            try:
-                self.root.after(0, show)
-            except Exception:
-                pass
-        self.worker.submit_probe_task_scrape(on_done)
-
-    def _dev_probe_followup(self) -> None:
-        """TEMP dev probe: capture the caseload Followup Date/Note inline-edit
-        DOM. On the Caseload LIST view, click into a Followup cell to open its
-        editor (calendar/input) FIRST, then click this. Writes the deep DOM to
-        temp/followup_probe.html for selector discovery."""
-        try:
-            if not self.worker.ready_event.is_set():
-                self._append_log("Browser not ready yet.")
-                return
-        except Exception:
-            return
-        self._append_log(
-            "Probing Followup fields… be on the Caseload list; click into a "
-            "Followup Date/Note cell to open its editor first.")
-
-        def on_done(res):
-            def show():
-                if not res or res.get("error"):
-                    self._append_log(
-                        f"Followup probe failed: {(res or {}).get('error')}",
-                        error=True)
-                    return
-                self._append_log(
-                    f"Followup probe: followup headers={res.get('headers')} "
-                    f"· followup_cells={res.get('followup_cells')} "
-                    f"· editors_visible={res.get('editors_visible')} "
-                    f"· save_footers={res.get('footers')} "
-                    f"(of {res.get('all_header_count')} cols)")
-                html = res.get("html") or ""
-                try:
-                    p = CASELOAD_CSV_PATH.parent / "temp" / "followup_probe.html"
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    p.write_text(html, encoding="utf-8")
-                    self._append_log(
-                        f"Followup deep DOM → {p}  ({len(html)} chars)")
-                except Exception as e:
-                    self._append_log(
-                        f"couldn't write followup probe file: {e}", error=True)
-            try:
-                self.root.after(0, show)
-            except Exception:
-                pass
-        self.worker.submit_probe_followup(on_done)
-
-    def _dev_probe_ea(self) -> None:
-        """TEMP dev probe: dump the live Essential Actions tab DOM so we can
-        find the real selectors (component, rows, the 'Add Note & Close EA'
-        dropdown). Open the EA tab + a row's dropdown first, then click."""
-        try:
-            if not self.worker.ready_event.is_set():
-                self._append_log("Browser not ready yet.")
-                return
-        except Exception:
-            return
-        self._append_log(
-            "Probing Essential Actions… make sure the EA tab is open and a "
-            "row's dropdown is expanded.")
-
-        def on_done(res):
-            def show():
-                if not res or res.get("error"):
-                    self._append_log(
-                        f"EA probe failed: {(res or {}).get('error')}",
+                        f"Text probe failed: {(res or {}).get('error')}",
                         error=True)
                     return
                 c = res.get("counts") or {}
                 self._append_log(
-                    f"EA probe: {res.get('opened','')} · ea_els={c.get('ea')} "
-                    f"open_menus={c.get('open')} dialogs={c.get('dialogs')} "
-                    f"fields={c.get('fields')} form_containers={c.get('forms')} "
-                    f"grids={c.get('grids')}")
-                items = res.get("menuItems") or []
+                    f"Text probe: text_hits={c.get('hits')} "
+                    f"dialogs={c.get('dialogs')} fields={c.get('fields')} "
+                    f"field_containers={c.get('field_containers')} "
+                    f"match_blocks={c.get('match_blocks')}")
+                btns = res.get("buttons") or []
                 self._append_log(
-                    "Menu/dropdown items: "
-                    + (" | ".join(items) if items
-                       else "(none — was a row dropdown actually open?)"))
-                for t in (res.get("eaTags") or [])[:15]:
-                    self._append_log("  EA el: " + t)
+                    "Visible buttons: "
+                    + (" | ".join(btns) if btns else "(none captured)"))
+                for t in (res.get("matchTags") or [])[:15]:
+                    self._append_log("  text el: " + t)
                 html = res.get("html") or ""
                 try:
-                    p = CASELOAD_CSV_PATH.parent / "temp" / "ea_probe.html"
+                    p = CASELOAD_CSV_PATH.parent / "temp" / "text_probe.html"
                     p.parent.mkdir(parents=True, exist_ok=True)
                     p.write_text(html, encoding="utf-8")
                     self._append_log(
-                        f"EA deep HTML → {p}  ({len(html)} chars)")
+                        f"Text deep DOM → {p}  ({len(html)} chars)")
                 except Exception as e:
                     self._append_log(
-                        f"couldn't write EA probe file: {e}", error=True)
+                        f"couldn't write text probe file: {e}", error=True)
             try:
                 self.root.after(0, show)
             except Exception:
                 pass
-        self.worker.submit_probe_ea(on_done)
+        self.worker.submit_probe_text(on_done)
 
     def _set_followup_date_for(self, student_id: str, date_str: str,
                                on_apply=None) -> None:
