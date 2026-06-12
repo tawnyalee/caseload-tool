@@ -5987,16 +5987,20 @@ def prompt_batch_text_review(
         ctk.CTkCheckBox(
             rowf, text="", width=24, variable=sel_vars[i],
             command=_update_sel_label,
-        ).pack(side="left")
-        sub = f"{e.get('course_code', '')}  ·  {e['when_str']}"
-        if e.get("issues"):
-            sub += f"  ·  ⚠ {', '.join(e['issues'])}"
-        ctk.CTkButton(
-            rowf, text=f"{e['name']}\n{sub}", anchor="w",
-            fg_color="transparent", text_color=("gray10", "gray90"),
-            hover_color=("gray85", "gray25"),
-            command=lambda x=i: _show(x),
-        ).pack(side="left", fill="x", expand=True)
+        ).pack(side="left", anchor="n")
+        # A wrapping label (not a button) so long group labels / "⚠ …" notes
+        # don't clip. Clicking it shows the message on the right. Compact sub-
+        # line — the full issue text lives in the right preview header.
+        warn = "⚠  " if e.get("issues") else ""
+        sub = e.get("mobile", "") or e.get("when_str", "")
+        lbl = ctk.CTkLabel(
+            rowf, text=f"{warn}{e['name']}\n{sub}", anchor="w", justify="left",
+            wraplength=250, font=ctk.CTkFont(size=11),
+            text_color=(("#a33", "#e88") if e.get("issues")
+                        else ("gray10", "gray90")),
+        )
+        lbl.pack(side="left", fill="x", expand=True)
+        lbl.bind("<Button-1>", lambda _ev, x=i: _show(x))
     _update_sel_label()
     if entries:
         _show(0)
