@@ -412,6 +412,12 @@ class BrowserWorker:
         review's up-front course-mismatch warning). on_done({dept})."""
         self.q.put(("MONGOOSE_DEPT", on_done))
 
+    def submit_restart_browser(self, on_done: Callable[[dict], None]) -> None:
+        """Tear down and reopen the browser context (hang recovery). Handled in
+        _session, not _dispatch_command. on_done({ok}) fires once the fresh
+        browser is ready."""
+        self.q.put(("RESTART_BROWSER", on_done))
+
     def submit_set_followup_date(
         self, query: str, date_str: str, on_done: Callable[[dict], None],
     ) -> None:
@@ -482,93 +488,82 @@ class BrowserWorker:
         self.q.put(self.SHUTDOWN)
 
     def _run(self) -> None:
+        """Own the browser session(s). Normally one session for the whole app
+        life; a RESTART_BROWSER command tears the context down and _session
+        returns True so we reopen a fresh one (hang recovery)."""
+        self._pending_restart_cb = None
+        first = True
         try:
-            with persistent_context() as ctx:
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                if CASELOAD_URL:
-                    page.goto(CASELOAD_URL)
-                    # TODO: popups stuck at about:blank on fresh launch.
-                    # In a Playwright-launched Chromium/Edge, user clicks
-                    # that spawn popups (window.open) hang at about:blank
-                    # with a "loading…" spinner until *any* Playwright-
-                    # driven action runs against the page — e.g. the
-                    # first time _handle_find calls goto/click/fill,
-                    # popups start working for the rest of the session.
-                    # Things we've tried that DON'T fix it:
-                    #   - User-initiated Ctrl+R on the parent tab
-                    #   - page.bring_to_front()
-                    #   - page.reload() right here
-                    #   - page.keyboard.press("F19") (synthetic key)
-                    #   - --disable-features=CalculateNativeWinOcclusion
-                    #     and other throttling-related Chromium flags
-                    #   - Monkey-patching window.open in the page
-                    #   - Startup "warming" block: wait_for_load_state
-                    #     "networkidle" + page.evaluate("document.title")
-                    #     + page.locator("body").count() + mouse.move —
-                    #     so the unstick trigger isn't generic
-                    #     DOM/JS/input activity; it's something specific
-                    #     to a user-driven later action.
-                    # Workaround documented in README: middle-click or
-                    # right-click → "Open link in new tab".
-
-                # Close any tabs left over from a previous session
-                # (Edge persists tabs across runs in the user-data
-                # dir). Stale tabs frequently start in a bad state
-                # — about:blank popup hang, half-navigated — and
-                # cause "Target page closed" errors when
-                # _active_page picks the wrong one. The session
-                # cookies / login state are preserved by the
-                # persistent profile; only tab state is reset.
-                for extra in list(ctx.pages):
-                    if extra is page:
-                        continue
-                    try:
-                        extra.close()
-                    except Exception:
-                        pass
-                # Hook the context-wide request listener so capture
-                # mode (when active) sees every page's Salesforce
-                # write traffic without us having to wire each page
-                # individually.
-                try:
-                    ctx.on("request", self._on_request)
-                except Exception:
-                    pass
-                self.on_status("Browser ready.")
-                self.ready_event.set()
-                # Bring the browser to the front so the user can log in to
-                # Salesforce; the launcher is foreground at startup, so the
-                # raise is honoured. It's minimized again once the startup
-                # caseload load finishes (App._minimize_browser).
-                try:
-                    self._raise_browser_window()
-                except Exception:
-                    pass
-                # NOTE: Mongoose is opened on demand via 🐭 Open Mongoose, NOT
-                # at startup. A new_page()+goto() this early still hangs at
-                # about:blank — the popup hang only clears after the caseload
-                # load runs real Playwright actions later. By the time the user
-                # clicks the button, popups work; opening it then is reliable.
-                while True:
-                    cmd = self.q.get()
-                    if cmd is self.SHUTDOWN:
-                        return
-                    # Outer try/except: any uncaught exception from a
-                    # command handler used to kill the entire worker
-                    # (next user action would hang forever). Now each
-                    # command is sandboxed — the worker logs the
-                    # failure and keeps processing future commands.
-                    try:
-                        self._dispatch_command(ctx, cmd)
-                    except Exception as e:
-                        self.on_status(
-                            f"Command {cmd[0]!r} failed: {e}. "
-                            "Worker still running; you may need to "
-                            "restart the launcher if the browser is "
-                            "in a bad state."
-                        )
+            while True:
+                if not self._session(first):
+                    return  # SHUTDOWN
+                first = False
         except Exception as e:
             self.on_status(f"Browser worker crashed: {e}")
+
+    def _session(self, first: bool) -> bool:
+        """One browser session: open the persistent context, set up, then
+        process commands until SHUTDOWN (return False) or RESTART_BROWSER
+        (return True — _run reopens a fresh context). The login profile is
+        persisted on disk, so a restart preserves the SSO session."""
+        with persistent_context() as ctx:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            if CASELOAD_URL:
+                page.goto(CASELOAD_URL)
+                # TODO: popups stuck at about:blank on fresh launch — see the
+                # README workaround (right/middle-click "Open link in new tab").
+                # The hang clears after the first Playwright-driven action.
+
+            # Close any tabs left over from a previous session (Edge persists
+            # tabs across runs in the user-data dir). Stale tabs start in a bad
+            # state and confuse _active_page. Login/cookies are preserved.
+            for extra in list(ctx.pages):
+                if extra is page:
+                    continue
+                try:
+                    extra.close()
+                except Exception:
+                    pass
+            try:
+                ctx.on("request", self._on_request)
+            except Exception:
+                pass
+            self.on_status("Browser ready." if first else "Browser restarted.")
+            self.ready_event.set()
+            try:
+                self._raise_browser_window()
+            except Exception:
+                pass
+            # If this session was opened to satisfy a RESTART_BROWSER request,
+            # tell the caller now that the new browser is ready.
+            cb = getattr(self, "_pending_restart_cb", None)
+            if cb is not None:
+                self._pending_restart_cb = None
+                try:
+                    cb({"ok": True})
+                except Exception:
+                    pass
+            while True:
+                cmd = self.q.get()
+                if cmd is self.SHUTDOWN:
+                    return False
+                if isinstance(cmd, tuple) and cmd and cmd[0] == "RESTART_BROWSER":
+                    _, on_done = cmd
+                    self.ready_event.clear()
+                    # Drop cached window handles — the new browser is a new
+                    # process/window (they self-heal via IsWindow anyway).
+                    self._browser_hwnd = None
+                    self._browser_pid = None
+                    self._pending_restart_cb = on_done
+                    self.on_status("Restarting browser…")
+                    return True  # _run reopens the context
+                try:
+                    self._dispatch_command(ctx, cmd)
+                except Exception as e:
+                    self.on_status(
+                        f"Command {cmd[0]!r} failed: {e}. Worker still "
+                        "running; use \u21bb Restart browser if it's stuck."
+                    )
 
     def _dispatch_command(self, ctx, cmd) -> None:
         """Dispatch one queued command. Each branch is responsible for
@@ -10930,6 +10925,14 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_settings.pack(side="left", padx=(8, 0))
+        # Recover from a stuck browser (Salesforce or Mongoose hang) without
+        # restarting the whole app — closes + reopens the browser; login is kept.
+        self._btn_restart_browser = ctk.CTkButton(
+            toggle_frame, text="↻ Browser",
+            width=90, command=self._restart_browser,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_restart_browser.pack(side="left", padx=(8, 0))
         # Discovery: capture Salesforce's note-submission network
         # traffic so we can later replay it via REST API instead of
         # driving the UI. One-click toggle; on stop, writes the
@@ -16348,6 +16351,34 @@ class App:
                 editor.apply_advanced_visibility(advanced)
         except Exception:
             pass
+
+    def _restart_browser(self) -> None:
+        """Tear down + reopen the automation browser (hang recovery). The
+        command queues behind any in-flight worker op, so it takes effect once
+        that op finishes/times out. Login is preserved on disk."""
+        if getattr(self, "_is_busy", False):
+            self._append_log(
+                "Busy — the restart will run once the current task finishes.")
+        if not ask_yes_no_topmost(
+            self.root, "Restart browser?",
+            "Close and reopen the automation browser?\n\nUse this if Salesforce "
+            "or Mongoose is stuck. Your login is preserved, but any unsent "
+            "draft in the browser (e.g. a half-composed text) will be lost.",
+            yes_label="Restart", no_label="Cancel",
+        ):
+            return
+        self._set_busy("Restarting browser…")
+
+        def on_done(_res):
+            def apply():
+                self._set_idle()
+                self._append_log("Browser restarted — ready.")
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                pass
+        self._append_log("Restarting browser…")
+        self.worker.submit_restart_browser(on_done)
 
     def _on_capture_toggle(self) -> None:
         """Toggle network capture for Salesforce REST-API discovery.
