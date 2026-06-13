@@ -405,6 +405,13 @@ class BrowserWorker:
         None), schedule_name, commit."""
         self.q.put(("SEND_TEXT", payload, on_done))
 
+    def submit_mongoose_department(
+        self, on_done: Callable[[dict], None],
+    ) -> None:
+        """Read the currently-selected Mongoose department (for the batch
+        review's up-front course-mismatch warning). on_done({dept})."""
+        self.q.put(("MONGOOSE_DEPT", on_done))
+
     def submit_set_followup_date(
         self, query: str, date_str: str, on_done: Callable[[dict], None],
     ) -> None:
@@ -706,6 +713,13 @@ class BrowserWorker:
                 res = self._send_text(ctx, payload)
             finally:
                 on_done(res)
+        elif cmd[0] == "MONGOOSE_DEPT":
+            _, on_done = cmd
+            dept = ""
+            try:
+                dept = self._mongoose_department(ctx)
+            finally:
+                on_done({"dept": dept})
         elif cmd[0] == "SET_FOLLOWUP_DATE":
             _, query, date_str, on_done = cmd
             res = {}
@@ -2351,6 +2365,30 @@ class BrowserWorker:
             except Exception:
                 continue
         return None
+
+    def _mongoose_department(self, ctx) -> str:
+        """The Mongoose department currently selected in the sidebar (e.g.
+        'C769'). Compose only offers that department's inbox, so the batch
+        review uses this to warn about course-mismatched groups up front. Opens
+        Mongoose in the background if it isn't already. '' if it can't be read."""
+        page = self._mongoose_page(ctx)
+        if page is None:
+            res = self._open_mongoose(ctx, focus=False)
+            if res.get("error"):
+                return ""
+            page = self._mongoose_page(ctx)
+            if page is None:
+                return ""
+            try:
+                page.wait_for_timeout(1500)  # let SSO / the SPA settle
+            except Exception:
+                pass
+        try:
+            el = page.locator(".department-name").filter(visible=True).first
+            el.wait_for(state="visible", timeout=4_000)
+            return (el.inner_text() or "").strip()
+        except Exception:
+            return ""
 
     def _send_text(self, ctx, payload: dict) -> dict:
         """Drive the Mongoose compose modal from a fired text action. `payload`
@@ -13594,6 +13632,28 @@ class App:
         self.root.wait_variable(done_var)
         return holder["res"]
 
+    def _mongoose_department_blocking(self) -> str:
+        """Read Mongoose's current department on the worker thread, blocking the
+        main thread until it returns. '' if unavailable."""
+        if not self.worker.ready_event.is_set():
+            return ""
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"dept": ""}
+
+        def on_done(res):
+            def set_main():
+                holder["dept"] = (res or {}).get("dept", "") or ""
+                done_var.set(True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                holder["dept"] = (res or {}).get("dept", "") or ""
+                done_var.set(True)
+
+        self.worker.submit_mongoose_department(on_done)
+        self.root.wait_variable(done_var)
+        return holder["dept"]
+
     # Team timezone for converting a student-local schedule time to the tz
     # Mongoose's scheduler enters times in. The team is Eastern; TODO: make
     # this a setting (read Mongoose's .timezone-label) for non-Eastern teams.
@@ -14073,6 +14133,17 @@ class App:
             filter_summary = ", ".join(
                 f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                 for f in scenario.batch.filters if f.get("column"))
+        # Up-front department check: Mongoose Compose only offers the current
+        # department's inbox, so flag any group whose course doesn't match it
+        # (so the user is warned in the review, not at send time). Best-effort —
+        # opens Mongoose in the background to read it.
+        dept = self._mongoose_department_blocking()
+        if dept:
+            for grp in review_groups:
+                gc = (grp.get("course_code") or "").strip()
+                if gc and gc.lower() != dept.lower():
+                    grp.setdefault("issues", []).insert(
+                        0, f"Mongoose is on {dept} — switch to {gc} to send")
         selected = prompt_batch_text_review(
             self.root, scenario.name, review_groups, skipped_names,
             filter_summary, scheduled=scheduled)
