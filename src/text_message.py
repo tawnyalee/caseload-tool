@@ -226,17 +226,35 @@ def open_compose(page: Page, *, timeout_ms: int = 15_000) -> None:
 
 
 def select_inbox(page: Page, inbox_label: str, *, timeout_ms: int = 6_000) -> None:
-    """On the "Select Inbox" step, click the inbox whose label matches (or the
-    first/only one if no label is given). No-op if the modal opened straight to
-    the compose step (inbox preselected because we launched from its URL)."""
-    item = page.locator(".inbox-select").filter(visible=True)
-    if inbox_label:
-        item = item.filter(has_text=inbox_label)
+    """On the "Select Inbox" step, click the inbox whose label matches
+    `inbox_label`. If the step is shown but NO inbox matches, raise (so the
+    caller fails loudly instead of silently sending from the wrong inbox) and
+    list what's available — usually means Mongoose is on the wrong department.
+    No label → click the first/only inbox. No-op if the step isn't shown
+    (inbox already selected)."""
+    items = page.locator(".inbox-select").filter(visible=True)
     try:
-        item.first.wait_for(state="visible", timeout=timeout_ms)
-        item.first.click()
+        items.first.wait_for(state="visible", timeout=timeout_ms)
     except PWTimeout:
-        pass  # already past the inbox step
+        return  # step not shown — inbox already selected
+    if not inbox_label:
+        items.first.click()
+        return
+    match = items.filter(has_text=inbox_label)
+    if match.count() == 0:
+        avail = []
+        try:
+            for i in range(min(items.count(), 10)):
+                t = (items.nth(i).inner_text() or "").strip().replace("\n", " ")
+                if t:
+                    avail.append(t)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Inbox {inbox_label!r} isn't available in Mongoose right now. "
+            f"Available: {', '.join(avail) or '(none)'}. Switch Mongoose to the "
+            "matching department, or fix the action's inbox name.")
+    match.first.click()
 
 
 def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
