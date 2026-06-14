@@ -29,6 +29,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -575,3 +576,74 @@ def send_text(
     if msg.commit:
         _click_button(page, "Schedule")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Segment CSV export — auto-download the per-department contacts list (with
+# Salesforce Contact ids) the launcher joins to the caseload.
+# ---------------------------------------------------------------------------
+SEGMENTS_URL = "https://sms.mongooseresearch.com/segments"
+# Mongoose maintains an "Auto-Update" segment per department named like this
+# (confirmed: "all C769 students"). The export of it carries every contact's
+# Contact id. Override per-deployment if a team renames theirs.
+SEGMENT_NAME_TEMPLATE = "all {course} students"
+
+
+def segment_name_for(course: str, template: str = SEGMENT_NAME_TEMPLATE) -> str:
+    """The expected segment name for a course (e.g. 'all C769 students')."""
+    return template.format(course=(course or "").strip())
+
+
+def list_segment_names(page: Page) -> list[str]:
+    """Visible segment names on the Segments list page (the row links)."""
+    try:
+        return [t.strip() for t in
+                page.locator('a[href*="/segments/"]').all_inner_texts()
+                if t.strip()]
+    except Exception:
+        return []
+
+
+def export_segment_csv(
+    page: Page, course: str, dest_path, *, segment_name: str = "",
+    on_status: Optional[Callable[[str], None]] = None, timeout_ms: int = 30_000,
+) -> Path:
+    """Drive Mongoose to export a department's contacts segment to a CSV.
+
+    Switches to `course`, opens the Segments list, opens the named segment's ⋯
+    menu, clicks Export, and saves the (Playwright-intercepted) download to
+    `dest_path`. `segment_name` defaults to 'all {course} students'. Returns the
+    saved Path. Raises a clear error — including the segment names that ARE
+    present — if the expected segment isn't found, so the user knows to create
+    or rename one (filter: contact id is not empty)."""
+    say = on_status or _noop
+    name = segment_name or segment_name_for(course)
+    if course:
+        switch_department(page, course)
+    page.goto(SEGMENTS_URL, wait_until="domcontentloaded")
+    # Per-row ⋯ button: aria-label is "<segment name> menu".
+    menu_btn = page.locator(
+        f'button[aria-label="{name} menu"]').filter(visible=True).first
+    try:
+        menu_btn.wait_for(state="visible", timeout=timeout_ms)
+    except PWTimeout:
+        avail = list_segment_names(page)
+        raise RuntimeError(
+            f"No Mongoose segment named {name!r} for {course or 'this dept'}. "
+            f"Segments present: {avail or '(none)'}. Create an Auto-Update "
+            "segment with that name (filter: contact id is not empty).")
+    say(f"  segment: opening {name!r} menu…")
+    menu_btn.click()
+    # The dropdown is a v-list overlay; click its Export item while capturing
+    # the download (Playwright intercepts it — there's no visible browser UI).
+    export_item = page.locator(
+        '.v-overlay-container .v-list-item, [role="menuitem"]'
+    ).filter(visible=True).filter(has_text="Export").first
+    export_item.wait_for(state="visible", timeout=timeout_ms)
+    say(f"  segment: exporting {name!r}…")
+    with page.expect_download(timeout=timeout_ms) as dl:
+        export_item.click()
+    dest = Path(dest_path)
+    dl.value.save_as(str(dest))
+    say(f"  segment: saved {dest.name}")
+    return dest

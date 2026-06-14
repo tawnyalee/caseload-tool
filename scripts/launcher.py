@@ -413,6 +413,13 @@ class BrowserWorker:
         None), schedule_name, commit."""
         self.q.put(("SEND_TEXT", payload, on_done))
 
+    def submit_export_segments(
+        self, courses: list, on_done: Callable[[dict], None],
+    ) -> None:
+        """Auto-export each course's Mongoose contacts segment to a CSV the
+        launcher joins to the caseload for Contact ids."""
+        self.q.put(("EXPORT_SEGMENTS", list(courses), on_done))
+
     def submit_mongoose_department(
         self, on_done: Callable[[dict], None],
     ) -> None:
@@ -721,6 +728,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._send_text(ctx, payload)
+            finally:
+                on_done(res)
+        elif cmd[0] == "EXPORT_SEGMENTS":
+            _, courses, on_done = cmd
+            res = {}
+            try:
+                res = self._export_segments(ctx, courses)
             finally:
                 on_done(res)
         elif cmd[0] == "MONGOOSE_DEPT":
@@ -2461,6 +2475,42 @@ class BrowserWorker:
             return {"ok": True}
         except Exception as e:
             return {"error": str(e)}
+
+    def _export_segments(self, ctx, courses: list) -> dict:
+        """Auto-export each course's Mongoose contacts segment to a CSV in the
+        config dir (the launcher then joins them to the caseload for Contact
+        ids). Opens Mongoose if needed. Returns {ok, exported:[...], errors:[...]}."""
+        page = self._mongoose_page(ctx)
+        if page is None:
+            self.on_status("Opening Mongoose…")
+            res = self._open_mongoose(ctx, focus=True)
+            if res.get("error"):
+                return {"error": f"couldn't open Mongoose: {res['error']}"}
+            page = self._mongoose_page(ctx)
+            if page is None:
+                return {"error": "Mongoose didn't open."}
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        from src import text_message as tm
+        from src.config import CASELOAD_CSV_PATH
+        dest_dir = CASELOAD_CSV_PATH.parent
+        exported, errors = [], []
+        for course in courses:
+            try:
+                dest = dest_dir / f"mongoose_{course}.csv"
+                tm.export_segment_csv(
+                    page, course, dest, on_status=self.on_status)
+                exported.append(course)
+            except Exception as e:
+                errors.append(f"{course}: {e}")
+                self.on_status(f"  segment export failed [{course}]: {e}")
+        return {"ok": True, "exported": exported, "errors": errors}
 
     def _test_text(self, ctx, mobile: str, body: str) -> dict:
         """TEMP dev: drive the Mongoose compose modal for one REAL recipient and
@@ -11076,6 +11126,14 @@ class App:
             **SECONDARY_BTN_KWARGS,
         )
         self._btn_restart_browser.pack(side="left", padx=(8, 0))
+        # Auto-export each caseload department's Mongoose contacts segment and
+        # refresh the StudentID -> Contact id map (no manual CSV copying).
+        self._btn_sync_ids = ctk.CTkButton(
+            toggle_frame, text="⬇ Texting IDs",
+            width=120, command=self._sync_contact_ids,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_sync_ids.pack(side="left", padx=(8, 0))
         # Discovery: capture Salesforce's note-submission network
         # traffic so we can later replay it via REST API instead of
         # driving the UI. One-click toggle; on stop, writes the
@@ -13781,6 +13839,67 @@ class App:
                      if (added or changed) else "")
             self._append_log(
                 f"Contact ids: {n} student(s) mapped{src}{extra}.")
+
+    def _distinct_courses(self, rows) -> list:
+        """Distinct normalized course codes (e.g. 'C769') across caseload rows,
+        in first-seen order — the departments to export Mongoose segments for."""
+        try:
+            from src.student_lookup import COURSE_CODE_RE
+        except Exception:
+            COURSE_CODE_RE = None
+        seen: list = []
+        for r in (rows or []):
+            c = (r.get("CourseCode") or "").strip()
+            if COURSE_CODE_RE is not None:
+                m = COURSE_CODE_RE.match(c)
+                if m:
+                    c = m.group(1)
+            if c and c not in seen:
+                seen.append(c)
+        return seen
+
+    def _sync_contact_ids(self) -> None:
+        """Auto-export each caseload department's Mongoose contacts segment, then
+        refresh the Contact-id map — no manual CSV copying. Drives Mongoose on
+        the worker (switches departments, ⋯ → Export, captures each download)."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Sync Contact IDs: browser not ready yet.",
+                             error=True)
+            return
+        rows = self._caseload_rows or []
+        courses = self._distinct_courses(rows)
+        if not courses:
+            self._append_log(
+                "Sync Contact IDs: no caseload course codes to export.",
+                error=True)
+            return
+        self._append_log(
+            f"Syncing Contact IDs from Mongoose ({', '.join(courses)})… "
+            "this switches departments + exports each segment.")
+        self._lock_browser_for_run()
+
+        def on_done(res):
+            def finish():
+                self._unlock_browser_after_run()
+                if not res or res.get("error"):
+                    self._append_log(
+                        f"Sync Contact IDs failed: {(res or {}).get('error')}",
+                        error=True)
+                    return
+                for e in (res.get("errors") or []):
+                    self._append_log(f"  segment: {e}", error=True)
+                exp = res.get("exported") or []
+                self._append_log(
+                    f"Exported {len(exp)} segment(s): "
+                    f"{', '.join(exp) or '(none)'}.")
+                # Re-join the freshly-downloaded exports to the caseload.
+                self._refresh_contact_ids(self._caseload_rows or [])
+            try:
+                self.root.after(0, finish)
+            except Exception:
+                finish()
+
+        self.worker.submit_export_segments(courses, on_done)
 
     def _text_term_for(self, student_id: str, mobile: str) -> str:
         """Recipient search term for Mongoose: the student's Contact id if we
