@@ -16408,6 +16408,9 @@ class App:
 
         def on_done(_res):
             def apply():
+                # A scrape in flight when we restarted won't report back — clear
+                # its flag so firing isn't blocked forever.
+                self._task_scrape_running = False
                 self._set_idle()
                 self._append_log("Browser restarted — ready.")
             try:
