@@ -360,7 +360,20 @@ def select_inbox(page: Page, inbox_label: str, *, timeout_ms: int = 6_000) -> No
 
 
 def _recipient_box(page: Page):
-    """Locator for the compose recipient search input."""
+    """Locator for the compose recipient search input. Find it by its container
+    (the Send-to-Contacts combobox), NOT by placeholder/label: once a recipient
+    chip is added the floating label changes, so the placeholder/label locator
+    stops matching and adding a 2nd+ recipient would hang. The bare text input
+    inside the field persists across chips."""
+    for sel in (
+        ".send-to-contacts input[type='text']",
+        ".send-to-contacts .v-field__input input",
+        ".v-autocomplete input[type='text']",
+    ):
+        loc = page.locator(sel).filter(visible=True)
+        if loc.count() > 0:
+            return loc.first
+    # Last resort: the original placeholder/label approach (first recipient).
     box = page.get_by_placeholder("Search by First, Last, ID, or Mobile")
     if box.count() == 0:
         box = page.get_by_label("Search by First, Last, ID, or Mobile")
