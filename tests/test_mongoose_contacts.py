@@ -104,6 +104,26 @@ def test_case_insensitive_name():
         "S5": "0033x000038J2X6CCM"}
 
 
+def test_join_loose_name_middle_name():
+    # Caseload has a middle name + a different (blank) mobile; exact full-name
+    # match fails but the first+last-word loose match should catch it.
+    contacts = load_contacts(_p := _write(SAMPLE))
+    os.remove(_p)
+    caseload = [{"StudentID": "S6", "Name": "Marquiece Allen Sims",
+                 "MobilePhone": ""}]
+    assert build_contact_id_map(caseload, contacts) == {
+        "S6": "0033x000038J2X4AAK"}
+
+
+def test_loose_name_skips_ambiguous():
+    # "Dup Name" appears twice -> loose match must NOT bind it either.
+    contacts = load_contacts(_p := _write(SAMPLE))
+    os.remove(_p)
+    caseload = [{"StudentID": "S7", "Name": "Dup Middle Name",
+                 "MobilePhone": ""}]
+    assert build_contact_id_map(caseload, contacts) == {}
+
+
 def test_persist_and_load_roundtrip():
     from src.mongoose_contacts import load_contact_ids, persist_contact_ids
     fd, db = tempfile.mkstemp(suffix=".db")

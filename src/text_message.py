@@ -122,6 +122,8 @@ class ScheduleSlot:
     ampm: str                  # "AM" / "PM"
     student_local_str: str     # e.g. "10:00 AM MDT" — for display/confirmation
     clamped: bool = False      # True if we bumped into the allowed window
+    day_label: str = ""        # "Today" / "Tomorrow" / "Fri 06/12" (team tz)
+    team_str: str = ""         # e.g. "4:05 PM EDT" — the actual Mongoose send time
 
 
 def compute_schedule_slot(
@@ -184,6 +186,14 @@ def compute_schedule_slot(
         )
         clamped = True
 
+    today = now.date()
+    if team_dt.date() == today:
+        day_label = "Today"
+    elif team_dt.date() == today + timedelta(days=1):
+        day_label = "Tomorrow"
+    else:
+        day_label = team_dt.strftime("%a %m/%d")
+
     return ScheduleSlot(
         team_dt=team_dt,
         date_str=team_dt.strftime("%m/%d/%Y"),
@@ -192,6 +202,8 @@ def compute_schedule_slot(
         ampm=team_dt.strftime("%p"),
         student_local_str=send_local.strftime("%I:%M %p %Z").lstrip("0"),
         clamped=clamped,
+        day_label=day_label,
+        team_str=team_dt.strftime("%I:%M %p %Z").lstrip("0"),
     )
 
 

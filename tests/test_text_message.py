@@ -67,6 +67,7 @@ def test_schedule_asap_within_window():
         "EST", team, window_start_hour=10, window_end_hour=16, now=now)
     assert (slot.hour12, slot.minute, slot.ampm) == (3, 55, "PM"), slot
     assert slot.date_str == "06/11/2026", slot.date_str
+    assert slot.day_label == "Today", slot.day_label
 
 
 def test_schedule_before_window_uses_start():
@@ -87,6 +88,7 @@ def test_schedule_after_window_rolls_tomorrow():
         "EST", team, window_start_hour=10, window_end_hour=16, now=now)
     assert (slot.hour12, slot.minute, slot.ampm) == (10, 0, "AM"), slot
     assert slot.date_str == "06/12/2026", slot.date_str
+    assert slot.day_label == "Tomorrow", slot.day_label
 
 
 def test_schedule_lead_time_can_push_past_window_end():

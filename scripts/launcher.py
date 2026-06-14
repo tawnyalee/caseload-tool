@@ -13954,6 +13954,23 @@ class App:
                      if (added or changed) else "")
             self._append_log(
                 f"Contact ids: {n} student(s) mapped{src}{extra}.")
+            # Surface opted-in students with no Contact id — they'll fall back
+            # to the caseload phone (which Mongoose may not recognize). Only
+            # worth flagging when we actually loaded an export this pass.
+            if exports:
+                unmatched = [
+                    (r.get("Name") or "").strip()
+                    for r in (rows or [])
+                    if self._texting_opted_in(r)
+                    and (r.get("StudentID") or "").strip() not in merged]
+                if unmatched:
+                    shown = ", ".join(unmatched[:8])
+                    more = (f" +{len(unmatched) - 8} more"
+                            if len(unmatched) > 8 else "")
+                    self._append_log(
+                        f"  ↳ {len(unmatched)} opted-in student(s) not matched "
+                        f"to a Contact id (texts use their caseload phone): "
+                        f"{shown}{more}.")
 
     def _distinct_courses(self, rows) -> list:
         """Distinct normalized course codes (e.g. 'C769') across caseload rows,
@@ -14217,6 +14234,7 @@ class App:
                 "date_str": slot.date_str, "hour12": slot.hour12,
                 "minute": slot.minute, "ampm": slot.ampm,
                 "student_local_str": slot.student_local_str,
+                "day_label": slot.day_label, "team_str": slot.team_str,
             }
             sched_name = (f"{variables['course_code']} "
                           f"{variables['first_name']}").strip() or "Scheduled text"
@@ -14227,11 +14245,17 @@ class App:
         # touch the Mongoose UI.
         scheduled = sch_payload is not None
         if not tcfg.commit:
-            when_str = (f"{sch_payload['student_local_str']} (student-local)"
-                        if scheduled else "now")
+            when_str = (
+                f"{sch_payload['day_label']}, {sch_payload['student_local_str']} "
+                "(student-local)" if scheduled else "now")
+            # Recipient line: make clear the Contact id is the search key when
+            # we have one (the phone, if any, is just informational).
+            if via_id:
+                recip = f"Contact id{f' (mobile {mobile})' if mobile else ''}"
+            else:
+                recip = mobile
             edited = prompt_text_review(
-                self.root, who=who,
-                mobile=(mobile or "via Contact id" if via_id else mobile),
+                self.root, who=who, mobile=recip,
                 inbox_label=inbox_label,
                 when_str=when_str, body=body, char_limit=tm.MAX_SMS_LEN,
                 scheduled=scheduled)
@@ -14518,10 +14542,15 @@ class App:
         self._review_and_send_texts(scenario, groups, skipped)
 
     def _build_text_review_groups(self, scenario, matched, prompt_vars):
-        """Group matched students by (inbox, timezone) for batch texting and
-        render the shared (generic) message + schedule per group. Returns
-        (review_groups, skipped_names); review_groups is None on a template-load
-        error, [] if no opted-in students. Logs the not-opted-in count."""
+        """Group matched students for batch texting and render the shared
+        (generic) message + schedule per group. Students are grouped by (inbox,
+        absolute send instant) — so when their ASAP-within-window times coincide
+        across timezones (the common case for a wide window fired mid-day), they
+        share ONE Mongoose compose instead of one-per-timezone (fewer, faster
+        sends). The single team-tz time still delivers to each student at their
+        own correct local time. Returns (review_groups, skipped_names);
+        review_groups is None on a template-load error, [] if no opted-in
+        students. Logs the not-opted-in count."""
         from src import text_message as tm
         tcfg = scenario.text
         body_tmpl = tcfg.body
@@ -14555,16 +14584,27 @@ class App:
             # mobile. A member is textable iff it has a term.
             term = self._text_term_for(rv.get("student_id", ""),
                                        row.get("MobilePhone") or "")
-            key = (inbox_label, tz)
+            # Compute each student's send time, then group by the ABSOLUTE
+            # instant (+ inbox) so coincident times across timezones merge into
+            # one compose. The same team-tz instant delivers to each student at
+            # their own correct local time.
+            slot = tm.compute_schedule_slot(
+                tz, self.TEAM_IANA,
+                window_start_hour=tcfg.window_start_hour,
+                window_end_hour=tcfg.window_end_hour)
+            sig = ((slot.date_str, slot.hour12, slot.minute, slot.ampm)
+                   if slot is not None else ("unknown",))
+            key = (inbox_label, sig)
             g = groups.get(key)
             if g is None:
-                g = {"inbox_label": inbox_label, "tz": tz, "course": course,
-                     "members": [], "defaulted": 0}
+                g = {"inbox_label": inbox_label, "course": course, "slot": slot,
+                     "members": [], "defaulted": 0, "tzs": set()}
                 groups[key] = g
                 order.append(key)
             g["members"].append({
                 "name": name, "mobile": mobile, "term": term,
                 "via_id": tm.looks_like_sfid(term)})
+            g["tzs"].add(tz)
             if raw_tz not in tm.TZ_ABBR_TO_IANA:
                 g["defaulted"] += 1
         if skipped_names:
@@ -14578,23 +14618,27 @@ class App:
             gvars.update(prompt_vars)
             body = tm.render_message(body_tmpl, gvars)
             issues: list = []
-            # Texts are always scheduled: ASAP within the action's window, per
-            # the group's timezone (one absolute send time for the whole group).
-            when_str, sch_payload, sched_name = "now", None, ""
-            slot = tm.compute_schedule_slot(
-                g["tz"], self.TEAM_IANA,
-                window_start_hour=tcfg.window_start_hour,
-                window_end_hour=tcfg.window_end_hour)
+            slot = g["slot"]
+            tzs = sorted(t for t in g["tzs"] if t)
+            zone_note = (f"{len(tzs)} zones" if len(tzs) > 1
+                         else (tzs[0] if tzs else "tz?"))
             if slot is None:
-                issues.append(f"unknown tz {g['tz']!r}")
+                when_str, sch_payload, sched_name = "unknown time", None, ""
+                issues.append("unknown timezone")
+                label = f"{g['inbox_label'] or 'inbox?'}  ·  {zone_note}"
             else:
-                when_str = f"{slot.student_local_str} (local)"
+                # Group may span timezones, so show the actual (team-tz) send
+                # time + the day — unambiguous for the whole group.
+                when_str = f"{slot.day_label}, {slot.team_str}"
                 sch_payload = {
                     "date_str": slot.date_str, "hour12": slot.hour12,
                     "minute": slot.minute, "ampm": slot.ampm,
                     "student_local_str": slot.student_local_str,
+                    "day_label": slot.day_label, "team_str": slot.team_str,
                 }
                 sched_name = f"{g['course']} batch".strip() or "Scheduled text"
+                label = (f"{g['inbox_label'] or 'inbox?'}  ·  "
+                         f"{slot.day_label} {slot.team_str}  ·  {zone_note}")
             if g.get("defaulted"):
                 issues.append(
                     f"{g['defaulted']} had no timezone — scheduled as MT")
@@ -14612,7 +14656,7 @@ class App:
             if "{{" in body and "}}" in body:
                 issues.append("unresolved {{variable}} - batch isn't personalized")
             review_groups.append({
-                "label": f"{g['inbox_label'] or 'inbox?'}  ·  {g['tz'] or 'tz?'}",
+                "label": label,
                 "course_code": g["course"], "when_str": when_str, "body": body,
                 "issues": issues, "inbox_label": g["inbox_label"],
                 "schedule": sch_payload, "schedule_name": sched_name,

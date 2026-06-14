@@ -66,6 +66,25 @@ def _full_name(first: str, last: str) -> str:
     return f"{first} {last}".strip().lower()
 
 
+def _loose_name(first: str, last: str) -> str:
+    """First word of the first name + last word of the last name, lowercased —
+    a forgiving key that survives middle names, suffixes, and extra spaces
+    (e.g. 'Mary Jane' / 'Smith Jr' -> 'mary smith'). '' if either side empty."""
+    fw = (first or "").split()
+    lw = (last or "").split()
+    if not fw or not lw:
+        return ""
+    return f"{fw[0]} {lw[-1]}".lower()
+
+
+def _loose_name_from_full(name: str) -> str:
+    """Loose key from a single 'First [Middle...] Last' caseload name."""
+    words = (name or "").split()
+    if len(words) < 2:
+        return ""
+    return f"{words[0]} {words[-1]}".lower()
+
+
 def build_contact_id_map(
     caseload_rows: list[dict], contacts: list[dict], *,
     include_opted_out: bool = False,
@@ -78,7 +97,9 @@ def build_contact_id_map(
     usable = [c for c in contacts if include_opted_out or not c["opted_out"]]
     by_mobile: dict[str, dict] = {}
     by_name: dict[str, dict] = {}
+    by_loose: dict[str, dict] = {}
     name_counts: dict[str, int] = {}
+    loose_counts: dict[str, int] = {}
     for c in usable:
         if c["mobile"]:
             by_mobile.setdefault(c["mobile"], c)
@@ -86,6 +107,10 @@ def build_contact_id_map(
         if nm:
             name_counts[nm] = name_counts.get(nm, 0) + 1
             by_name.setdefault(nm, c)
+        lk = _loose_name(c["first"], c["last"])
+        if lk:
+            loose_counts[lk] = loose_counts.get(lk, 0) + 1
+            by_loose.setdefault(lk, c)
 
     out: dict[str, str] = {}
     for row in caseload_rows:
@@ -94,10 +119,16 @@ def build_contact_id_map(
             continue
         mob = normalize_phone(row.get("MobilePhone") or "")
         match = by_mobile.get(mob) if mob else None
+        name = (row.get("Name") or "").strip()
         if match is None:
-            nm = (row.get("Name") or "").strip().lower()
+            nm = name.lower()
             if nm and name_counts.get(nm, 0) == 1:
                 match = by_name.get(nm)
+        if match is None:
+            # Forgiving fallback: first+last word, only if unambiguous.
+            lk = _loose_name_from_full(name)
+            if lk and loose_counts.get(lk, 0) == 1:
+                match = by_loose.get(lk)
         if match:
             out[sid] = match["contact_id"]
     return out
