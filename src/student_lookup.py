@@ -336,6 +336,42 @@ def _parse_task_cell(cls: str, title: str):
                   "date": date, "attempts": attempts}
 
 
+def read_caseload_row_ids(table) -> dict:
+    """Map Student ID -> {rowkey, contact_id} for each loaded caseload row, to
+    capture each student's Salesforce record id during the bulk scroll-load.
+    `rowkey` = Lightning's data-row-key-value attr on the <tr>; `contact_id` =
+    a 003... id pulled from any /Contact/ link in the row. Either may be '' if
+    the list doesn't expose it. Pass an already scroll-loaded table locator."""
+    rows = table.evaluate(
+        r'''(tbl) => {
+          const out = [];
+          for (const r of tbl.querySelectorAll('tr')) {
+            let sid = '';
+            for (const td of r.querySelectorAll('td')) {
+              const t = (td.textContent || '').trim();
+              if (/^\d{9,10}$/.test(t)) { sid = t; break; }
+            }
+            if (!sid) continue;
+            const rowkey = (r.getAttribute('data-row-key-value') || '');
+            let cid = '';
+            for (const a of r.querySelectorAll('a[href]')) {
+              const m = (a.getAttribute('href') || '').match(/(003[0-9A-Za-z]{12,15})/);
+              if (m) { cid = m[1]; break; }
+            }
+            out.push({sid, rowkey, cid});
+          }
+          return out;
+        }'''
+    )
+    result: dict = {}
+    for row in rows or []:
+        sid = row.get("sid")
+        if sid:
+            result[sid] = {"rowkey": row.get("rowkey", ""),
+                           "contact_id": row.get("cid", "")}
+    return result
+
+
 def read_loaded_task_status(table) -> dict:
     """Bulk per-task pass/fail for the WHOLE caseload, keyed by Student ID.
 
