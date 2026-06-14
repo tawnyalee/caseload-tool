@@ -347,6 +347,39 @@ def select_inbox(page: Page, inbox_label: str, *, timeout_ms: int = 6_000) -> No
     match.first.click()
 
 
+def _recipient_box(page: Page):
+    """Locator for the compose recipient search input."""
+    box = page.get_by_placeholder("Search by First, Last, ID, or Mobile")
+    if box.count() == 0:
+        box = page.get_by_label("Search by First, Last, ID, or Mobile")
+    return box.filter(visible=True).first
+
+
+def open_compose_to_recipient_step(
+    page: Page, inbox_label: str, say: Callable[[str], None], *, attempts: int = 2,
+) -> None:
+    """Open Compose, select the inbox, and wait until the recipient search box
+    is visible. The FIRST compose of a session often doesn't engage (the
+    renderer needs a warm-up action), so retry once after closing the modal —
+    the retry reliably reaches the recipient step."""
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            open_compose(page)              # closes any leftover modal first
+            select_inbox(page, inbox_label)
+            _recipient_box(page).wait_for(state="visible", timeout=12_000)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt + 1 < attempts:
+                say("  text: compose didn't engage; retrying…")
+                close_compose(page)
+                page.wait_for_timeout(700)
+    raise RuntimeError(
+        "compose modal didn't reach the recipient step after "
+        f"{attempts} tries ({last_err}).")
+
+
 def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
     """Type a (normalized) mobile number into the recipient search and click the
     first matching result. Returns True if a result was added. The caller should
@@ -354,19 +387,7 @@ def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
     term = normalize_phone(mobile) or (mobile or "").strip()
     if not term:
         return False
-    box = page.get_by_placeholder("Search by First, Last, ID, or Mobile")
-    if box.count() == 0:
-        box = page.get_by_label("Search by First, Last, ID, or Mobile")
-    box = box.filter(visible=True).first
-    # The recipient box lives on the compose step; if it never shows, the modal
-    # is stuck on an earlier step — fail fast + clearly instead of a 30s click
-    # timeout.
-    try:
-        box.wait_for(state="visible", timeout=12_000)
-    except PWTimeout:
-        raise RuntimeError(
-            "recipient search box didn't appear — the compose modal didn't "
-            "reach the recipient step (inbox not selected / page still loading).")
+    box = _recipient_box(page)
     box.click()
     box.fill(term)
     # Results render in an overlay listbox of .v-list-item options.
@@ -439,8 +460,9 @@ def send_text(
     # frozen/backgrounded renderer.
     if msg.course:
         switch_department(page, msg.course)
-    open_compose(page)
-    select_inbox(page, msg.inbox_label)
+    # Open Compose + select the inbox, retrying once if it doesn't reach the
+    # recipient step (the first compose of a session is flaky — warm-up).
+    open_compose_to_recipient_step(page, msg.inbox_label, say)
 
     added = 0
     for raw in msg.recipients_mobile:
