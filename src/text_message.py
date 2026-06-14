@@ -48,6 +48,18 @@ TZ_ABBR_TO_IANA = {
     "ChS": "Pacific/Guam", "ChST": "Pacific/Guam",  # Chamorro — no DST
 }
 
+# Fallback timezone for students with a blank/unrecognized Timezone — schedule
+# them as Mountain rather than skipping (user's call: MT is the safe default).
+DEFAULT_TZ_ABBR = "MST"
+
+
+def effective_tz(tz_abbr: str) -> str:
+    """The student's tz abbreviation if recognized, else the MT default — so a
+    student with no/unknown Timezone still gets scheduled (treated as Mountain)."""
+    tz = (tz_abbr or "").strip()
+    return tz if tz in TZ_ABBR_TO_IANA else DEFAULT_TZ_ABBR
+
+
 # The Mongoose compose textarea caps the body (maxlength="306" in the DOM).
 MAX_SMS_LEN = 306
 

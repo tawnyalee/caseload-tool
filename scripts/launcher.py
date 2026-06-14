@@ -13748,13 +13748,17 @@ class App:
         sch_payload = None
         sched_name = ""
         if tcfg.schedule:
-            tzc = (row.get("Timezone") if row else "") or ""
+            raw_tz = (row.get("Timezone") if row else "") or ""
+            tzc = tm.effective_tz(raw_tz)  # blank/unknown -> MT default
+            if raw_tz.strip() not in tm.TZ_ABBR_TO_IANA:
+                self._append_log(
+                    f"Text: no timezone for {who} — scheduling as MT.")
             slot = tm.compute_schedule_slot(
                 tzc, self.TEAM_IANA, target_hour=tcfg.target_hour)
             if slot is None:
                 self._append_log(
-                    f"Text: unknown timezone {tzc!r} for {who}; can't schedule "
-                    "(set a Timezone, or set schedule:false).", error=True)
+                    f"Text: couldn't compute a schedule time for {who}; not "
+                    "sent.", error=True)
                 return False
             sch_payload = {
                 "date_str": slot.date_str, "hour12": slot.hour12,
@@ -14089,16 +14093,19 @@ class App:
             course = rv["course_code"]
             inbox_label = tcfg.inbox_label or (
                 f"{course} Inbox" if course else "")
-            tz = (row.get("Timezone") or "").strip()
+            raw_tz = (row.get("Timezone") or "").strip()
+            tz = tm.effective_tz(raw_tz)  # blank/unknown -> MT default
             mobile = tm.normalize_phone(row.get("MobilePhone") or "")
             key = (inbox_label, tz)
             g = groups.get(key)
             if g is None:
                 g = {"inbox_label": inbox_label, "tz": tz, "course": course,
-                     "members": []}
+                     "members": [], "defaulted": 0}
                 groups[key] = g
                 order.append(key)
             g["members"].append({"name": name, "mobile": mobile})
+            if raw_tz not in tm.TZ_ABBR_TO_IANA:
+                g["defaulted"] += 1
         if skipped_names:
             self._append_log(
                 f"Batch text: {len(skipped_names)} student(s) not opted in "
@@ -14124,6 +14131,9 @@ class App:
                         "student_local_str": slot.student_local_str,
                     }
                     sched_name = f"{g['course']} batch".strip() or "Scheduled text"
+            if g.get("defaulted"):
+                issues.append(
+                    f"{g['defaulted']} had no timezone — scheduled as MT")
             n_mobile = sum(1 for m in g["members"] if m["mobile"])
             n_no_mobile = len(g["members"]) - n_mobile
             if n_mobile == 0:
