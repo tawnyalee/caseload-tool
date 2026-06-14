@@ -2313,25 +2313,6 @@ class BrowserWorker:
             by_sid = read_loaded_task_status(table)
         except Exception as e:
             return {"error": f"bulk task read failed: {e}"}
-        # GO/NO-GO diagnostic: can we harvest each student's Salesforce id from
-        # the loaded list rows (for caching a StudentID->SF-id map)? Log a few
-        # samples so we can see whether data-row-key-value / a Contact link
-        # carries the 003... id. (Best-effort; never fails the scrape.)
-        try:
-            from src.student_lookup import read_caseload_row_ids
-            ids = read_caseload_row_ids(table)
-            n_rowkey = sum(1 for v in ids.values() if v.get("rowkey"))
-            n_cid = sum(1 for v in ids.values() if v.get("contact_id"))
-            self.on_status(
-                f"  [sf-id probe] {len(ids)} rows: rowkey on {n_rowkey}, "
-                f"contact-link 003 on {n_cid}")
-            for sid, v in list(ids.items())[:3]:
-                self.on_status(
-                    f"  [sf-id probe] sid {sid} -> rowkey={v.get('rowkey')!r} "
-                    f"contact_id={v.get('contact_id')!r} "
-                    f"hrefs={v.get('hrefs')}")
-        except Exception as e:
-            self.on_status(f"  [sf-id probe] failed: {e}")
         return {"by_sid": by_sid, "count": len(by_sid)}
 
     MONGOOSE_DASHBOARD_URL = "https://sms.mongooseresearch.com/legacy-dashboard"

@@ -336,60 +336,6 @@ def _parse_task_cell(cls: str, title: str):
                   "date": date, "attempts": attempts}
 
 
-def read_caseload_row_ids(table) -> dict:
-    """Map Student ID -> {rowkey, contact_id} for each loaded caseload row, to
-    capture each student's Salesforce record id during the bulk scroll-load.
-    `rowkey` = Lightning's data-row-key-value attr on the <tr>; `contact_id` =
-    a 003... id pulled from any /Contact/ link in the row. Either may be '' if
-    the list doesn't expose it. Pass an already scroll-loaded table locator."""
-    rows = table.evaluate(
-        r'''(tbl) => {
-          const RE = /(003[0-9A-Za-z]{12,15})/;
-          // Deep walk a subtree INCLUDING shadow roots: find a 003 id in any
-          // attribute, and sample the first few href values seen.
-          function scan(root){
-            let cid = ''; const hrefs = [];
-            const stack = [root];
-            while (stack.length) {
-              const el = stack.pop();
-              if (!el || el.nodeType !== 1) continue;
-              if (el.attributes) {
-                for (const a of el.attributes) {
-                  const v = a.value || '';
-                  if (!cid) { const m = v.match(RE); if (m) cid = m[1]; }
-                  if (a.name === 'href' && hrefs.length < 5) hrefs.push(v.slice(0, 90));
-                }
-              }
-              if (el.shadowRoot) for (const c of el.shadowRoot.children) stack.push(c);
-              for (const c of el.children) stack.push(c);
-            }
-            return {cid, hrefs};
-          }
-          const out = [];
-          for (const r of tbl.querySelectorAll('tr')) {
-            let sid = '';
-            for (const td of r.querySelectorAll('td')) {
-              const t = (td.textContent || '').trim();
-              if (/^\d{9,10}$/.test(t)) { sid = t; break; }
-            }
-            if (!sid) continue;
-            const s = scan(r);
-            out.push({sid, rowkey: r.getAttribute('data-row-key-value') || '',
-                      cid: s.cid, hrefs: s.hrefs});
-          }
-          return out;
-        }'''
-    )
-    result: dict = {}
-    for row in rows or []:
-        sid = row.get("sid")
-        if sid:
-            result[sid] = {"rowkey": row.get("rowkey", ""),
-                           "contact_id": row.get("cid", ""),
-                           "hrefs": row.get("hrefs", [])}
-    return result
-
-
 def read_loaded_task_status(table) -> dict:
     """Bulk per-task pass/fail for the WHOLE caseload, keyed by Student ID.
 
