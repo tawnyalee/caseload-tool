@@ -260,6 +260,10 @@ class BrowserWorker:
         # actual progress messages.
         self._mailto_diag_logged = False
         self._contact_card_diag_logged = False
+        # Whether the Mongoose compose has been "warmed up" this browser session
+        # (the first compose of a cold/backgrounded tab is flaky). Reset whenever
+        # a fresh Mongoose tab is opened.
+        self._mongoose_warmed = False
         self.ready_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -2340,6 +2344,7 @@ class BrowserWorker:
                 continue
         try:
             page = ctx.new_page()
+            self._mongoose_warmed = False  # fresh tab — compose needs warming
             page.goto(self.MONGOOSE_DASHBOARD_URL, wait_until="domcontentloaded")
             if focus:
                 try:
@@ -2412,6 +2417,14 @@ class BrowserWorker:
         except Exception:
             pass
         from src import text_message as tm
+        # The first compose of a session is flaky (cold renderer); warm it once
+        # with a throwaway open/search/close so the first real group goes through.
+        if not self._mongoose_warmed:
+            try:
+                tm.warm_up_compose(page)
+            except Exception:
+                pass
+            self._mongoose_warmed = True
         sch = payload.get("schedule")
         slot = None
         if sch:

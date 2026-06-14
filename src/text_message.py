@@ -355,6 +355,32 @@ def _recipient_box(page: Page):
     return box.filter(visible=True).first
 
 
+def warm_up_compose(page: Page) -> None:
+    """One throwaway open → (select first inbox) → type a dummy search → close,
+    to wake the renderer. The FIRST compose of a session is unreliable (the
+    recipient step / autocomplete don't engage on a cold/backgrounded tab); a
+    Playwright-driven dry run warms it so the first REAL group goes through.
+    Fully best-effort — all errors are swallowed."""
+    try:
+        open_compose(page)
+        try:
+            select_inbox(page, "")            # first/only inbox, no match needed
+            box = _recipient_box(page)
+            box.wait_for(state="visible", timeout=8_000)
+            box.click()
+            box.press_sequentially("0000", delay=15)  # fire the autocomplete once
+            page.wait_for_timeout(600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        try:
+            close_compose(page)
+        except Exception:
+            pass
+
+
 def open_compose_to_recipient_step(
     page: Page, inbox_label: str, say: Callable[[str], None], *, attempts: int = 2,
 ) -> None:
