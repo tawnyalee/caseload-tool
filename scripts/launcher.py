@@ -17297,13 +17297,20 @@ class App:
                 # worker is free. (on_complete deliberately NOT fired here; it
                 # only matters at startup, which never interrupts.)
                 if res and res.get("interrupted"):
+                    # Resume ONLY once the app is idle. Resuming mid-batch made
+                    # the scrape's Salesforce navigation keep backgrounding the
+                    # Mongoose tab between groups (re-freezing it -> cold composes
+                    # fail) and thrash the worker. So wait out the running action.
                     self._append_log(
-                        "Task pass/fail scan paused for your action — resuming…")
+                        "Task pass/fail scan paused — will finish when idle.")
+
+                    def _resume_when_idle():
+                        if getattr(self, "_is_busy", False):
+                            self.root.after(2000, _resume_when_idle)
+                        else:
+                            self.worker.submit_scrape_all_task_status(on_done)
                     try:
-                        self.root.after(
-                            1500,
-                            lambda: self.worker.submit_scrape_all_task_status(
-                                on_done))
+                        self.root.after(2000, _resume_when_idle)
                     except Exception:
                         pass
                     return
