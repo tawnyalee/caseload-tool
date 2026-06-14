@@ -589,6 +589,21 @@ SEGMENTS_URL = "https://sms.mongooseresearch.com/segments"
 SEGMENT_NAME_TEMPLATE = "all {course} students"
 
 
+class SegmentNotFound(RuntimeError):
+    """The expected per-department segment isn't in the Segments list — the user
+    needs to create it. Carries the course, the expected name, and the segment
+    names that ARE present so the UI can show actionable instructions."""
+
+    def __init__(self, course: str, segment_name: str, available: list):
+        self.course = course
+        self.segment_name = segment_name
+        self.available = available or []
+        super().__init__(
+            f"No Mongoose segment named {segment_name!r} for "
+            f"{course or 'this dept'}. Segments present: "
+            f"{self.available or '(none)'}.")
+
+
 def segment_name_for(course: str, template: str = SEGMENT_NAME_TEMPLATE) -> str:
     """The expected segment name for a course (e.g. 'all C769 students')."""
     return template.format(course=(course or "").strip())
@@ -627,11 +642,7 @@ def export_segment_csv(
     try:
         menu_btn.wait_for(state="visible", timeout=timeout_ms)
     except PWTimeout:
-        avail = list_segment_names(page)
-        raise RuntimeError(
-            f"No Mongoose segment named {name!r} for {course or 'this dept'}. "
-            f"Segments present: {avail or '(none)'}. Create an Auto-Update "
-            "segment with that name (filter: contact id is not empty).")
+        raise SegmentNotFound(course, name, list_segment_names(page))
     say(f"  segment: opening {name!r} menu…")
     menu_btn.click()
     # The dropdown is a v-list overlay; click its Export item while capturing

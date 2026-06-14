@@ -2500,17 +2500,25 @@ class BrowserWorker:
         from src import text_message as tm
         from src.config import CASELOAD_CSV_PATH
         dest_dir = CASELOAD_CSV_PATH.parent
-        exported, errors = [], []
+        exported, missing, errors = [], [], []
         for course in courses:
             try:
                 dest = dest_dir / f"mongoose_{course}.csv"
                 tm.export_segment_csv(
                     page, course, dest, on_status=self.on_status)
                 exported.append(course)
+            except tm.SegmentNotFound as e:
+                # Setup gap, not a failure: the user must create this segment.
+                missing.append({"course": e.course,
+                                "segment_name": e.segment_name,
+                                "available": e.available})
+                self.on_status(f"  segment: none named {e.segment_name!r} "
+                               f"in {course} yet.")
             except Exception as e:
                 errors.append(f"{course}: {e}")
                 self.on_status(f"  segment export failed [{course}]: {e}")
-        return {"ok": True, "exported": exported, "errors": errors}
+        return {"ok": True, "exported": exported, "missing": missing,
+                "errors": errors}
 
     def _test_text(self, ctx, mobile: str, body: str) -> dict:
         """TEMP dev: drive the Mongoose compose modal for one REAL recipient and
@@ -6112,6 +6120,102 @@ def _configure_email_preview_tags(text_widget) -> None:
         background="#cc0000",
         font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
     )
+
+
+def prompt_segment_setup(parent, missing: list) -> bool:
+    """Modal with step-by-step instructions to create the missing Mongoose
+    contacts segment(s) — one per caseload department that has none yet. The
+    exact segment name(s) are shown in a read-only box to copy verbatim (the
+    auto-export matches the name exactly). Returns True if the user clicked
+    'Re-check now' (the caller then re-runs the sync)."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Texting IDs — create Mongoose segment(s)")
+    dialog.geometry("640x560")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
+    result = {"recheck": False}
+
+    ctk.CTkLabel(
+        dialog,
+        text=f"{len(missing)} department(s) need a contacts segment",
+        font=ctk.CTkFont(size=15, weight="bold"), anchor="w",
+    ).pack(fill="x", padx=16, pady=(14, 2))
+    ctk.CTkLabel(
+        dialog, anchor="w", justify="left", wraplength=600,
+        text=("These caseload departments have no Mongoose segment yet, so "
+              "their students can't be mapped to a Salesforce Contact id. "
+              "Create one per department (one-time) — then texting can reach "
+              "students even when their caseload mobile is blank."),
+        font=ctk.CTkFont(size=12),
+    ).pack(fill="x", padx=16, pady=(0, 8))
+
+    steps = (
+        "In Mongoose, for EACH department below:\n"
+        "  1.  Switch to that department (top-left department selector).\n"
+        "  2.  Tools → Segments → New Segment.\n"
+        "  3.  Add a filter:   Contact ID   →   is not empty\n"
+        "        (REQUIRED — this is what makes the list complete: every\n"
+        "         student who has a Contact id is included.)\n"
+        "  4.  Name the segment EXACTLY as shown below (copy it).\n"
+        "  5.  Save.\n"
+        "Then click “Re-check now”."
+    )
+    ctk.CTkLabel(
+        dialog, text=steps, anchor="w", justify="left",
+        font=ctk.CTkFont(size=12),
+    ).pack(fill="x", padx=16, pady=(0, 8))
+
+    ctk.CTkLabel(
+        dialog, text="Exact segment name(s) to create:", anchor="w",
+        font=ctk.CTkFont(size=12, weight="bold"),
+    ).pack(fill="x", padx=16, pady=(0, 2))
+    names = "\n".join(m["segment_name"] for m in missing)
+    name_box = ctk.CTkTextbox(dialog, height=max(40, 22 * len(missing)),
+                              wrap="none", font=ctk.CTkFont(size=13))
+    name_box.pack(fill="x", padx=16, pady=(0, 8))
+    name_box.insert("1.0", names)
+    name_box.configure(state="disabled")
+
+    # Show what each department currently has (helps spot a near-miss name).
+    have = []
+    for m in missing:
+        present = m.get("available") or []
+        have.append(f"{m['course']}: " + (", ".join(present) if present
+                                          else "(no segments yet)"))
+    ctk.CTkLabel(
+        dialog, text="Currently in each department:\n" + "\n".join(have),
+        anchor="w", justify="left", wraplength=600,
+        font=ctk.CTkFont(size=11), text_color=("gray40", "gray70"),
+    ).pack(fill="x", padx=16, pady=(0, 8))
+
+    footer = ctk.CTkFrame(dialog, fg_color="transparent")
+    footer.pack(fill="x", padx=16, pady=(0, 14))
+
+    def _close():
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
+    def _recheck():
+        result["recheck"] = True
+        _close()
+
+    ctk.CTkButton(footer, text="Re-check now", command=_recheck,
+                  width=140).pack(side="right", padx=(6, 0))
+    ctk.CTkButton(footer, text="Close", command=_close, width=90,
+                  **SECONDARY_BTN_KWARGS).pack(side="right")
+    dialog.bind("<Escape>", lambda _e: _close())
+    dialog.protocol("WM_DELETE_WINDOW", _close)
+    parent.wait_window(dialog)
+    return result["recheck"]
 
 
 def prompt_batch_text_review(
@@ -13894,6 +13998,16 @@ class App:
                     f"{', '.join(exp) or '(none)'}.")
                 # Re-join the freshly-downloaded exports to the caseload.
                 self._refresh_contact_ids(self._caseload_rows or [])
+                # Pop up creation instructions for any department with no
+                # segment yet; offer to re-run once the user has made them.
+                missing = res.get("missing") or []
+                if missing:
+                    names = ", ".join(m["segment_name"] for m in missing)
+                    self._append_log(
+                        f"Texting IDs: {len(missing)} department(s) need a "
+                        f"segment ({names}) — see the pop-up.")
+                    if prompt_segment_setup(self.root, missing):
+                        self._sync_contact_ids()
             try:
                 self.root.after(0, finish)
             except Exception:
