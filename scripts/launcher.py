@@ -2687,7 +2687,19 @@ class BrowserWorker:
           let nHit=0;
           for(const h of topHits.slice(0,6)){
             html+='\n=== MATCH (text/sms/cadence) ===\n'+ser(h,0); nHit++; }
-          return {buttons, matchTags, html:html.slice(0,700000),
+          // Salesforce-id scan: do any elements carry a 003... Contact id in an
+          // attribute (data-*, href, etc.)? If so, the Contacts page is
+          // scrapable for the StudentID->ContactId map without an export.
+          const IDRE=/003[0-9A-Za-z]{12,15}/;
+          const idEls=deepAll(el=>{ if(!el.attributes) return false;
+            for(const a of el.attributes) if(IDRE.test(a.value||'')) return true;
+            return false; });
+          const id003=[...new Set(idEls.map(el=>{
+            for(const a of el.attributes){const m=(a.value||'').match(IDRE);
+              if(m) return el.tagName.toLowerCase()+'['+a.name+']='+m[0];}
+            return ''; }).filter(Boolean))].slice(0,12);
+          return {buttons, matchTags, id003, id003count:idEls.length,
+            html:html.slice(0,700000),
             counts:{hits:hits.length, dialogs:topD.length,
               fields:fields.length, field_containers:nForm, match_blocks:nHit}};
         }
@@ -17187,6 +17199,11 @@ class App:
                 self._append_log(
                     "Visible buttons: "
                     + (" | ".join(btns) if btns else "(none captured)"))
+                self._append_log(
+                    f"  [sf-id scan] elements with a 003 Contact id: "
+                    f"{res.get('id003count', 0)}")
+                for t in (res.get("id003") or []):
+                    self._append_log("  [sf-id scan] " + t)
                 for t in (res.get("matchTags") or [])[:15]:
                     self._append_log("  text el: " + t)
                 html = res.get("html") or ""
