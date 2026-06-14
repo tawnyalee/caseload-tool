@@ -8315,8 +8315,8 @@ class ScenarioEditor:
         else:
             self._email_section.grid_remove()
 
-    # 12-hour labels for the text-schedule "send at" picker, mapped to/from
-    # the 24-hour `target_hour` stored in TextConfig.
+    # 12-hour labels for the text-schedule window pickers, mapped to/from the
+    # 24-hour window_start_hour / window_end_hour stored in TextConfig.
     _HOUR_LABELS = [
         "6 AM", "7 AM", "8 AM", "9 AM", "10 AM", "11 AM", "12 PM", "1 PM",
         "2 PM", "3 PM", "4 PM", "5 PM", "6 PM", "7 PM", "8 PM", "9 PM",
@@ -8363,20 +8363,32 @@ class ScenarioEditor:
             wraplength=420, justify="left", anchor="w",
         ).grid(row=1, column=1, sticky="w", padx=8, pady=(0, 4))
 
+        # Texts are ALWAYS scheduled (Mongoose can't name/batch immediate
+        # texts). The user picks an acceptable WINDOW in the student's local
+        # time; the text goes out ASAP within it (or the window's start the next
+        # day if it's already too late today). schedule stays True (kept for the
+        # saved config).
         self.text_schedule_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            frame, text="Schedule at the student's local time",
-            variable=self.text_schedule_var,
-            command=self._on_text_schedule_toggled,
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=(2, 0))
+        ctk.CTkLabel(
+            frame,
+            text=("Sent ASAP within this window, in the student's local time "
+                  "(rolls to the next day if it's already past):"),
+            font=ctk.CTkFont(size=11), anchor="w", wraplength=420,
+            justify="left", text_color=("gray45", "gray60"),
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(4, 0))
 
         self._text_hour_row = ctk.CTkFrame(frame, fg_color="transparent")
         self._text_hour_row.grid(row=3, column=1, sticky="w", padx=8, pady=(2, 0))
-        ctk.CTkLabel(self._text_hour_row, text="Send at (local):").pack(side="left")
-        self.text_hour_combo = ctk.CTkComboBox(
+        ctk.CTkLabel(self._text_hour_row, text="Window:").pack(side="left")
+        self.text_window_start_combo = ctk.CTkComboBox(
             self._text_hour_row, values=self._HOUR_LABELS, width=90)
-        self.text_hour_combo.pack(side="left", padx=(6, 0))
-        self.text_hour_combo.set("10 AM")
+        self.text_window_start_combo.pack(side="left", padx=(6, 0))
+        self.text_window_start_combo.set("10 AM")
+        ctk.CTkLabel(self._text_hour_row, text="to").pack(side="left", padx=6)
+        self.text_window_end_combo = ctk.CTkComboBox(
+            self._text_hour_row, values=self._HOUR_LABELS, width=90)
+        self.text_window_end_combo.pack(side="left")
+        self.text_window_end_combo.set("4 PM")
 
         ctk.CTkLabel(frame, text="Inbox").grid(
             row=4, column=0, sticky="w", padx=8, pady=(4, 0))
@@ -8391,13 +8403,6 @@ class ScenarioEditor:
             variable=self.text_commit_var,
         ).grid(row=5, column=1, sticky="w", padx=8, pady=(4, 8))
 
-    def _on_text_schedule_toggled(self) -> None:
-        """Show the 'send at' hour picker only when scheduling is on."""
-        if self.text_schedule_var.get():
-            self._text_hour_row.grid()
-        else:
-            self._text_hour_row.grid_remove()
-
     def _on_send_text_toggled(self) -> None:
         """Show or hide the text section based on the checkbox."""
         if self.send_text_var.get():
@@ -8405,7 +8410,6 @@ class ScenarioEditor:
                 row=self._text_section_row, column=0,
                 sticky="ew", padx=8, pady=(0, 8),
             )
-            self._on_text_schedule_toggled()
         else:
             self._text_section.grid_remove()
 
@@ -8688,14 +8692,18 @@ class ScenarioEditor:
         self.text_body_box.delete("1.0", "end")
         if t is not None:
             self.text_body_box.insert("1.0", t.body or "")
-            self.text_schedule_var.set(bool(t.schedule))
-            self.text_hour_combo.set(self._hour_to_label(t.target_hour))
+            self.text_schedule_var.set(True)
+            self.text_window_start_combo.set(
+                self._hour_to_label(t.window_start_hour))
+            self.text_window_end_combo.set(
+                self._hour_to_label(t.window_end_hour))
             self.text_inbox_entry.delete(0, "end")
             self.text_inbox_entry.insert(0, t.inbox_label or "")
             self.text_commit_var.set(bool(t.commit))
         else:
             self.text_schedule_var.set(True)
-            self.text_hour_combo.set("10 AM")
+            self.text_window_start_combo.set("10 AM")
+            self.text_window_end_combo.set("4 PM")
             self.text_inbox_entry.delete(0, "end")
             self.text_commit_var.set(False)
         self._on_send_text_toggled()
@@ -8814,8 +8822,11 @@ class ScenarioEditor:
             out["text"] = {
                 "body": self.text_body_box.get("1.0", "end-1c"),
                 "body_file": getattr(self, "_text_body_file", "") or "",
-                "schedule": bool(self.text_schedule_var.get()),
-                "target_hour": self._label_to_hour(self.text_hour_combo.get()),
+                "schedule": True,  # texts are always scheduled
+                "window_start_hour": self._label_to_hour(
+                    self.text_window_start_combo.get()),
+                "window_end_hour": self._label_to_hour(
+                    self.text_window_end_combo.get()),
                 "inbox_label": self.text_inbox_entry.get().strip(),
                 "commit": bool(self.text_commit_var.get()),
             }
@@ -14185,14 +14196,18 @@ class App:
             return False
         sch_payload = None
         sched_name = ""
-        if tcfg.schedule:
+        # Texts are always scheduled (Mongoose can't name/batch immediate ones):
+        # ASAP within the action's acceptable window, in the student's local tz.
+        if True:
             raw_tz = (row.get("Timezone") if row else "") or ""
             tzc = tm.effective_tz(raw_tz)  # blank/unknown -> MT default
             if raw_tz.strip() not in tm.TZ_ABBR_TO_IANA:
                 self._append_log(
                     f"Text: no timezone for {who} — scheduling as MT.")
             slot = tm.compute_schedule_slot(
-                tzc, self.TEAM_IANA, target_hour=tcfg.target_hour)
+                tzc, self.TEAM_IANA,
+                window_start_hour=tcfg.window_start_hour,
+                window_end_hour=tcfg.window_end_hour)
             if slot is None:
                 self._append_log(
                     f"Text: couldn't compute a schedule time for {who}; not "
@@ -14563,20 +14578,23 @@ class App:
             gvars.update(prompt_vars)
             body = tm.render_message(body_tmpl, gvars)
             issues: list = []
+            # Texts are always scheduled: ASAP within the action's window, per
+            # the group's timezone (one absolute send time for the whole group).
             when_str, sch_payload, sched_name = "now", None, ""
-            if tcfg.schedule:
-                slot = tm.compute_schedule_slot(
-                    g["tz"], self.TEAM_IANA, target_hour=tcfg.target_hour)
-                if slot is None:
-                    issues.append(f"unknown tz {g['tz']!r}")
-                else:
-                    when_str = f"{slot.student_local_str} (local)"
-                    sch_payload = {
-                        "date_str": slot.date_str, "hour12": slot.hour12,
-                        "minute": slot.minute, "ampm": slot.ampm,
-                        "student_local_str": slot.student_local_str,
-                    }
-                    sched_name = f"{g['course']} batch".strip() or "Scheduled text"
+            slot = tm.compute_schedule_slot(
+                g["tz"], self.TEAM_IANA,
+                window_start_hour=tcfg.window_start_hour,
+                window_end_hour=tcfg.window_end_hour)
+            if slot is None:
+                issues.append(f"unknown tz {g['tz']!r}")
+            else:
+                when_str = f"{slot.student_local_str} (local)"
+                sch_payload = {
+                    "date_str": slot.date_str, "hour12": slot.hour12,
+                    "minute": slot.minute, "ampm": slot.ampm,
+                    "student_local_str": slot.student_local_str,
+                }
+                sched_name = f"{g['course']} batch".strip() or "Scheduled text"
             if g.get("defaulted"):
                 issues.append(
                     f"{g['defaulted']} had no timezone — scheduled as MT")
@@ -14606,7 +14624,7 @@ class App:
         """Show the batch-text reviewer, then send each selected group's text as
         one multi-recipient scheduled compose. Returns False if the user
         cancelled the review (so a combined action aborts), True otherwise."""
-        scheduled = bool(scenario.text.schedule)
+        scheduled = True  # texts are always scheduled
         filter_summary = ""
         if scenario.batch is not None:
             filter_summary = ", ".join(

@@ -103,16 +103,20 @@ class TextConfig:
     (first_name / preferred_name / course_code / ...). It's sent via the
     Mongoose compose driver in src/text_message.py.
 
-    - `schedule=True` schedules the text at `target_hour` in the STUDENT's
-      local timezone (converted to the team's tz); `schedule=False` sends now.
+    Texts are ALWAYS scheduled (Mongoose can't name/batch immediate texts).
+    - `window_start_hour`..`window_end_hour` is the acceptable send window in
+      the STUDENT's local tz. The text is scheduled ASAP inside it (>= now + a
+      lead time), rolling to the window's start the next day if it's already too
+      late today. e.g. 10..16 = "any time 10 AM-4 PM their time".
     - `inbox_label` overrides which Mongoose inbox to compose from. Empty =
       derive "<course> Inbox" from the student's course code.
     - `commit=False` stops at the confirm/schedule step for the user to review
       and click Send/Schedule themselves (mirrors a note's submit=False)."""
     body: str = ""
     body_file: str = ""        # optional template filename in the templates dir
-    schedule: bool = True
-    target_hour: int = 10      # local hour (student tz) to schedule at
+    schedule: bool = True      # texts are always scheduled (Mongoose limitation)
+    window_start_hour: int = 10   # earliest acceptable local hour (student tz)
+    window_end_hour: int = 16     # latest acceptable local hour
     inbox_label: str = ""
     commit: bool = False
 
@@ -204,15 +208,21 @@ def _email_from_dict(d: Optional[dict]) -> Optional[EmailConfig]:
 def _text_from_dict(d: Optional[dict]) -> Optional[TextConfig]:
     if not d:
         return None
-    try:
-        target_hour = int(d.get("target_hour", 10) or 10)
-    except (TypeError, ValueError):
-        target_hour = 10
+
+    def _hour(key: str, default: int) -> int:
+        try:
+            return int(d.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    # Legacy: a single `target_hour` becomes the window START (end defaults 4 PM).
+    legacy_start = _hour("target_hour", 10) if "target_hour" in d else 10
     return TextConfig(
         body=str(d.get("body", "") or ""),
         body_file=str(d.get("body_file", "") or ""),
         schedule=bool(d.get("schedule", True)),
-        target_hour=target_hour,
+        window_start_hour=_hour("window_start_hour", legacy_start),
+        window_end_hour=_hour("window_end_hour", 16),
         inbox_label=str(d.get("inbox_label", "") or ""),
         commit=bool(d.get("commit", False)),
     )

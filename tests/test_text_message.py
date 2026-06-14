@@ -59,40 +59,70 @@ def test_group_by_timezone():
     assert [s["name"] for s in g[""]] == ["D"]
 
 
-def test_compute_schedule_slot_west_of_team():
-    # Team = Eastern. "Now" = 9:00 AM ET on a summer day (EDT/MDT in effect).
+def test_schedule_asap_within_window():
+    # Inside the window now -> send ASAP (now + lead). 3:45 PM ET, lead 10m.
     team = "America/New_York"
-    now = datetime(2026, 6, 11, 9, 0, tzinfo=ZoneInfo(team))
-    # Mountain student, target 10:00 AM local. 10 AM MDT == 12:00 PM EDT.
-    slot = tm.compute_schedule_slot("MST", team, target_hour=10, now=now)
-    assert slot is not None
-    assert (slot.hour12, slot.minute, slot.ampm) == (12, 0, "PM"), slot
+    now = datetime(2026, 6, 11, 15, 45, tzinfo=ZoneInfo(team))
+    slot = tm.compute_schedule_slot(
+        "EST", team, window_start_hour=10, window_end_hour=16, now=now)
+    assert (slot.hour12, slot.minute, slot.ampm) == (3, 55, "PM"), slot
     assert slot.date_str == "06/11/2026", slot.date_str
-    assert "10:00 AM" in slot.student_local_str, slot.student_local_str
-    assert slot.clamped is False
 
 
-def test_compute_schedule_slot_rolls_to_tomorrow():
-    # Eastern student, target 10 AM, but it's already 3 PM ET -> next day.
+def test_schedule_before_window_uses_start():
+    # 7:00 AM ET, window opens 10 AM -> 10:00 AM today.
     team = "America/New_York"
-    now = datetime(2026, 6, 11, 15, 0, tzinfo=ZoneInfo(team))
-    slot = tm.compute_schedule_slot("EST", team, target_hour=10, now=now)
-    assert slot is not None
+    now = datetime(2026, 6, 11, 7, 0, tzinfo=ZoneInfo(team))
+    slot = tm.compute_schedule_slot(
+        "EST", team, window_start_hour=10, window_end_hour=16, now=now)
+    assert (slot.hour12, slot.minute, slot.ampm) == (10, 0, "AM"), slot
+    assert slot.date_str == "06/11/2026", slot.date_str
+
+
+def test_schedule_after_window_rolls_tomorrow():
+    # 5:45 PM ET, past the 4 PM window end -> 10:00 AM tomorrow.
+    team = "America/New_York"
+    now = datetime(2026, 6, 11, 17, 45, tzinfo=ZoneInfo(team))
+    slot = tm.compute_schedule_slot(
+        "EST", team, window_start_hour=10, window_end_hour=16, now=now)
     assert (slot.hour12, slot.minute, slot.ampm) == (10, 0, "AM"), slot
     assert slot.date_str == "06/12/2026", slot.date_str
 
 
-def test_compute_schedule_slot_unknown_tz():
+def test_schedule_lead_time_can_push_past_window_end():
+    # 3:55 PM ET + 10m lead = 4:05 PM, past the 4 PM end -> tomorrow 10 AM.
+    team = "America/New_York"
+    now = datetime(2026, 6, 11, 15, 55, tzinfo=ZoneInfo(team))
+    slot = tm.compute_schedule_slot(
+        "EST", team, window_start_hour=10, window_end_hour=16, now=now)
+    assert (slot.hour12, slot.minute, slot.ampm) == (10, 0, "AM"), slot
+    assert slot.date_str == "06/12/2026", slot.date_str
+
+
+def test_schedule_west_of_team_converts():
+    # Mountain student, 9 AM ET = 7 AM MDT (before window) -> 10 AM MDT today,
+    # which is 12:00 PM EDT in the team's tz.
+    team = "America/New_York"
+    now = datetime(2026, 6, 11, 9, 0, tzinfo=ZoneInfo(team))
+    slot = tm.compute_schedule_slot(
+        "MST", team, window_start_hour=10, window_end_hour=16, now=now)
+    assert (slot.hour12, slot.minute, slot.ampm) == (12, 0, "PM"), slot
+    assert "10:00 AM" in slot.student_local_str, slot.student_local_str
+    assert slot.date_str == "06/11/2026", slot.date_str
+    assert slot.clamped is False
+
+
+def test_schedule_unknown_tz():
     assert tm.compute_schedule_slot("ZZZ", "America/New_York") is None
 
 
-def test_compute_schedule_slot_clamps_for_western_team():
-    # Team = Pacific. Eastern student target 10 AM local = 7 AM PT, before the
+def test_schedule_clamps_for_western_team():
+    # Team = Pacific. Eastern student window-start 10 AM ET = 7 AM PT, before the
     # 8 AM team window -> clamp up to 8:00 AM PT.
     team = "America/Los_Angeles"
     now = datetime(2026, 6, 11, 5, 0, tzinfo=ZoneInfo(team))
-    slot = tm.compute_schedule_slot("EST", team, target_hour=10, now=now)
-    assert slot is not None
+    slot = tm.compute_schedule_slot(
+        "EST", team, window_start_hour=10, window_end_hour=16, now=now)
     assert (slot.hour12, slot.minute, slot.ampm) == (8, 0, "AM"), slot
     assert slot.clamped is True
 

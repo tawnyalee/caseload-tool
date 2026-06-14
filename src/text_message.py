@@ -64,10 +64,15 @@ def effective_tz(tz_abbr: str) -> str:
 # The Mongoose compose textarea caps the body (maxlength="306" in the DOM).
 MAX_SMS_LEN = 306
 
-# Default local hour to target when scheduling (10:00 AM in the student's tz).
-# Overridable per fire; surfaced as a setting in the UI.
-DEFAULT_TARGET_HOUR = 10
-DEFAULT_TARGET_MINUTE = 0
+# Texts are ALWAYS scheduled (Mongoose can't name/batch immediate texts, nor
+# mix immediate + scheduled). Each action defines an ACCEPTABLE WINDOW in the
+# student's local tz; we send ASAP inside it. Defaults: 10:00 AM - 4:00 PM.
+DEFAULT_WINDOW_START_HOUR = 10
+DEFAULT_WINDOW_END_HOUR = 16
+
+# Never schedule sooner than now + this many minutes (Mongoose rejects times
+# too close to "now"). The earliest a text can go out.
+DEFAULT_LEAD_MINUTES = 10
 
 # Mongoose only allows scheduling inside the team's working window
 # (the DOM said "8:00 AM and 12:00 AM EDT"). We clamp the team-tz hour into
@@ -123,22 +128,25 @@ def compute_schedule_slot(
     student_tz_abbr: str,
     team_iana: str,
     *,
-    target_hour: int = DEFAULT_TARGET_HOUR,
-    target_minute: int = DEFAULT_TARGET_MINUTE,
+    window_start_hour: int = DEFAULT_WINDOW_START_HOUR,
+    window_end_hour: int = DEFAULT_WINDOW_END_HOUR,
+    window_start_minute: int = 0,
+    window_end_minute: int = 0,
+    lead_minutes: int = DEFAULT_LEAD_MINUTES,
     now: Optional[datetime] = None,
 ) -> Optional[ScheduleSlot]:
-    """When to schedule so the student receives the text at
-    target_hour:target_minute in THEIR local timezone.
+    """Soonest acceptable send time as a team-tz ScheduleSlot.
+
+    Texts are always scheduled. The acceptable window [window_start,
+    window_end] is in the STUDENT's local tz; we send ASAP — the earliest time
+    that is >= now + lead_minutes AND inside the window, today if it still fits,
+    otherwise window_start the NEXT day. Examples (window 10:00-16:00, lead 10m,
+    student-local "now"): 3:45 PM -> 3:55 PM today; 7:00 AM -> 10:00 AM today;
+    5:45 PM -> 10:00 AM tomorrow.
 
     Returns a ScheduleSlot in the TEAM's tz (what Mongoose's scheduler expects),
-    or None if the student's tz abbreviation is unknown.
-
-    Picks the next occurrence of the target local time that is still in the
-    future (today if it hasn't passed in the student's tz, else tomorrow), then
-    converts that absolute instant to the team tz. Defensively clamps the
-    team-tz time up to EARLIEST_TEAM_HOUR if it would land before the allowed
-    window (shouldn't happen for an Eastern team, but matters if the team is
-    further west)."""
+    or None if the student's tz abbreviation is unknown. Defensively clamps the
+    team-tz hour up to EARLIEST_TEAM_HOUR (matters only for a non-Eastern team)."""
     iana = TZ_ABBR_TO_IANA.get((student_tz_abbr or "").strip())
     if not iana:
         return None
@@ -150,14 +158,25 @@ def compute_schedule_slot(
     elif now.tzinfo is None:
         now = now.replace(tzinfo=team_tz)
 
-    now_student = now.astimezone(student_tz)
-    target = now_student.replace(
-        hour=target_hour, minute=target_minute, second=0, microsecond=0,
-    )
-    if target <= now_student:
-        target = target + timedelta(days=1)
+    # Floor to the minute so the computed time maps cleanly onto Mongoose's
+    # hour/minute selects (no stray seconds).
+    now_student = now.astimezone(student_tz).replace(second=0, microsecond=0)
+    earliest = now_student + timedelta(minutes=lead_minutes)
+    win_start = now_student.replace(
+        hour=window_start_hour, minute=window_start_minute,
+        second=0, microsecond=0)
+    win_end = now_student.replace(
+        hour=window_end_hour, minute=window_end_minute,
+        second=0, microsecond=0)
 
-    team_dt = target.astimezone(team_tz)
+    if earliest <= win_end:
+        # Fits today: ASAP, but not before the window opens.
+        send_local = earliest if earliest >= win_start else win_start
+    else:
+        # Too late today -> open of the window tomorrow.
+        send_local = win_start + timedelta(days=1)
+
+    team_dt = send_local.astimezone(team_tz)
     clamped = False
     if team_dt.hour < EARLIEST_TEAM_HOUR:
         team_dt = team_dt.replace(
@@ -171,7 +190,7 @@ def compute_schedule_slot(
         hour12=int(team_dt.strftime("%I")),
         minute=team_dt.minute,
         ampm=team_dt.strftime("%p"),
-        student_local_str=target.strftime("%I:%M %p %Z").lstrip("0"),
+        student_local_str=send_local.strftime("%I:%M %p %Z").lstrip("0"),
         clamped=clamped,
     )
 
