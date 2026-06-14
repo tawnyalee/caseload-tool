@@ -18,8 +18,11 @@ falling back to mobile when a student has no mapped id.
 from __future__ import annotations
 
 import csv
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
+from src.config import HISTORY_DB
 from src.text_message import normalize_phone
 
 # Header that marks a file as a Mongoose contacts/segment export.
@@ -108,3 +111,92 @@ def load_and_map(path, caseload_rows: list[dict], **kwargs) -> dict[str, str]:
     except Exception:
         return {}
     return build_contact_id_map(caseload_rows, contacts, **kwargs)
+
+
+def find_exports_in_dir(directory) -> list[Path]:
+    """All Mongoose contacts exports in `directory`, newest first. A file
+    qualifies if it has a contactId header (so multiple departments' exports
+    can sit side by side). The caseload CSV is excluded by the header sniff."""
+    try:
+        cands = [p for p in Path(directory).glob("*.csv")
+                 if is_contacts_export(p)]
+    except Exception:
+        return []
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands
+
+
+# ----------------------------------------------------------------------
+# SQLite persistence — a StudentID -> Contact Id table in the history DB.
+# Survives restarts so texting/notes can use the id even before a fresh
+# export is loaded, and only new/changed students are written on reload.
+# ----------------------------------------------------------------------
+_CONTACT_DDL = """
+CREATE TABLE IF NOT EXISTS contact_ids (
+    student_id TEXT PRIMARY KEY,
+    contact_id TEXT NOT NULL,
+    name       TEXT,
+    updated_at TEXT
+);
+"""
+
+
+def _connect(db_path=HISTORY_DB) -> sqlite3.Connection:
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_CONTACT_DDL)
+    return conn
+
+
+def load_contact_ids(*, db_path=HISTORY_DB) -> dict[str, str]:
+    """The persisted StudentID -> Contact Id map ({} if none/unavailable)."""
+    try:
+        conn = _connect(db_path)
+    except Exception:
+        return {}
+    try:
+        return {r["student_id"]: r["contact_id"]
+                for r in conn.execute(
+                    "SELECT student_id, contact_id FROM contact_ids")}
+    finally:
+        conn.close()
+
+
+def persist_contact_ids(
+    mapping: dict[str, str], *, name_by_sid: dict | None = None,
+    db_path=HISTORY_DB,
+) -> tuple[int, int]:
+    """Upsert StudentID -> Contact Id rows. Returns (added, changed) — rows
+    whose id was new or differed from what was stored (unchanged rows are a
+    no-op, so reloads only touch what moved)."""
+    if not mapping:
+        return (0, 0)
+    name_by_sid = name_by_sid or {}
+    conn = _connect(db_path)
+    try:
+        existing = {r["student_id"]: r["contact_id"]
+                    for r in conn.execute(
+                        "SELECT student_id, contact_id FROM contact_ids")}
+        added = changed = 0
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = []
+        for sid, cid in mapping.items():
+            if sid not in existing:
+                added += 1
+            elif existing[sid] != cid:
+                changed += 1
+            else:
+                continue  # unchanged — skip the write
+            payload.append((sid, cid, name_by_sid.get(sid, ""), now))
+        if payload:
+            conn.executemany(
+                "INSERT INTO contact_ids (student_id, contact_id, name, "
+                "updated_at) VALUES (?,?,?,?) ON CONFLICT(student_id) DO "
+                "UPDATE SET contact_id=excluded.contact_id, "
+                "name=excluded.name, updated_at=excluded.updated_at",
+                payload)
+            conn.commit()
+        return (added, changed)
+    finally:
+        conn.close()

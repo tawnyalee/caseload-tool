@@ -194,6 +194,16 @@ def normalize_phone(raw: str) -> str:
     return digits if len(digits) == 10 else ""
 
 
+_SFID_RE = re.compile(r"^003[0-9A-Za-z]{12}([0-9A-Za-z]{3})?$")
+
+
+def looks_like_sfid(s: str) -> bool:
+    """True if `s` is a Salesforce Contact id (15- or 18-char, '003' prefix).
+    Mongoose's recipient search accepts the Contact id as a search term and
+    returns the unique contact — blank-mobile-proof, unlike a phone search."""
+    return bool(_SFID_RE.match((s or "").strip()))
+
+
 # ---------------------------------------------------------------------------
 # Playwright driver for the Mongoose compose modal.
 #
@@ -431,11 +441,16 @@ def open_compose_to_recipient_step(
         f"{attempts} tries ({last_err}).")
 
 
-def add_recipient(page: Page, mobile: str, *, timeout_ms: int = 10_000) -> bool:
-    """Type a (normalized) mobile number into the recipient search and click the
-    first matching result. Returns True if a result was added. The caller should
-    have normalized the number; a full 10-digit search should yield one match."""
-    term = normalize_phone(mobile) or (mobile or "").strip()
+def add_recipient(page: Page, recipient: str, *, timeout_ms: int = 10_000) -> bool:
+    """Type a recipient search term — a Salesforce Contact id (003…) OR a mobile
+    number — into the recipient search and click the matching result. Returns
+    True if a result was added. A Contact id yields exactly one match; a full
+    10-digit mobile usually does too."""
+    recipient = (recipient or "").strip()
+    if looks_like_sfid(recipient):
+        term = recipient  # search Mongoose by the unique Contact id verbatim
+    else:
+        term = normalize_phone(recipient) or recipient
     if not term:
         return False
     box = _recipient_box(page)

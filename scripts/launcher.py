@@ -6065,14 +6065,16 @@ def prompt_batch_text_review(
     scheduled: bool = True,
 ) -> "Optional[list[list[str]]]":
     """Modal reviewer for batch texts. Each timezone group is a foldable section
-    with a per-student checklist (default checked; students without a mobile are
-    shown disabled). A read-only "Skipped - not opted in" section lists students
-    who won't be texted. The right pane shows the group's shared message.
+    with a per-student checklist (default checked; students with neither a mobile
+    nor a Contact id are shown disabled). A read-only "Skipped - not opted in"
+    section lists students who won't be texted. The right pane shows the group's
+    shared message.
 
     `groups`: dicts with keys label, course_code, when_str, body, issues,
-    inbox_label, schedule, schedule_name, members (list of {name, mobile}).
-    Returns a list PARALLEL to `groups`, each element the selected recipient
-    mobiles for that group; or None on cancel."""
+    inbox_label, schedule, schedule_name, members (list of {name, mobile, term,
+    via_id}). `term` is the Mongoose search key (Contact id or mobile); a member
+    is textable iff it has one. Returns a list PARALLEL to `groups`, each element
+    the selected recipient terms for that group; or None on cancel."""
     skipped_names = skipped_names or []
     dialog = ctk.CTkToplevel(parent)
     dialog.title(f"Review texts - {scenario_name}")
@@ -6084,12 +6086,13 @@ def prompt_batch_text_review(
     dialog.after(150, lambda: (dialog.lift(), dialog.focus_force()))
     result: dict = {"value": None}
 
-    # Per-group, per-member selection vars. No-mobile members aren't textable
-    # -> var stays False and the checkbox is disabled.
+    # Per-group, per-member selection vars. Members with no term (no mobile and
+    # no Contact id) aren't textable -> var stays False and the checkbox is
+    # disabled.
     member_vars: list = []
     for g in groups:
         member_vars.append(
-            [ctk.BooleanVar(value=bool(m.get("mobile")))
+            [ctk.BooleanVar(value=bool(m.get("term")))
              for m in g.get("members", [])])
 
     banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
@@ -6177,7 +6180,7 @@ def prompt_batch_text_review(
         def _toggle_group():
             on = master.get()
             for m, v in zip(g.get("members", []), gv):
-                if m.get("mobile"):
+                if m.get("term"):
                     v.set(on)
             _update_sel_label()
 
@@ -6188,7 +6191,7 @@ def prompt_batch_text_review(
             head, text="▾", width=24, fg_color="transparent",
             text_color=("gray10", "gray90"), hover_color=("gray85", "gray25"))
         toggle_btn.pack(side="left")
-        ntext = sum(1 for m in g.get("members", []) if m.get("mobile"))
+        ntext = sum(1 for m in g.get("members", []) if m.get("term"))
         warn = "⚠  " if g.get("issues") else ""
         lbl = ctk.CTkLabel(
             head,
@@ -6201,8 +6204,14 @@ def prompt_batch_text_review(
         lbl.bind("<Button-1>", lambda _ev, x=i: _show(x))
 
         for m, v in zip(g.get("members", []), gv):
-            has = bool(m.get("mobile"))
-            txt = m["name"] + ("" if has else "   (no mobile)")
+            has = bool(m.get("term"))
+            if not has:
+                suffix = "   (no mobile / Contact id)"
+            elif m.get("via_id"):
+                suffix = "   (via Contact id)"
+            else:
+                suffix = ""
+            txt = m["name"] + suffix
             ctk.CTkCheckBox(
                 members_box, text=txt, variable=v, command=_sync_master,
                 font=ctk.CTkFont(size=11),
@@ -6234,7 +6243,7 @@ def prompt_batch_text_review(
         target = _count() == 0
         for g, gv in zip(groups, member_vars):
             for m, v in zip(g.get("members", []), gv):
-                if m.get("mobile"):
+                if m.get("term"):
                     v.set(target)
         _update_sel_label()
 
@@ -6251,8 +6260,8 @@ def prompt_batch_text_review(
     def _send():
         out = []
         for g, gv in zip(groups, member_vars):
-            out.append([m["mobile"] for m, v in zip(g.get("members", []), gv)
-                        if v.get() and m.get("mobile")])
+            out.append([m["term"] for m, v in zip(g.get("members", []), gv)
+                        if v.get() and m.get("term")])
         result["value"] = out
         _close()
 
@@ -10832,6 +10841,11 @@ class App:
         # DOM-scroll scrape — slower but always works.
         self._caseload_rows: Optional[list[dict]] = None
         self._caseload_csv_mtime = None
+        # StudentID -> Salesforce Contact id (003…), from a Mongoose segment
+        # export joined to the caseload + persisted in the history DB. Texting
+        # searches Mongoose by this (unique, works for blank-mobile students);
+        # loaded from SQLite at startup and refreshed when an export is found.
+        self._contact_ids: dict[str, str] = {}
         # Checked row keys for the caseload panel's multi-select. Held on
         # the app (not the panel) so the selection survives the panel
         # rebuild that pop-out / re-dock performs.
@@ -13710,6 +13724,64 @@ class App:
                 out.append(n)
         return out[:50]
 
+    def _refresh_contact_ids(self, rows, *, silent: bool = False) -> None:
+        """Refresh self._contact_ids: load the persisted StudentID -> Contact id
+        map, then fold in any Mongoose segment export(s) sitting in the config
+        dir (joined to the caseload by mobile/name) and persist new/changed ids.
+        Non-fatal — texting falls back to mobile if anything here fails."""
+        try:
+            from src import mongoose_contacts as mc
+        except Exception:
+            return
+        try:
+            persisted = mc.load_contact_ids()
+        except Exception:
+            persisted = {}
+        merged = dict(persisted)
+        added = changed = 0
+        exports = []
+        try:
+            exports = mc.find_exports_in_dir(CASELOAD_CSV_PATH.parent)
+        except Exception:
+            exports = []
+        for path in exports:
+            try:
+                contacts = mc.load_contacts(path)
+                fresh = mc.build_contact_id_map(rows or [], contacts)
+            except Exception as e:
+                if not silent:
+                    self._append_log(
+                        f"Contact ids: couldn't read {path.name}: {e}",
+                        error=True)
+                continue
+            merged.update(fresh)
+            name_by_sid = {
+                (r.get("StudentID") or "").strip(): (r.get("Name") or "").strip()
+                for r in (rows or [])}
+            try:
+                a, c = mc.persist_contact_ids(fresh, name_by_sid=name_by_sid)
+                added += a
+                changed += c
+            except Exception:
+                pass
+        self._contact_ids = merged
+        if not silent and (exports or merged):
+            n = len(merged)
+            src = (f" from {len(exports)} export(s)" if exports else "")
+            extra = (f"; {added} new, {changed} updated"
+                     if (added or changed) else "")
+            self._append_log(
+                f"Contact ids: {n} student(s) mapped{src}{extra}.")
+
+    def _text_term_for(self, student_id: str, mobile: str) -> str:
+        """Recipient search term for Mongoose: the student's Contact id if we
+        have one (unique, blank-mobile-proof), else the normalized mobile."""
+        from src import text_message as tm
+        cid = self._contact_ids.get((student_id or "").strip())
+        if cid:
+            return cid
+        return tm.normalize_phone(mobile or "")
+
     def _text_vars_from_row(self, row: dict) -> dict:
         """Build template variables (the same set email uses) from a caseload
         CSV row — for firing a text without scraping the Salesforce record."""
@@ -13841,11 +13913,16 @@ class App:
             return False
         mobile_raw = (row.get("MobilePhone") if row else "") or ""
         mobile = tm.normalize_phone(mobile_raw)
-        if not mobile:
+        # Prefer the Salesforce Contact id (unique, works when the mobile is
+        # blank); fall back to the mobile. The term is what Mongoose searches.
+        term = self._text_term_for(variables.get("student_id", ""), mobile_raw)
+        if not term:
             self._append_log(
-                f"Text: no usable Mobile Phone for {who} (got {mobile_raw!r}); "
-                "not sent.", error=True)
+                f"Text: no Mobile Phone and no Contact id for {who} "
+                f"(got {mobile_raw!r}); not sent. Export a Mongoose segment to "
+                "map blank-mobile students.", error=True)
             return False
+        via_id = tm.looks_like_sfid(term)
         body_tmpl = tcfg.body
         if not body_tmpl and tcfg.body_file:
             try:
@@ -13896,7 +13973,9 @@ class App:
             when_str = (f"{sch_payload['student_local_str']} (student-local)"
                         if scheduled else "now")
             edited = prompt_text_review(
-                self.root, who=who, mobile=mobile, inbox_label=inbox_label,
+                self.root, who=who,
+                mobile=(mobile or "via Contact id" if via_id else mobile),
+                inbox_label=inbox_label,
                 when_str=when_str, body=body, char_limit=tm.MAX_SMS_LEN,
                 scheduled=scheduled)
             if edited is None:
@@ -13908,7 +13987,7 @@ class App:
                     f"Text: trimmed to the {tm.MAX_SMS_LEN}-char limit.")
         payload = {
             "body": body,
-            "recipients": [mobile],
+            "recipients": [term],
             "inbox_label": inbox_label,
             "schedule": sch_payload,
             "schedule_name": sched_name,
@@ -14215,6 +14294,10 @@ class App:
             raw_tz = (row.get("Timezone") or "").strip()
             tz = tm.effective_tz(raw_tz)  # blank/unknown -> MT default
             mobile = tm.normalize_phone(row.get("MobilePhone") or "")
+            # Recipient term: Contact id (blank-mobile-proof) if known, else
+            # mobile. A member is textable iff it has a term.
+            term = self._text_term_for(rv.get("student_id", ""),
+                                       row.get("MobilePhone") or "")
             key = (inbox_label, tz)
             g = groups.get(key)
             if g is None:
@@ -14222,7 +14305,9 @@ class App:
                      "members": [], "defaulted": 0}
                 groups[key] = g
                 order.append(key)
-            g["members"].append({"name": name, "mobile": mobile})
+            g["members"].append({
+                "name": name, "mobile": mobile, "term": term,
+                "via_id": tm.looks_like_sfid(term)})
             if raw_tz not in tm.TZ_ABBR_TO_IANA:
                 g["defaulted"] += 1
         if skipped_names:
@@ -14253,12 +14338,15 @@ class App:
             if g.get("defaulted"):
                 issues.append(
                     f"{g['defaulted']} had no timezone — scheduled as MT")
-            n_mobile = sum(1 for m in g["members"] if m["mobile"])
-            n_no_mobile = len(g["members"]) - n_mobile
-            if n_mobile == 0:
-                issues.append("no recipients with a mobile")
-            elif n_no_mobile:
-                issues.append(f"{n_no_mobile} without a mobile")
+            n_textable = sum(1 for m in g["members"] if m.get("term"))
+            n_untextable = len(g["members"]) - n_textable
+            n_via_id = sum(1 for m in g["members"] if m.get("via_id"))
+            if n_textable == 0:
+                issues.append("no recipients with a mobile or Contact id")
+            elif n_untextable:
+                issues.append(f"{n_untextable} without a mobile or Contact id")
+            if n_via_id:
+                issues.append(f"{n_via_id} via Contact id (blank mobile)")
             if tm.over_length(body):
                 issues.append(f"{tm.over_length(body)} over limit")
             if "{{" in body and "}}" in body:
@@ -16944,6 +17032,7 @@ class App:
             return False
         self._caseload_rows = rows
         self._caseload_csv_mtime = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
+        self._refresh_contact_ids(rows, silent=silent)
         # Cache whether the CSV carries a student-email column so the
         # pre-batch warning + Settings status line don't have to scan
         # rows again. Refreshed on every cache reload — picks up the

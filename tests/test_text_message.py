@@ -37,6 +37,15 @@ def test_normalize_phone():
     assert tm.normalize_phone("") == ""
 
 
+def test_looks_like_sfid():
+    assert tm.looks_like_sfid("0033x000038J2X4AAK")   # 18-char
+    assert tm.looks_like_sfid("0033x000038J2X4")      # 15-char
+    assert not tm.looks_like_sfid("5551234567")       # phone
+    assert not tm.looks_like_sfid("(336) 213-2291")
+    assert not tm.looks_like_sfid("")
+    assert not tm.looks_like_sfid("003")              # too short
+
+
 def test_group_by_timezone():
     students = [
         {"name": "A", "timezone": "EST"},

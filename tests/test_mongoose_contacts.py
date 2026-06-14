@@ -104,6 +104,27 @@ def test_case_insensitive_name():
         "S5": "0033x000038J2X6CCM"}
 
 
+def test_persist_and_load_roundtrip():
+    from src.mongoose_contacts import load_contact_ids, persist_contact_ids
+    fd, db = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.remove(db)  # let sqlite create it
+    try:
+        added, changed = persist_contact_ids(
+            {"S1": "003AAA", "S2": "003BBB"}, db_path=db)
+        assert (added, changed) == (2, 0)
+        assert load_contact_ids(db_path=db) == {"S1": "003AAA", "S2": "003BBB"}
+        # re-persist: one unchanged, one changed, one new
+        added, changed = persist_contact_ids(
+            {"S1": "003AAA", "S2": "003ZZZ", "S3": "003CCC"}, db_path=db)
+        assert (added, changed) == (1, 1)
+        assert load_contact_ids(db_path=db) == {
+            "S1": "003AAA", "S2": "003ZZZ", "S3": "003CCC"}
+    finally:
+        if os.path.exists(db):
+            os.remove(db)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
