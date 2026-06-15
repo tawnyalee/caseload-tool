@@ -148,8 +148,27 @@ def wrap_with_font(html: str, font_family: str, font_size: int) -> str:
     return f'<div style="{style}">{html}</div>'
 
 
+# Cache decoded template text by path, keyed on mtime so an edit (the in-app
+# editor or Word rewrites the file → mtime changes) invalidates the entry. A
+# batch renders the SAME template once per student, so this turns N disk
+# reads + decodes into one — the bulk of the "Rendering N previews…" stall.
+_TEMPLATE_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _decode_template(raw: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "windows-1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def load_template(path: Path) -> str:
     """Read a template file, tolerating non-UTF-8 encodings.
+
+    Cached by (path, mtime): repeated loads of the same template (every student
+    in a batch) are served from memory; editing the file reloads it.
 
     Word's "Save as Web Page (Filtered)" defaults to Windows-1252,
     which fails a strict UTF-8 decode the moment it hits a smart
@@ -166,10 +185,17 @@ def load_template(path: Path) -> str:
     sees the template (with mojibake on the bad bytes) instead of a
     hard failure mid-fire.
     """
-    raw = Path(path).read_bytes()
-    for enc in ("utf-8", "utf-8-sig", "windows-1252", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    p = Path(path)
+    key = str(p)
+    mtime = None
+    try:
+        mtime = p.stat().st_mtime
+        hit = _TEMPLATE_CACHE.get(key)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+    except OSError:
+        pass  # stat failed (missing file etc.) — fall through to read + raise
+    text = _decode_template(p.read_bytes())
+    if mtime is not None:
+        _TEMPLATE_CACHE[key] = (mtime, text)
+    return text
