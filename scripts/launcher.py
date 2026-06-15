@@ -14350,9 +14350,22 @@ class App:
         else:
             confirmed = matched
 
-        # Text channel (combined action): review + send the texts FIRST
-        # (timezone-grouped + scheduled = fast), then the slower per-student
-        # email+note loop below. Cancelling the text review aborts the action.
+        # Collect ALL remaining user input UP FRONT — the per-note "additional
+        # text" edits — BEFORE the text send + the per-student loop run. That
+        # way the user finishes every prompt at the start and the tool then
+        # works unattended (texts schedule, emails send, notes file). Otherwise
+        # the additional-text prompt landed AFTER the ~30s text send, forcing
+        # the user to come back mid-run.
+        note_inputs: "Optional[tuple[str, dict]]" = None
+        if scenario.notes:
+            note_inputs = self._collect_note_inputs(
+                scenario, len(confirmed), "batch")
+            if note_inputs is None:
+                return  # cancelled at an additional-text prompt
+
+        # Text channel (combined action): review (the last interactive step)
+        # then SEND — timezone-grouped + scheduled. Cancelling aborts the
+        # action. After this point everything runs without user input.
         if scenario.text is not None:
             tgroups, tskipped = self._build_text_review_groups(
                 scenario, matched, prompt_vars)
@@ -14364,12 +14377,12 @@ class App:
                     "Action cancelled at text review; notes/email not run.")
                 return
 
-        # Steps 6 + 7 (custom-body prompts, clipboard, the per-student
-        # loop) are shared with the caseload-panel mini-batch — see
-        # _execute_scenario_over_rows.
+        # Step 7 (the per-student loop) — shared with the panel mini-batch.
+        # Pass the pre-collected note input so the loop doesn't prompt again.
         self._execute_scenario_over_rows(
             scenario, override, confirmed, prompt_vars,
             has_email=has_email, source="batch", body_overrides=body_overrides,
+            prefetched_inputs=note_inputs,
         )
 
     def _fire_batch_text(self, scenario: ScenarioConfig) -> None:
@@ -14642,25 +14655,13 @@ class App:
         sid = str(row.get("StudentID", "") or row.get("Student ID", "")).strip()
         return name, (sid or name)
 
-    def _execute_scenario_over_rows(
-        self, scenario: ScenarioConfig, override: str,
-        confirmed: list[dict], prompt_vars: dict, *,
-        has_email: bool, source: str = "batch",
-        body_overrides: Optional[dict] = None,
-    ) -> None:
-        """Shared execution core for firing a scenario across many
-        students — the full caseload batch AND the panel's hand-picked
-        mini-batch. Gathers per-note custom bodies + clipboard, then loops
-        fast-find → auto-send email (if configured) → file note. The
-        activity log is the progress display. `source` is the noun used in
-        log lines ('batch' / 'selection'). `body_overrides` maps a row's
-        position in `confirmed` to a hand-edited email body (from the
-        reviewer's Edit-body button)."""
-        body_overrides = body_overrides or {}
-        # Step 6: clipboard FIRST (read once up front — Tk + PIL aren't safe
-        # on the worker thread) so it can be folded into the additional-text
-        # review, then the per-note custom-body prompts. Gathered AFTER
-        # confirmation so cancelled runs don't waste typing.
+    def _collect_note_inputs(
+        self, scenario: ScenarioConfig, total: int, source: str = "batch",
+    ) -> "Optional[tuple[str, dict]]":
+        """Gather everything the per-note step needs from the USER up front —
+        the clipboard (read once; Tk/PIL aren't worker-thread safe) and each
+        note's 'additional text' edit — so all input happens BEFORE any
+        automation. Returns (clipboard, custom_bodies) or None if cancelled."""
         clipboard = ""
         if any(n.append_clipboard for n in scenario.notes):
             clipboard = self._read_clipboard_content()
@@ -14668,7 +14669,7 @@ class App:
         for i, n in enumerate(scenario.notes):
             if not n.enter_additional_text:
                 continue
-            label = f"Note {i + 1} (applies to all {len(confirmed)} students)"
+            label = f"Note {i + 1} (applies to all {total} students)"
             prefill = n.body
             if n.append_clipboard and clipboard:
                 sep = "\n" if prefill and not prefill.endswith("\n") else ""
@@ -14676,8 +14677,38 @@ class App:
             edited = prompt_additional_text(self.root, label, prefill)
             if edited is None:
                 self._append_log(f"{label}: cancelled; {source} not started.")
-                return
+                return None
             custom_bodies[i] = edited
+        return clipboard, custom_bodies
+
+    def _execute_scenario_over_rows(
+        self, scenario: ScenarioConfig, override: str,
+        confirmed: list[dict], prompt_vars: dict, *,
+        has_email: bool, source: str = "batch",
+        body_overrides: Optional[dict] = None,
+        prefetched_inputs: "Optional[tuple[str, dict]]" = None,
+    ) -> None:
+        """Shared execution core for firing a scenario across many
+        students — the full caseload batch AND the panel's hand-picked
+        mini-batch. Loops fast-find → auto-send email (if configured) → file
+        note. The activity log is the progress display. `source` is the noun
+        used in log lines ('batch' / 'selection'). `body_overrides` maps a row's
+        position in `confirmed` to a hand-edited email body. `prefetched_inputs`
+        = (clipboard, custom_bodies) already gathered by the caller (so a
+        combined action collects ALL user input before the text send); when
+        None we gather them here."""
+        body_overrides = body_overrides or {}
+        # Step 6: per-note user input — use the caller's if it front-loaded
+        # them, else gather now (selection mini-batch has no text step, so
+        # there's nothing to front-load ahead of).
+        if prefetched_inputs is not None:
+            clipboard, custom_bodies = prefetched_inputs
+        else:
+            collected = self._collect_note_inputs(
+                scenario, len(confirmed), source)
+            if collected is None:
+                return
+            clipboard, custom_bodies = collected
 
         total = len(confirmed)
 
