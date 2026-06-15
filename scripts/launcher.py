@@ -888,6 +888,8 @@ class BrowserWorker:
         parts = urlsplit(CASELOAD_URL or "https://srm.lightning.force.com")
         url = (f"{parts.scheme}://{parts.netloc}"
                f"/lightning/r/Contact/{contact_id}/view")
+        self.on_status(
+            "Deep-link: opening the record by Contact id (skipping search)…")
         try:
             target.goto(url, wait_until="domcontentloaded", timeout=30_000)
         except Exception:
