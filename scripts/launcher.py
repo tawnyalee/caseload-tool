@@ -406,11 +406,12 @@ class BrowserWorker:
         self.q.put(("OPEN_MONGOOSE", on_done))
 
     def submit_mongoose_login_check(
-        self, on_done: Callable[[dict], None],
+        self, on_done: Callable[[dict], None], surface: bool = True,
     ) -> None:
         """Open Mongoose if needed and report whether the session is signed in.
-        Brings the window forward (for sign-in) when it isn't. on_done({ok})."""
-        self.q.put(("MONGOOSE_LOGIN_CHECK", on_done))
+        `surface` brings the window forward (for sign-in) when it isn't;
+        startup passes False for a non-intrusive heads-up. on_done({ok})."""
+        self.q.put(("MONGOOSE_LOGIN_CHECK", surface, on_done))
 
     def submit_restart_browser(self, on_done: Callable[[dict], None]) -> None:
         """Tear down and reopen the browser context (hang recovery). Handled in
@@ -720,10 +721,10 @@ class BrowserWorker:
             finally:
                 on_done(res)
         elif cmd[0] == "MONGOOSE_LOGIN_CHECK":
-            _, on_done = cmd
+            _, surface, on_done = cmd
             res = {"ok": False}
             try:
-                res = self._mongoose_login_check(ctx)
+                res = self._mongoose_login_check(ctx, surface)
             finally:
                 on_done(res)
         elif cmd[0] == "SET_FOLLOWUP_DATE":
@@ -2423,13 +2424,15 @@ class BrowserWorker:
                 continue
         return None
 
-    def _mongoose_login_check(self, ctx) -> dict:
-        """Open Mongoose if needed and report whether it's signed in. Brings the
-        window forward when it isn't, so the user can log in. Returns
+    def _mongoose_login_check(self, ctx, surface: bool = True) -> dict:
+        """Open Mongoose if needed and report whether it's signed in. When
+        `surface` (the fire-time check), open with focus + bring the window
+        forward if not signed in so the user can log in. When not (the startup
+        heads-up), open in the background and don't steal focus. Returns
         {ok: bool, error?}."""
         page = self._mongoose_page(ctx)
         if page is None:
-            res = self._open_mongoose(ctx, focus=True)
+            res = self._open_mongoose(ctx, focus=surface)
             if res.get("error"):
                 return {"ok": False, "error": res["error"]}
             page = self._mongoose_page(ctx)
@@ -2441,7 +2444,7 @@ class BrowserWorker:
                 pass
         from src import text_message as tm
         logged_in = tm.mongoose_logged_in(page)
-        if not logged_in:
+        if not logged_in and surface:
             try:
                 self._bring_browser_forward(page)
             except Exception:
@@ -13939,6 +13942,31 @@ class App:
 
         self.worker.submit_open_mongoose(on_done)
 
+    def _open_mongoose_on_startup(self) -> None:
+        """After the caseload finishes loading, open Mongoose in the BACKGROUND
+        and report whether it's signed in — a non-intrusive heads-up so the user
+        knows to sign in before texting (and the session is warm when they do).
+        Runs only once the about:blank popup hang has cleared (post-load)."""
+        if not self.worker.ready_event.is_set():
+            return
+
+        def on_done(res):
+            def set_main():
+                if res and res.get("ok"):
+                    self._append_log("Mongoose: signed in — ready for texting.")
+                elif res and res.get("error"):
+                    pass  # couldn't open; not worth nagging at startup
+                else:
+                    self._append_log(
+                        "⚠ Mongoose isn't signed in — click 🐭 Mongoose to "
+                        "sign in before texting.", error=True)
+            try:
+                self.root.after(0, set_main)
+            except Exception:
+                set_main()
+
+        self.worker.submit_mongoose_login_check(on_done, surface=False)
+
     # Team timezone for converting a student-local schedule time to the tz
     # Mongoose's scheduler enters times in. The team is Eastern; TODO: make
     # this a setting (read Mongoose's .timezone-label) for non-Eastern teams.
@@ -17538,6 +17566,13 @@ class App:
         try:
             self.worker._minimize_browser_window()
             self._append_log("Caseload loaded — minimized the browser.")
+        except Exception:
+            pass
+        # Now that the caseload load has cleared the about:blank popup hang,
+        # open Mongoose in the background + report its sign-in state (so texting
+        # is warm and the user gets an early heads-up if they're logged out).
+        try:
+            self._open_mongoose_on_startup()
         except Exception:
             pass
 
