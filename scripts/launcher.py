@@ -13664,6 +13664,7 @@ class App:
         custom_activities: dict[int, list] = {}
         ea_arg = None
         eas_read = False
+        eas_navigated = False  # did we actually nav to the EA tab (needs re-nav)?
         eas: list = []
         edit_idxs = [i for i, n in enumerate(scenario.notes)
                      if n.enter_additional_text]
@@ -13688,8 +13689,22 @@ class App:
                 sep = "\n" if prefill and not prefill.endswith("\n") else ""
                 prefill = f"{prefill}{sep}{clipboard}"
             if not eas_read:
-                self._append_log("Checking this student's Essential Actions…")
-                eas = self._read_eas_blocking()
+                # Skip the (slow) per-student EA navigation when the startup EA
+                # dashboard scrape already tells us this student has no open EA
+                # — the edit dialog then opens immediately. Only skip on
+                # positive knowledge (we have a Student ID + dashboard data and
+                # the student isn't in it); otherwise read as before.
+                sid = prenav_student_id or (
+                    (self._caseload_row_by_name(chosen_name) or {}).get(
+                        "StudentID", "") if chosen_name else "")
+                ea_by_sid = getattr(self, "_ea_by_sid", {}) or {}
+                if sid and ea_by_sid and not ea_by_sid.get(sid):
+                    eas = []
+                else:
+                    self._append_log(
+                        "Checking this student's Essential Actions…")
+                    eas = self._read_eas_blocking()
+                    eas_navigated = True
                 eas_read = True
             course_default = (n.course_code_override or course_hint
                               or override or "")
@@ -13750,8 +13765,10 @@ class App:
                 return
 
         # Reading EAs switched the record to the EA tab; if we're NOT
-        # attaching, re-open the record so the normal note panel is back.
-        if eas_read and ea_arg is None:
+        # attaching, re-open the record so the normal note panel is back. Only
+        # needed when we ACTUALLY navigated to the EA tab (not when we skipped
+        # the read above) — saves a second navigation for most fires.
+        if eas_navigated and ea_arg is None:
             nav_query = prenav_query or chosen_name
             if nav_query:
                 self._navigate_for_fire_blocking(
