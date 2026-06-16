@@ -11061,7 +11061,9 @@ class App:
         # bar gets too narrow (they're the first to clip).
         self._toggle_row_frame = toggle_frame
         self._toggle_row_mode = None
-        toggle_frame.bind("<Configure>", self._relayout_toggle_row)
+        toggle_frame.bind(
+            "<Configure>",
+            self._debounce_configure(self._relayout_toggle_row))
 
         # Activity-log header: collapse toggle + Copy-to-clipboard. The
         # log box (row 6) can be collapsed to reclaim vertical space.
@@ -11115,7 +11117,27 @@ class App:
         self._btn_open_log.pack(side="left", padx=(8, 0))
         self._bottom_row_frame = bottom
         self._bottom_row_mode = None
-        bottom.bind("<Configure>", self._relayout_bottom_row)
+        bottom.bind(
+            "<Configure>",
+            self._debounce_configure(self._relayout_bottom_row))
+
+    def _debounce_configure(self, fn, delay_ms: int = 80):
+        """Wrap a <Configure> handler so it runs at most once after resizing
+        settles, instead of on every intermediate event during a drag. Several
+        handlers fire per pixel of a window resize; coalescing them (and the
+        layout work they do — e.g. _cap_editor_width reconfigures the editor
+        grid) keeps the drag smooth. The wrapped fn is called with event=None
+        (it reads the current width itself)."""
+        state = {"aid": None}
+
+        def handler(event=None):
+            if state["aid"] is not None:
+                try:
+                    self.root.after_cancel(state["aid"])
+                except Exception:
+                    pass
+            state["aid"] = self.root.after(delay_ms, lambda: fn(None))
+        return handler
 
     def _relayout_toggle_row(self, event=None) -> None:
         """Collapse the rightmost toolbar buttons (Templates/Settings/
@@ -11856,7 +11878,9 @@ class App:
         self.editor_content.grid_columnconfigure(0, weight=0)
         self.editor_content.grid_columnconfigure(1, weight=1)
         self.editor_content.grid_rowconfigure(0, weight=1)
-        self.editor_content.bind("<Configure>", self._cap_editor_width)
+        self.editor_content.bind(
+            "<Configure>",
+            self._debounce_configure(self._cap_editor_width))
 
         paned.add(tabs_holder, minsize=200, width=250, stretch="never")
         paned.add(self.editor_content, minsize=320, stretch="always")
@@ -11926,7 +11950,9 @@ class App:
             font=ctk.CTkFont(size=18), **SECONDARY_BTN_KWARGS,
         )
         self._btn_revert.pack(side="right", padx=4, pady=2)
-        inner.bind("<Configure>", self._relayout_save_row)
+        inner.bind(
+            "<Configure>",
+            self._debounce_configure(self._relayout_save_row))
         # Keep the bar aligned to the form as the window / sash resizes.
         self._editor_tabs_holder.bind(
             "<Configure>", lambda e: self._align_save_row(), add="+")
