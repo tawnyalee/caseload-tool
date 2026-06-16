@@ -10352,12 +10352,17 @@ class CaseloadPanel:
         prefs = self._load_col_prefs()
         visible_order = self._resolve_display_columns(headers, prefs)
         hidden = [c for c in headers if c not in visible_order]
-        # Working model: [header, visible_bool], visible first in order.
-        work = [[c, True] for c in visible_order] + [[c, False] for c in hidden]
+        # Two NATIVE lists (tk.Listbox — instant for the ~100-column set,
+        # unlike a CTk-widget-per-row scroll that rebuilt on every move):
+        #   SHOWN     - visible columns, in order; drag to reorder.
+        #   AVAILABLE - the hidden pool, with a search box.
+        # Move with the buttons or a double-click.
+        shown = list(visible_order)
+        avail = list(hidden)
 
         dlg = ctk.CTkToplevel(self.frame)
         dlg.title("Choose columns")
-        dlg.geometry("440x500")
+        dlg.geometry("640x540")
         try:
             dlg.transient(self.frame.winfo_toplevel())
         except Exception:
@@ -10370,58 +10375,151 @@ class CaseloadPanel:
         dlg.grid_columnconfigure(0, weight=1)
         dlg.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(
-            dlg, text="Show, hide and reorder caseload columns",
+            dlg, text="Drag to reorder shown columns; double-click to move.",
             font=ctk.CTkFont(size=12, weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
-        scroll = ctk.CTkScrollableFrame(dlg)
-        scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
-        scroll.grid_columnconfigure(2, weight=1)
 
-        def move(idx: int, delta: int) -> None:
-            j = idx + delta
-            if 0 <= j < len(work):
-                work[idx], work[j] = work[j], work[idx]
-                redraw()
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(2, weight=1)
+        body.grid_rowconfigure(1, weight=1)
 
-        def redraw() -> None:
-            for w in scroll.winfo_children():
-                w.destroy()
-            for i, pair in enumerate(work):
-                hdr = pair[0]
-                var = ctk.BooleanVar(value=pair[1])
+        _dark = ctk.get_appearance_mode() == "Dark"
+        lb_kw = dict(
+            bg=("#2b2b2b" if _dark else "#ffffff"),
+            fg=("#dce4ee" if _dark else "#1a1a1a"),
+            selectbackground=("#1f6aa5" if _dark else "#3b8ed0"),
+            selectforeground="#ffffff", highlightthickness=0, bd=1,
+            relief="flat", activestyle="none", exportselection=False,
+            selectmode="extended", font=("Segoe UI", 11),
+        )
 
-                def on_toggle(p=pair, v=var):
-                    p[1] = v.get()
+        ctk.CTkLabel(body, text="Shown (in order)").grid(
+            row=0, column=0, sticky="w", padx=2)
+        shown_wrap = tk.Frame(body, bd=0, highlightthickness=0)
+        shown_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        shown_wrap.grid_rowconfigure(0, weight=1)
+        shown_wrap.grid_columnconfigure(0, weight=1)
+        shown_lb = tk.Listbox(shown_wrap, **lb_kw)
+        shown_lb.grid(row=0, column=0, sticky="nsew")
+        shown_sb = ttk.Scrollbar(shown_wrap, command=shown_lb.yview)
+        shown_sb.grid(row=0, column=1, sticky="ns")
+        shown_lb.configure(yscrollcommand=shown_sb.set)
 
-                ctk.CTkButton(
-                    scroll, text="▲", width=26, command=lambda ix=i: move(ix, -1),
-                    **SECONDARY_BTN_KWARGS,
-                ).grid(row=i, column=0, padx=(2, 0), pady=1)
-                ctk.CTkButton(
-                    scroll, text="▼", width=26, command=lambda ix=i: move(ix, 1),
-                    **SECONDARY_BTN_KWARGS,
-                ).grid(row=i, column=1, padx=(2, 4), pady=1)
-                ctk.CTkCheckBox(
-                    scroll, text=caseload_csv.display_for_column(hdr),
-                    variable=var, command=on_toggle,
-                ).grid(row=i, column=2, sticky="w", padx=4, pady=1)
+        mid = ctk.CTkFrame(body, fg_color="transparent")
+        mid.grid(row=1, column=1, padx=4)
 
-        redraw()
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(4, 0))
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(right, text="Available").grid(
+            row=0, column=0, sticky="w", padx=2)
+        search_var = tk.StringVar()
+        ctk.CTkEntry(
+            right, placeholder_text="Search columns...",
+            textvariable=search_var,
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        avail_wrap = tk.Frame(right, bd=0, highlightthickness=0)
+        avail_wrap.grid(row=2, column=0, sticky="nsew")
+        avail_wrap.grid_rowconfigure(0, weight=1)
+        avail_wrap.grid_columnconfigure(0, weight=1)
+        avail_lb = tk.Listbox(avail_wrap, **lb_kw)
+        avail_lb.grid(row=0, column=0, sticky="nsew")
+        avail_sb = ttk.Scrollbar(avail_wrap, command=avail_lb.yview)
+        avail_sb.grid(row=0, column=1, sticky="ns")
+        avail_lb.configure(yscrollcommand=avail_sb.set)
+
+        disp = caseload_csv.display_for_column
+        avail_view = []  # headers currently rendered in avail_lb (filtered)
+
+        def refresh_shown(sel=None):
+            shown_lb.delete(0, "end")
+            for h in shown:
+                shown_lb.insert("end", disp(h))
+            if sel is not None and 0 <= sel < len(shown):
+                shown_lb.selection_clear(0, "end")
+                shown_lb.selection_set(sel)
+                shown_lb.activate(sel)
+
+        def refresh_avail():
+            nonlocal avail_view
+            q = search_var.get().strip().lower()
+            avail_view = [h for h in avail if q in disp(h).lower()]
+            avail_lb.delete(0, "end")
+            for h in avail_view:
+                avail_lb.insert("end", disp(h))
+
+        def hide_selected():
+            idxs = sorted(shown_lb.curselection(), reverse=True)
+            if not idxs:
+                return
+            for i in idxs:
+                avail.append(shown.pop(i))
+            avail.sort(key=lambda h: disp(h).lower())
+            refresh_shown()
+            refresh_avail()
+
+        def show_selected():
+            picks = [avail_view[i] for i in avail_lb.curselection()
+                     if 0 <= i < len(avail_view)]
+            if not picks:
+                return
+            for h in picks:
+                if h in avail:
+                    avail.remove(h)
+                shown.append(h)
+            refresh_shown()
+            refresh_avail()
+
+        # Drag within SHOWN to reorder (native Listbox; no rebuild storm).
+        drag = {"i": None}
+
+        def on_press(e):
+            drag["i"] = shown_lb.nearest(e.y)
+
+        def on_motion(e):
+            i = drag["i"]
+            if i is None:
+                return
+            j = shown_lb.nearest(e.y)
+            if j < 0 or j == i or j >= len(shown):
+                return
+            shown.insert(j, shown.pop(i))
+            drag["i"] = j
+            refresh_shown(sel=j)
+
+        def on_release(e):
+            drag["i"] = None
+
+        shown_lb.bind("<ButtonPress-1>", on_press, add="+")
+        shown_lb.bind("<B1-Motion>", on_motion)
+        shown_lb.bind("<ButtonRelease-1>", on_release)
+        shown_lb.bind("<Double-Button-1>", lambda e: hide_selected())
+        avail_lb.bind("<Double-Button-1>", lambda e: show_selected())
+        search_var.trace_add("write", lambda *_: refresh_avail())
+
+        ctk.CTkButton(mid, text="◄ Show", width=84, command=show_selected,
+                      **SECONDARY_BTN_KWARGS).pack(pady=(0, 6))
+        ctk.CTkButton(mid, text="Hide ►", width=84, command=hide_selected,
+                      **SECONDARY_BTN_KWARGS).pack()
+
+        refresh_shown()
+        refresh_avail()
 
         btns = ctk.CTkFrame(dlg, fg_color="transparent")
         btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 10))
 
-        def do_apply() -> None:
-            visible = [p[0] for p in work if p[1]]
-            if not visible:
+        def do_apply():
+            if not shown:
                 from tkinter import messagebox
                 messagebox.showinfo(
                     "Columns", "Keep at least one column visible.")
                 return
-            hidden2 = [p[0] for p in work if not p[1]]
             import json
             payload = {
-                "visible": visible, "hidden": hidden2,
+                "visible": list(shown), "hidden": list(avail),
                 "widths": self._current_col_widths(),
             }
             self.app.settings.caseload_columns = json.dumps(payload)
@@ -10429,18 +10527,19 @@ class CaseloadPanel:
             self._apply_column_layout(headers)
             dlg.destroy()
 
-        def check_all() -> None:
-            # Reveal every column WITHOUT changing the current order.
-            for p in work:
-                p[1] = True
-            redraw()
+        def show_all():
+            # Reveal everything: keep current shown order, append the rest.
+            for h in list(avail):
+                shown.append(h)
+            avail.clear()
+            refresh_shown()
+            refresh_avail()
 
-        def copy_caseload() -> None:
-            # Match the live Salesforce Caseload view's columns + order.
+        def copy_caseload():
             from tkinter import messagebox
             if not self.app.worker.ready_event.is_set():
                 messagebox.showinfo(
-                    "Copy caseload", "Browser not ready yet — try again "
+                    "Copy caseload", "Browser not ready yet - try again "
                     "once it's loaded.")
                 return
             cols = self.app._read_caseload_columns_blocking()
@@ -10461,9 +10560,11 @@ class CaseloadPanel:
                     "None of the caseload view's columns matched the CSV "
                     "export.")
                 return
-            rest = [h for h in headers if h not in view]
-            work[:] = [[h, True] for h in view] + [[h, False] for h in rest]
-            redraw()
+            shown[:] = view
+            avail[:] = sorted((h for h in headers if h not in view),
+                              key=lambda h: disp(h).lower())
+            refresh_shown()
+            refresh_avail()
 
         ctk.CTkButton(btns, text="Apply", width=70, command=do_apply).pack(
             side="right", padx=(6, 0))
@@ -10472,7 +10573,7 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         ).pack(side="right", padx=(6, 0))
         ctk.CTkButton(
-            btns, text="Show all", width=78, command=check_all,
+            btns, text="Show all", width=78, command=show_all,
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
         ctk.CTkButton(
