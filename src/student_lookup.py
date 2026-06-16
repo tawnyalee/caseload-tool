@@ -721,12 +721,21 @@ def gather_caseload_matches(
     page: Page,
     query: str,
     on_status=None,
+    max_scan_rows: int = 50,
 ) -> list[tuple]:
     """Return matching rows from Caseload tables WITHOUT clicking.
 
     Each tuple is (priority, row_locator, student_name, name_col_idx),
     sorted by priority ascending. Use click_caseload_row() to act on a
     chosen match.
+
+    Scanning a row is a per-row DOM round-trip, so a table with more than
+    `max_scan_rows` data rows is SKIPPED (returns no matches from it) — the
+    caller then narrows the list with Salesforce's server-side row filter and
+    re-gathers on the ~1 matching row. Normally the list only renders ~10-30
+    rows, but the startup task-status scrape scrolls the WHOLE caseload into the
+    DOM (250+ rows); without this guard a single find then scanned all of them
+    (seconds). Set max_scan_rows high to force a full scan.
     """
     def diag(msg: str) -> None:
         if on_status:
@@ -752,7 +761,7 @@ def gather_caseload_matches(
     for i in range(n_tables):
         table = tables.nth(i)
         headers = table.locator("th").all_text_contents()
-        diag(f"  [search] table {i} headers: {[h.strip()[:30] for h in headers]}")
+        diag(f"  [search] table {i}: {len(headers)} columns")
         name_idx = next(
             (j for j, h in enumerate(headers) if h.strip() == "Name"),
             None,
@@ -772,6 +781,14 @@ def gather_caseload_matches(
         rows = table.locator("tr")
         n_rows = rows.count()
         diag(f"  [search] table {i}: {n_rows} <tr>, Name col idx {name_idx}")
+
+        # The whole caseload is loaded in the DOM (post task-status scrape) —
+        # scanning every row is hundreds of round-trips. Skip it; the caller
+        # falls back to the server-side row filter, which narrows to a match.
+        if (n_rows - 1) > max_scan_rows:
+            diag(f"  [search] table {i}: {n_rows - 1} rows loaded — skipping "
+                 "full scan, will use the row filter")
+            continue
 
         for r in range(1, n_rows):
             row = rows.nth(r)
