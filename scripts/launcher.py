@@ -8695,6 +8695,14 @@ class CaseloadPanel:
         # Task pass/fail is now a normal "Task Status" filter inside the
         # Filters section below, so it works for the viewer AND batch
         # actions via the shared filter engine.)
+        # Saved Views dropdown — switch column-set + filter bundles. Sits just
+        # left of the Filters/Columns buttons (col 3; the search box at col 2
+        # expands, pushing this into the right-side cluster).
+        self.view_menu = ctk.CTkOptionMenu(
+            bar, values=["View ▾"], width=130, command=self._on_view_select,
+        )
+        self.view_menu.grid(row=0, column=3, padx=(0, 4))
+        self._refresh_view_menu()  # populate with any saved views
         # Filters toggle — shows/hides the collapsible column-filter
         # section (same builder the batch scenarios use).
         self.filters_toggle_btn = ctk.CTkButton(
@@ -10239,6 +10247,164 @@ class CaseloadPanel:
             return caseload_filter.apply_filters(filters, rows)
         except Exception:
             return list(rows)
+
+    # ----- saved Views (named column-set + filter bundles) -----
+
+    _VIEW_SAVE = "＋ Save current as…"
+    _VIEW_MANAGE = "⚙ Manage views…"
+
+    def _load_views(self) -> list:
+        import json
+        raw = (self.app.settings.caseload_views or "").strip()
+        if not raw:
+            return []
+        try:
+            v = json.loads(raw)
+            return [x for x in v if isinstance(x, dict) and x.get("name")] \
+                if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    def _save_views(self, views: list) -> None:
+        import json
+        self.app.settings.caseload_views = json.dumps(views)
+        save_settings(self.app.settings)
+
+    def _view_headers(self) -> list:
+        rows = self.app._caseload_rows or []
+        if not rows:
+            return []
+        return [h for h in rows[0].keys() if not _is_task_facet_col(h)]
+
+    def _capture_current_view(self, name: str) -> dict:
+        """Snapshot the current columns (order + shown/hidden) and filters."""
+        headers = self._view_headers()
+        self.persist_column_state()  # fold in any width drags
+        prefs = self._load_col_prefs()
+        visible = self._resolve_display_columns(headers, prefs)
+        hidden = [h for h in headers if h not in visible]
+        filters = [f for f in (r.serialize() for r in self.filter_rows)
+                   if f.get("column", "").strip()]
+        return {"name": name, "visible": visible, "hidden": hidden,
+                "filters": filters}
+
+    def _apply_view(self, view: dict) -> None:
+        """Apply a saved view: set its columns + rebuild its filters, re-render."""
+        import json
+        headers = self._view_headers()
+        if not headers:
+            return
+        visible = [c for c in view.get("visible", []) if c in headers]
+        hidden = [c for c in view.get("hidden", []) if c in headers]
+        seen = set(visible) | set(hidden)
+        hidden += [h for h in headers if h not in seen]  # new columns -> hidden
+        if not visible:
+            visible = headers[:1]
+        self.app.settings.caseload_columns = json.dumps(
+            {"visible": visible, "hidden": hidden,
+             "widths": self._current_col_widths()})
+        # Rebuild filters from the view.
+        for r in list(self.filter_rows):
+            self._delete_filter_row(r)
+        flts = view.get("filters", []) or []
+        if flts and not self._filters_open:
+            self._toggle_filters()
+        for f in flts:
+            self._add_filter_row(prefilled=f)
+        self._active_filters = [f for f in flts if f.get("column", "").strip()]
+        self.app.settings.caseload_current_view = view.get("name", "")
+        save_settings(self.app.settings)
+        self._apply_column_layout(headers)
+        self.populate()
+        self._refresh_view_menu()
+
+    def _refresh_view_menu(self) -> None:
+        if not hasattr(self, "view_menu"):
+            return
+        views = self._load_views()
+        names = [v["name"] for v in views]
+        values = names + [self._VIEW_SAVE]
+        if names:
+            values.append(self._VIEW_MANAGE)
+        self.view_menu.configure(values=values)
+        cur = self.app.settings.caseload_current_view or ""
+        self.view_menu.set(cur if cur in names else (names[0] if names
+                                                     else "View ▾"))
+
+    def _on_view_select(self, choice: str) -> None:
+        if choice == self._VIEW_SAVE:
+            self._save_view_dialog()
+        elif choice == self._VIEW_MANAGE:
+            self._manage_views_dialog()
+        else:
+            by_name = {v["name"]: v for v in self._load_views()}
+            if choice in by_name:
+                self._apply_view(by_name[choice])
+                self.app._append_log(f"Applied view {choice!r}.")
+        self._refresh_view_menu()
+
+    def _save_view_dialog(self) -> None:
+        from tkinter import simpledialog
+        if not (self.app._caseload_rows or []):
+            return
+        name = simpledialog.askstring(
+            "Save view", "Name this view (columns + filters):",
+            parent=self.frame.winfo_toplevel())
+        if not name or not name.strip():
+            self._refresh_view_menu()
+            return
+        name = name.strip()
+        views = [v for v in self._load_views() if v["name"] != name]
+        views.append(self._capture_current_view(name))
+        self._save_views(views)
+        self.app.settings.caseload_current_view = name
+        save_settings(self.app.settings)
+        self.app._append_log(f"Saved view {name!r}.")
+
+    def _manage_views_dialog(self) -> None:
+        views = self._load_views()
+        dlg = ctk.CTkToplevel(self.frame)
+        dlg.title("Manage views")
+        dlg.geometry("360x360")
+        try:
+            dlg.transient(self.frame.winfo_toplevel())
+            dlg.grab_set()
+        except Exception:
+            pass
+        ctk.CTkLabel(
+            dlg, text="Saved views", font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+        body = ctk.CTkScrollableFrame(dlg)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
+        def rebuild():
+            for w in body.winfo_children():
+                w.destroy()
+            vs = self._load_views()
+            if not vs:
+                ctk.CTkLabel(body, text="(no saved views)",
+                             text_color=("gray45", "gray60")).pack(pady=8)
+            for v in vs:
+                rowf = ctk.CTkFrame(body, fg_color="transparent")
+                rowf.pack(fill="x", pady=2)
+                ctk.CTkLabel(
+                    rowf, text=f"{v['name']}  ·  {len(v.get('visible', []))} "
+                    f"cols, {len(v.get('filters', []))} filters",
+                    anchor="w").pack(side="left", fill="x", expand=True, padx=4)
+
+                def _del(name=v["name"]):
+                    self._save_views(
+                        [x for x in self._load_views() if x["name"] != name])
+                    if self.app.settings.caseload_current_view == name:
+                        self.app.settings.caseload_current_view = ""
+                        save_settings(self.app.settings)
+                    self._refresh_view_menu()
+                    rebuild()
+                ctk.CTkButton(rowf, text="Delete", width=70, command=_del,
+                              **SECONDARY_BTN_KWARGS).pack(side="right", padx=4)
+        rebuild()
+        ctk.CTkButton(dlg, text="Close", width=80, command=dlg.destroy,
+                      **SECONDARY_BTN_KWARGS).pack(pady=(0, 10))
 
     # ----- column show/hide + reorder + width persistence -----
 

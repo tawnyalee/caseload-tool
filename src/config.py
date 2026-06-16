@@ -237,6 +237,11 @@ class Settings:
     # Columns the user has never seen (new CSV exports) default to visible
     # and append after the saved order.
     caseload_columns: str = ""
+    # Saved viewer "Views": named bundles of {columns + filters} the user can
+    # switch between from the viewer's View dropdown. JSON list of
+    # {"name", "visible": [...], "hidden": [...], "filters": [...]}.
+    caseload_views: str = ""
+    caseload_current_view: str = ""   # last-applied view name (for the dropdown)
     # Warn (red activity-log line) before a batch/selection fire when the
     # cached caseload CSV is older than this many MINUTES. 0 = never warn.
     caseload_stale_minutes: int = 720  # 12 h
