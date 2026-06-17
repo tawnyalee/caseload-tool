@@ -6486,8 +6486,16 @@ def prompt_batch_email_review(
         if _syncing["on"]:
             return
         iid = review_tree.focus()
-        if iid:
-            _show(int(iid))
+        if not iid:
+            return
+        idx = int(iid)
+        # Already showing this row → do nothing. This breaks the feedback loop:
+        # _show() calls _select_in_tree() which can fire a *queued*
+        # <<TreeviewSelect>> after _syncing has reset, which would re-enter
+        # _show() and spin the event loop forever.
+        if idx == state["current"]:
+            return
+        _show(idx)
 
     review_tree.bind("<Button-1>", _on_review_click)
     review_tree.bind("<<TreeviewSelect>>", _on_tree_select)
