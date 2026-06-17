@@ -293,6 +293,15 @@ class Settings:
     #   "standard" — also normalize ALL-CAPS to Title case, preserving
     #                intentional mixed case (McDonald, O'Brien)
     name_capitalization: str = "standard"
+    # Note-body editors: when True (default), Enter submits the note and
+    # Shift+Enter inserts a newline. When False, Enter inserts a newline like
+    # a normal text box and the note is submitted only via the button.
+    enter_submits_note: bool = True
+    # Caseload-panel "Fire action" menu: JSON list of scenario names, in the
+    # order they appear in the right-click / Right-arrow action menu. Empty =
+    # fall back to the per-scenario "Show as a caseload-panel action" flags
+    # (or every non-batch scenario when none are flagged).
+    panel_action_order: str = ""
 
 
 def load_settings() -> Settings:

@@ -5041,6 +5041,51 @@ def _save_dialog_geometry(dialog, key: str) -> None:
         pass
 
 
+def _fit_dialog_to_content(dialog, min_w: int = 0, min_h: int = 0,
+                           near_mouse: bool = False) -> None:
+    """Grow a popup so all of its packed content is visible, then pin that as
+    the minimum size. Needed for dialogs whose height varies with optional
+    sections (e.g. the note editor's Essential Actions block, which sits at
+    the bottom and was getting clipped when a smaller geometry was restored
+    from an earlier no-EA session). Never shrinks an already-larger window,
+    and clamps to the screen so it can't open off-edge.
+
+    `near_mouse` places the (sized) window just up-left of the pointer so the
+    cursor barely travels, instead of keeping any remembered position."""
+    try:
+        dialog.update_idletasks()
+        req_w = max(int(min_w), dialog.winfo_reqwidth())
+        req_h = max(int(min_h), dialog.winfo_reqheight())
+        sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+        # Don't exceed the screen (leave a margin for the taskbar/title bar).
+        max_w = max(req_w, sw - 40)
+        max_h = max(req_h, sh - 80)
+        req_w, req_h = min(req_w, max_w), min(req_h, max_h)
+        geo = dialog.geometry()  # "WxH+X+Y" (W/H may be the 1x1 placeholder)
+        m = re.match(r"(\d+)x(\d+)", geo)
+        cur_w = int(m.group(1)) if m else 0
+        cur_h = int(m.group(2)) if m else 0
+        new_w = min(max(cur_w, req_w), max_w)
+        new_h = min(max(cur_h, req_h), max_h)
+        dialog.minsize(req_w, req_h)
+        if near_mouse:
+            try:
+                px, py = dialog.winfo_pointerxy()
+            except Exception:
+                px, py = 0, 0
+            x = min(max(px - 30, 0), max(sw - new_w, 0))
+            y = min(max(py - 30, 0), max(sh - new_h, 0))
+            dialog.geometry(f"{new_w}x{new_h}+{x}+{y}")
+        else:
+            # Keep a remembered position; for a fresh (1x1 placeholder)
+            # dialog, set size only and let the window manager place it.
+            has_pos = cur_w > 1 and cur_h > 1 and "+" in geo
+            pos = geo[geo.index("+"):] if has_pos else ""
+            dialog.geometry(f"{new_w}x{new_h}{pos}")
+    except Exception:
+        pass
+
+
 def prompt_calendar_pick(parent, initial_date=None):
     """Small monthly calendar picker. Click a day → returns that
     `datetime.date`. Returns None on cancel. Built from CTk widgets
@@ -5343,10 +5388,13 @@ def prompt_find_and_pick(
     return result["value"]
 
 
-def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
+def prompt_additional_text(parent, label: str, prefilled: str,
+                           enter_submits: bool = True) -> Optional[str]:
     """Blocking modal: multi-line edit of a note body, pre-filled.
-    Returns the new body (no strip), or None if cancelled. Enter
-    submits, Shift+Enter inserts a newline, Esc cancels.
+    Returns the new body (no strip), or None if cancelled. When
+    `enter_submits` (the default), Enter submits and Shift+Enter inserts a
+    newline; when False, Enter inserts a newline and only the button submits.
+    Esc always cancels.
 
     Pre-fill rule: if the body doesn't already end in whitespace, a
     single trailing space is added so the user can start typing
@@ -5362,12 +5410,11 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
 
     result: dict = {"value": None}
 
+    hint = ("Enter = submit · Shift+Enter = newline · Esc = cancel"
+            if enter_submits else "Esc = cancel")
     ctk.CTkLabel(
         dialog,
-        text=(
-            f"{label}: edit or add to the body. "
-            "Enter = submit · Shift+Enter = newline · Esc = cancel"
-        ),
+        text=f"{label}: edit or add to the body.  {hint}",
         justify="left",
     ).pack(padx=12, pady=(10, 4), anchor="w")
 
@@ -5402,8 +5449,9 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
         text_box.insert("insert", "\n")
         return "break"
 
-    text_box.bind("<Return>", submit)
-    text_box.bind("<Shift-Return>", insert_newline)
+    if enter_submits:
+        text_box.bind("<Return>", submit)
+        text_box.bind("<Shift-Return>", insert_newline)
     dialog.bind("<Escape>", cancel)
     dialog.protocol("WM_DELETE_WINDOW", cancel)
 
@@ -5420,15 +5468,31 @@ def prompt_additional_text(parent, label: str, prefilled: str) -> Optional[str]:
 
 
 def prompt_edit_note(parent, label, body_prefill, course_default,
-                     activities_on, eas):
-    """Unified fire-time note dialog: edit the body, course code, and
-    academic activities, and — when the student has open Essential
+                     activities_on, eas, enter_submits: bool = True,
+                     interaction_type: str = "",
+                     interaction_format: str = "Single Interaction"):
+    """Unified fire-time note dialog: edit the body, course code, note type,
+    and academic activities, and — when the student has open Essential
     Actions — attach/close one. Returns
-    {body, course, activities, ea} (ea = (reason, course, close) or None)
-    or None if cancelled."""
+    {body, course, type, activities, ea} (ea = (reason, course, close) or
+    None) or None if cancelled.
+
+    The Note type dropdown defaults to the action's `interaction_type`;
+    picking a type that doesn't take academic activities (e.g. "Email to
+    Student", "Admin Note") disables the activity checkboxes.
+
+    When `enter_submits` (the default), Enter in the body submits the note
+    and Shift+Enter inserts a newline; when False, Enter inserts a newline
+    and the note is submitted only via the Continue button."""
     dialog = ctk.CTkToplevel(parent)
     dialog.title(f"Edit note — {label}")
-    _restore_dialog_geometry(dialog, "edit_note")
+    # Open near the mouse (not where it was last). The final size + on-screen
+    # clamp is applied after the content is built, keeping it near the cursor.
+    try:
+        _px, _py = dialog.winfo_pointerxy()
+        dialog.geometry(f"+{max(_px - 30, 0)}+{max(_py - 30, 0)}")
+    except Exception:
+        pass
     dialog.transient(parent)
     dialog.attributes("-topmost", True)
     dialog.grab_set()
@@ -5449,27 +5513,70 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
     if course_default:
         course_entry.insert(0, course_default)
 
+    # Note type — defaults to the action's type; drives whether the academic
+    # activity checkboxes below are usable for this type.
+    fmt = interaction_format or "Single Interaction"
+    type_choices = types_for_format(fmt)
+    trow = ctk.CTkFrame(dialog, fg_color="transparent")
+    trow.pack(fill="x", padx=12, pady=(2, 2))
+    ctk.CTkLabel(trow, text="Note type:", width=90, anchor="w").pack(side="left")
+    type_var = ctk.StringVar(value=interaction_type or "")
+    type_combo = ctk.CTkComboBox(
+        trow, values=type_choices, variable=type_var, state="readonly",
+        width=260, command=lambda _v=None: _sync_activities(),
+    )
+    type_combo.pack(side="left")
+
     ctk.CTkLabel(dialog, text="Note body:", anchor="w").pack(
         fill="x", padx=12, pady=(6, 0))
     text_box = ctk.CTkTextbox(dialog, wrap="word", height=150)
-    text_box.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+    text_box.pack(fill="both", expand=True, padx=12, pady=(0, 0))
     c = body_prefill or ""
     if c and c[-1] not in (" ", "\n", "\t"):
         c += " "
     text_box.insert("1.0", c)
     text_box.mark_set("insert", "end-1c")
+    if enter_submits:
+        ctk.CTkLabel(
+            dialog, text="Press Shift+Enter for a new line · Enter submits",
+            anchor="w", font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray60"),
+        ).pack(fill="x", padx=12, pady=(1, 4))
 
-    ctk.CTkLabel(dialog, text="Academic activities:", anchor="w").pack(
-        fill="x", padx=12, pady=(6, 0))
+    act_hdr = ctk.CTkLabel(dialog, text="Academic activities:", anchor="w")
+    act_hdr.pack(fill="x", padx=12, pady=(6, 0))
     act_frame = ctk.CTkFrame(dialog, fg_color=("gray95", "gray18"))
     act_frame.pack(fill="x", padx=12, pady=(0, 4))
     act_vars = {}
+    act_boxes = []
     for lbl in ACADEMIC_ACTIVITY_LABELS:
         v = ctk.BooleanVar(value=(lbl in (activities_on or [])))
         act_vars[lbl] = v
-        ctk.CTkCheckBox(
+        cb = ctk.CTkCheckBox(
             act_frame, text=lbl, variable=v, font=ctk.CTkFont(size=11),
-        ).pack(anchor="w", padx=8, pady=1)
+        )
+        cb.pack(anchor="w", padx=8, pady=1)
+        act_boxes.append(cb)
+
+    def _sync_activities(_v=None) -> None:
+        """Enable/disable the academic-activity checkboxes for the selected
+        note type — types like 'Email to Student' / 'Admin Note' don't take
+        them (matching the live Caseload form), so they're grayed + cleared."""
+        disabled = activities_disabled_for(fmt, type_var.get())
+        for cb in act_boxes:
+            try:
+                if disabled:
+                    cb.deselect()
+                    cb.configure(state="disabled")
+                else:
+                    cb.configure(state="normal")
+            except Exception:
+                pass
+        act_hdr.configure(
+            text=("Academic activities:  (not used for this note type)"
+                  if disabled else "Academic activities:"))
+
+    _sync_activities()  # apply the initial state for the action's type
 
     ea_sel = ctk.StringVar(value="skip")
     ea_close = ctk.BooleanVar(value=False)
@@ -5502,17 +5609,20 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
             ea = eas[int(v)]
             ea_choice = (ea.get("reason", ""), ea.get("course", ""),
                          bool(ea_close.get()))
+        chosen_type = type_var.get().strip()
+        # Never send activities for a type that doesn't take them.
+        acts = ([] if activities_disabled_for(fmt, chosen_type)
+                else [l for l, vv in act_vars.items() if vv.get()])
         res["value"] = {
             "body": text_box.get("1.0", "end-1c"),
             "course": course_entry.get().strip(),
-            "activities": [l for l, vv in act_vars.items() if vv.get()],
+            "type": chosen_type,
+            "activities": acts,
             "ea": ea_choice,
         }
-        _save_dialog_geometry(dialog, "edit_note")
         _close()
 
     def _cancel(_e=None):
-        _save_dialog_geometry(dialog, "edit_note")
         _close()
 
     def _close():
@@ -5531,6 +5641,17 @@ def prompt_edit_note(parent, label, body_prefill, course_default,
     ).pack(side="left", padx=4)
     dialog.bind("<Escape>", _cancel)
     dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    # Enter in the body submits, Shift+Enter inserts a newline (default).
+    if enter_submits:
+        def _newline(_e=None):
+            text_box.insert("insert", "\n")
+            return "break"
+        text_box.bind("<Return>", lambda _e: (_cont(), "break")[1])
+        text_box.bind("<Shift-Return>", _newline)
+    # Size to fit the whole form (the Academic Activities + Essential Actions
+    # blocks and the buttons sit at the bottom and were getting clipped), and
+    # place it near the mouse.
+    _fit_dialog_to_content(dialog, min_w=480, near_mouse=True)
     parent.wait_window(dialog)
     return res["value"]
 
@@ -8924,6 +9045,10 @@ class CaseloadPanel:
                 self.tree.bind(seq, self._on_row_menu_key)
             except Exception:
                 pass
+        # Right arrow also opens the row menu, with "Fire action" pre-
+        # highlighted — so a second Right arrow drops straight into the
+        # actions list. (Flat rows have no native Right-arrow behavior.)
+        self.tree.bind("<Right>", self._on_row_menu_key)
         # Enter on a focused row opens it (switch tab), matching dbl-click.
         self.tree.bind("<Return>", self._on_row_open_key)
         # Left-click in the leading checkbox column toggles that row's
@@ -9200,13 +9325,16 @@ class CaseloadPanel:
 
     def _build_detail_pane(self) -> None:
         """Bottom pane of the panel: an instant quick-view box for the
-        highlighted student, then (on Enter) the on-demand note viewer.
-        Quick view + notes live in ONE scrollable body so neither can be
-        squeezed to zero height when the pane is short."""
+        highlighted student, then (on Enter) the on-demand note viewer. The
+        info/notes body below reflows by width — see _build_detail_body —
+        with the student info + Essential Action pinned on the left and the
+        notes scrolling on the right when there's room, else stacked in a
+        single scroll."""
         self.detail_frame = ctk.CTkFrame(self.vpane)
         self.detail_frame.grid_columnconfigure(0, weight=1)
         self.detail_frame.grid_rowconfigure(1, weight=1)
         self._detail_collapsed = False
+        self._detail_wide = None  # last applied one/two-column layout mode
 
         # Header (always visible): collapse · name · Review notes · Fields.
         hdr = ctk.CTkFrame(self.detail_frame, fg_color="transparent")
@@ -9233,46 +9361,136 @@ class CaseloadPanel:
         )
         self.qv_fields_btn.grid(row=0, column=3, padx=(6, 0))
 
-        # One scrollable body holding the quick view then the notes.
-        self.detail_scroll = ctk.CTkScrollableFrame(
-            self.detail_frame, fg_color=("gray94", "gray16"),
-        )
-        self.detail_scroll.grid(row=1, column=0, sticky="nsew",
-                                padx=4, pady=(0, 6))
-        # Two columns: basic info (left) + Essential Actions (right). Notes
-        # span both, below.
-        self.detail_scroll.grid_columnconfigure(0, weight=3)
-        self.detail_scroll.grid_columnconfigure(1, weight=2)
-        self.qv_body = ctk.CTkFrame(self.detail_scroll, fg_color="transparent")
-        self.qv_body.grid(row=0, column=0, sticky="new", padx=4, pady=(2, 4))
-        self.qv_body.grid_columnconfigure(1, weight=1)
-        # Essential Actions panel — to the right of the basic info.
-        self.qv_ea_frame = ctk.CTkFrame(
-            self.detail_scroll, fg_color=("gray90", "gray22"), corner_radius=6)
-        self.qv_ea_frame.grid(row=0, column=1, sticky="new", padx=(4, 4),
-                              pady=(2, 4))
-        self.qv_ea_frame.grid_columnconfigure(0, weight=1)
-        self.notes_title = ctk.CTkLabel(
-            self.detail_scroll, text="Notes", anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        )
-        self.notes_title.grid(row=1, column=0, columnspan=2, sticky="w",
-                              padx=6, pady=(2, 0))
-        self.notes_holder = ctk.CTkFrame(
-            self.detail_scroll, fg_color="transparent")
-        self.notes_holder.grid(row=2, column=0, columnspan=2, sticky="ew",
-                               padx=2, pady=2)
-        self.notes_holder.grid_columnconfigure(0, weight=1)
-        # Ctrl +/- and Ctrl+wheel resize the note text while reading.
-        bind_font_hotkeys("notes", self.detail_scroll)
-        # The notes themselves render into a single native tk.Text (created
-        # lazily) rather than one CTk card per note — a student can have dozens
-        # of notes, and N canvas-backed CTk widgets repaint slowly on resize.
-        self._notes_text = None
+        # The info/notes body is (re)built per width mode by
+        # _build_detail_body — wide pins the info on the left with a separate
+        # notes scroll; narrow puts everything in one scroll. Both share the
+        # same notes state below.
+        self.detail_body = None
         self._notes_open = set()
         self._notes_last_w = None
         self._last_notes = None
+        self._last_notes_label = ""
+        self._notes_text = None
+        # Reflow (rebuild) when the pane crosses the width breakpoint.
+        self.detail_frame.bind("<Configure>", self._on_detail_configure)
+        self._apply_detail_layout(force=True)
+
+    def _build_detail_body(self, wide: bool) -> None:
+        """(Re)build the info/notes widget tree for the given width mode.
+        Wide: info + Essential Action pinned on the LEFT, notes in their own
+        scroll on the RIGHT (info stays on screen while notes scroll).
+        Narrow: a single scroll holds info + EA then the notes, so the whole
+        thing scrolls together. Rebuilt only when the mode flips."""
+        old = getattr(self, "detail_body", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+
+        if wide:
+            self.detail_body = ctk.CTkFrame(
+                self.detail_frame, fg_color="transparent")
+            self.detail_body.grid_columnconfigure(0, weight=3)
+            self.detail_body.grid_columnconfigure(1, weight=5)
+            self.detail_body.grid_rowconfigure(0, weight=1)
+            self.qv_col = ctk.CTkFrame(self.detail_body, fg_color="transparent")
+            self.qv_col.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+            self.notes_col = ctk.CTkScrollableFrame(
+                self.detail_body, fg_color=("gray94", "gray16"))
+            self.notes_col.grid(row=0, column=1, sticky="nsew")
+            notes_parent = self.notes_col
+            self._notes_scroll = self.notes_col   # the scrolling container
+            nb = 0                                 # notes start at row 0
+        else:
+            # One scroll holds info + EA + notes stacked, so it all scrolls.
+            self.detail_body = ctk.CTkScrollableFrame(
+                self.detail_frame, fg_color=("gray94", "gray16"))
+            self.detail_body.grid_columnconfigure(0, weight=1)
+            self.qv_col = ctk.CTkFrame(self.detail_body, fg_color="transparent")
+            self.qv_col.grid(row=0, column=0, sticky="ew")
+            self.notes_col = self.detail_body   # notes render into the scroll
+            notes_parent = self.detail_body
+            self._notes_scroll = self.detail_body
+            nb = 1                               # notes stack below qv_col
+
+        self.detail_body.grid(row=1, column=0, sticky="nsew",
+                              padx=4, pady=(0, 6))
+        # Alias used by resize-freeze + collapse (hides/shows the whole body).
+        self.detail_scroll = self.detail_body
+
+        # Left column: basic info (top) + Essential Action (below).
+        self.qv_col.grid_columnconfigure(0, weight=1)
+        self.qv_body = ctk.CTkFrame(self.qv_col, fg_color="transparent")
+        self.qv_body.grid(row=0, column=0, sticky="new", padx=4, pady=(2, 4))
+        self.qv_body.grid_columnconfigure(1, weight=1)
+        self.qv_ea_frame = ctk.CTkFrame(
+            self.qv_col, fg_color=("gray90", "gray22"), corner_radius=6)
+        self.qv_ea_frame.grid(row=1, column=0, sticky="new", padx=4,
+                              pady=(2, 4))
+        self.qv_ea_frame.grid_columnconfigure(0, weight=1)
+
+        # Notes area: last action + latest course note pinned at the top
+        # (qv_notehead), then the full notes.
+        self.qv_notehead = ctk.CTkFrame(notes_parent, fg_color="transparent")
+        self.qv_notehead.grid(row=nb, column=0, sticky="ew", padx=2, pady=(2, 0))
+        self.qv_notehead.grid_columnconfigure(0, weight=1)
+        self.notes_title = ctk.CTkLabel(
+            notes_parent, text="Notes", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.notes_title.grid(row=nb + 1, column=0, sticky="w",
+                              padx=6, pady=(2, 0))
+        self.notes_holder = ctk.CTkFrame(notes_parent, fg_color="transparent")
+        self.notes_holder.grid(row=nb + 2, column=0, sticky="ew", padx=2, pady=2)
+        self.notes_holder.grid_columnconfigure(0, weight=1)
+
+        # Ctrl +/- and Ctrl+wheel resize the note text while reading.
+        bind_font_hotkeys("notes", self.detail_body)
+        # The notes render into a single lazily-built tk.Text — reset so it's
+        # recreated inside the new notes_holder.
+        self._notes_text = None
+        self._notes_open = set()
+        self._notes_last_w = None
         self._notes_hint()
+
+    def _on_detail_configure(self, event=None) -> None:
+        self._apply_detail_layout()
+
+    def _apply_detail_layout(self, force: bool = False) -> None:
+        """Rebuild the info/notes body in the right mode (two pinned columns
+        when wide, one scroll when narrow) when the pane crosses the width
+        breakpoint. Preserves the selected student + any loaded notes."""
+        try:
+            w = self.detail_frame.winfo_width()
+        except Exception:
+            return
+        if w <= 1:
+            # Not sized yet. On the initial forced call, assume wide (the
+            # common desktop case); the first real <Configure> corrects it.
+            if self._detail_wide is not None or not force:
+                return
+            wide = True
+        else:
+            wide = w >= 720
+        if not force and wide == self._detail_wide:
+            return
+        self._detail_wide = wide
+        # Preserve loaded notes + the current selection across the rebuild.
+        prev_notes = getattr(self, "_last_notes", None)
+        prev_label = getattr(self, "_last_notes_label", "")
+        self._build_detail_body(wide)
+        row = self._focused_row()
+        if row is not None:
+            self.show_quick_view(row)
+        if prev_notes:
+            self.show_notes(prev_label, prev_notes)
+        # If the pane was collapsed when the mode flipped, keep it collapsed.
+        if getattr(self, "_detail_collapsed", False):
+            try:
+                self.detail_body.grid_remove()
+            except Exception:
+                pass
 
     def _toggle_detail_collapsed(self) -> None:
         self._detail_collapsed = not self._detail_collapsed
@@ -9307,8 +9525,8 @@ class CaseloadPanel:
             return
         try:
             self.detail_frame.update_idletasks()
-            # header + quick view + a minimum notes area.
-            need = self.qv_body.winfo_reqheight() + 44 + 110
+            # header + left column (info + EA) + a minimum notes area.
+            need = self.qv_col.winfo_reqheight() + 44 + 110
             h = self.vpane.winfo_height()
             if h <= 1:
                 return
@@ -9436,6 +9654,8 @@ class CaseloadPanel:
         Salesforce. Rebuilds the body each highlight (simple + correct)."""
         for w in self.qv_body.winfo_children():
             w.destroy()
+        for w in self.qv_notehead.winfo_children():
+            w.destroy()
         name = self._cell(row, "Name")
         pref = self._cell(row, "stuprename")
         title = name or pref or "(unknown)"
@@ -9443,12 +9663,21 @@ class CaseloadPanel:
             title = f"{title}  ·  {pref}"
         self.qv_name.configure(text=title)
 
+        # Pinned identifiers at the top of the student info, each with a
+        # Copy button right beside the value: Student ID then Mobile. Shown
+        # regardless of the configurable field set (they're essential).
+        r = self._qv_id_row(0, row)
+        r = self._qv_mobile_row(r, row)
         catalog = {k: (label, csv, kind)
                    for k, label, csv, kind in self.QUICK_VIEW_CATALOG}
-        r = 0
         for key in self._quickview_field_keys():
             ent = catalog.get(key)
             if not ent:
+                continue
+            # Student ID + phone are pinned above (as Student ID / Mobile
+            # rows); last action moves to the notes column header — skip all
+            # three here so nothing is shown twice.
+            if key in ("student_id", "phone", "last_action"):
                 continue
             label, csv_key, kind = ent
             if kind == "tasks":
@@ -9456,19 +9685,87 @@ class CaseloadPanel:
                 r += 1
             else:
                 r = self._qv_field(r, row, label, csv_key, kind)
-        # Latest course note (straight from the CSV) — a fast preview that
-        # sits just above the on-demand detailed notes. Most of the time
-        # this is all the context needed; load full notes only if more is
-        # wanted.
-        r = self._qv_latest_note(r, row)
         # Editable follow-up date (writes back to Salesforce).
         r = self._qv_followup_editor(r, row)
-        # Essential Actions for this student (right-hand panel).
+        # Notes-column header: last action + latest course note pinned atop
+        # the notes (the at-a-glance context, kept on screen above them).
+        self._qv_render_notehead(row)
+        # Essential Actions for this student (left column, below info).
         self._qv_render_ea(row)
         # New student → reset the notes area to the hint.
         self._notes_hint()
         # Make sure the whole quick view is visible by default.
         self._ensure_detail_height()
+
+    def _qv_render_notehead(self, row) -> None:
+        """Top of the notes column: last logged action, then the latest
+        course note. These stay pinned above the full Salesforce notes."""
+        head = self.qv_notehead
+        for w in head.winfo_children():
+            w.destroy()
+        r = 0
+        action = last_logged_action(self._cell(row, "StudentID"))
+        if action:
+            line = ctk.CTkFrame(head, fg_color="transparent")
+            line.grid(row=r, column=0, sticky="ew", padx=4, pady=(2, 0))
+            line.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                line, text="Last action:", anchor="nw",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=("gray35", "gray70"),
+            ).grid(row=0, column=0, sticky="nw", padx=(0, 6))
+            ctk.CTkLabel(
+                line, text=action, anchor="w", justify="left",
+                wraplength=360, font=ctk.CTkFont(size=12),
+            ).grid(row=0, column=1, sticky="ew")
+            r += 1
+        self._qv_latest_note(r, row, parent=head)
+
+    def _qv_id_row(self, r, row) -> int:
+        """Student ID with a Copy button beside it."""
+        sid = self._cell(row, "StudentID")
+        if not sid:
+            return r
+        ctk.CTkLabel(
+            self.qv_body, text="Student ID:", anchor="nw",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"), width=70,
+        ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+        vf = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        vf.grid(row=r, column=1, sticky="ew", pady=1)
+        # Spacer column 2 absorbs the slack so the copy icon hugs the value.
+        vf.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(
+            vf, text=sid, anchor="w", font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, sticky="w")
+        self._copy_icon_btn(vf, sid).grid(row=0, column=1, padx=(4, 0))
+        return r + 1
+
+    def _qv_mobile_row(self, r, row) -> int:
+        """Mobile number (clickable + Copy button), pinned in the student
+        info. Prefers the caseload MobilePhone column, then any phone-ish
+        column — shown whether or not the configurable Phone field is on."""
+        mobile = self._cell(row, "MobilePhone") or self._phone_value(row)
+        if not mobile:
+            return r
+        ctk.CTkLabel(
+            self.qv_body, text="Mobile:", anchor="nw",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"), width=70,
+        ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+        vf = ctk.CTkFrame(self.qv_body, fg_color="transparent")
+        vf.grid(row=r, column=1, sticky="ew", pady=1)
+        vf.grid_columnconfigure(2, weight=1)   # spacer keeps the icon close
+        link_color = ("#1f6feb", "#58a6ff")
+        v = ctk.CTkLabel(
+            vf, text=mobile, anchor="w", justify="left",
+            wraplength=(320 if not self._narrow else 180),
+            font=ctk.CTkFont(size=12), text_color=link_color, cursor="hand2",
+        )
+        v.bind("<Button-1>", lambda e, m=mobile: self._open_tel(m))
+        v.grid(row=0, column=0, sticky="w")
+        self._copy_icon_btn(vf, mobile).grid(row=0, column=1, padx=(4, 0))
+        return r + 1
 
     def _qv_render_ea(self, row) -> None:
         """Fill the right-hand Essential Actions panel for this student
@@ -9518,18 +9815,18 @@ class CaseloadPanel:
                 text_color=("gray35", "gray70"),
             ).grid(row=rr, column=0, sticky="ew", padx=8, pady=(0, 6))
 
-    def _qv_latest_note(self, r, row) -> int:
+    def _qv_latest_note(self, r, row, parent=None) -> int:
         """Render the latest course note (CSV `LatestCourseNote`) with its
         date (`MyCourseContact`, = last CI contact) as a compact boxed
         preview above the detailed-notes section. Skipped if no note."""
         note = self._cell(row, "LatestCourseNote")
         if not note:
             return r
+        parent = parent if parent is not None else self.qv_body
         date = self._cell(row, "MyCourseContact")
         box = ctk.CTkFrame(
-            self.qv_body, fg_color=("gray92", "gray22"), corner_radius=6)
-        box.grid(row=r, column=0, columnspan=2, sticky="ew",
-                 padx=4, pady=(6, 2))
+            parent, fg_color=("gray92", "gray22"), corner_radius=6)
+        box.grid(row=r, column=0, sticky="ew", padx=4, pady=(6, 2))
         box.grid_columnconfigure(0, weight=1)
         head = "Latest course note" + (f"   ·   {date}" if date else "")
         ctk.CTkLabel(
@@ -9683,29 +9980,32 @@ class CaseloadPanel:
         lbl.grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
         valframe = ctk.CTkFrame(self.qv_body, fg_color="transparent")
         valframe.grid(row=r, column=1, sticky="ew", pady=1)
-        valframe.grid_columnconfigure(0, weight=1)
+        # Spacer column 2 absorbs slack so a copy icon hugs the value.
+        valframe.grid_columnconfigure(2, weight=1)
         wrap = 320 if not self._narrow else 180
         vlbl = ctk.CTkLabel(
             valframe, text=val, anchor="w", justify="left",
             wraplength=wrap, font=ctk.CTkFont(size=12),
         )
         # Email / phone are clickable links (open in the OS default app)
-        # and get a Copy button.
+        # and get a copy-icon button right beside the address.
         if kind in ("email", "phone") and val:
             link_color = ("#1f6feb", "#58a6ff")
             vlbl.configure(text_color=link_color, cursor="hand2")
-            opener = (self._open_mailto if kind == "email"
-                      else self._open_tel)
-            vlbl.bind("<Button-1>", lambda e, v=val: opener(v))
-            vlbl.grid(row=0, column=0, sticky="ew")
-            ctk.CTkButton(
-                valframe, text="Copy", width=46,
-                command=lambda v=val: self._copy_text(v),
-                **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=1, padx=(6, 0))
+            if kind == "email":
+                vlbl.bind(
+                    "<Button-1>",
+                    lambda e, v=val, rw=row: self._open_mailto(v, rw))
+            else:
+                vlbl.bind("<Button-1>", lambda e, v=val: self._open_tel(v))
+            vlbl.grid(row=0, column=0, sticky="w")
+            self._copy_icon_btn(valframe, val).grid(
+                row=0, column=1, padx=(4, 0))
         else:
             if color:
                 vlbl.configure(text_color=color)
+            valframe.grid_columnconfigure(2, weight=0)
+            valframe.grid_columnconfigure(0, weight=1)
             vlbl.grid(row=0, column=0, sticky="ew")
         return r + 1
 
@@ -9718,9 +10018,25 @@ class CaseloadPanel:
                 return str(v).strip()
         return ""
 
-    def _open_mailto(self, email: str) -> None:
+    def _open_mailto(self, email: str, row: Optional[dict] = None) -> None:
+        """Open the OS mail app to this student, seeding the subject with the
+        course code and CC'ing their Program Mentor — matching the email-fire
+        convention. Both are added only when present in the caseload row."""
+        from urllib.parse import quote, urlencode
+        addr = (email or "").strip()
+        params = {}
+        if row is not None:
+            course = self._cell(row, "CourseCode")
+            if course:
+                params["subject"] = course
+            pm_email = _first_present_value(row, _CSV_PM_EMAIL_COLS)
+            if pm_email:
+                params["cc"] = pm_email
+        url = f"mailto:{addr}"
+        if params:
+            url += "?" + urlencode(params, quote_via=quote)
         try:
-            os.startfile(f"mailto:{email.strip()}")
+            os.startfile(url)
         except Exception as e:
             self.app._append_log(f"Couldn't open mail app: {e}", error=True)
 
@@ -9853,6 +10169,18 @@ class CaseloadPanel:
         except Exception:
             pass
 
+    def _copy_icon_btn(self, parent, text: str):
+        """A compact clipboard-icon button that copies `text`. Sized to sit
+        right next to the value it copies (with a 'Copy' tooltip)."""
+        btn = ctk.CTkButton(
+            parent, text="📋", width=26, height=24,
+            font=ctk.CTkFont(size=12),
+            command=lambda t=text: self._copy_text(t),
+            **SECONDARY_BTN_KWARGS,
+        )
+        _attach_tooltip(btn, "Copy")
+        return btn
+
     # ----- note viewer -----
 
     # The notes viewer is a single native tk.Text (built lazily). It holds
@@ -9878,7 +10206,11 @@ class CaseloadPanel:
         self._configure_note_tags()
         # Channel font: applies the current size + binds Ctrl +/- / Ctrl+wheel.
         register_font_box("notes", txt, hotkeys=True)
-        register_font_apply("notes", self._on_notes_font)
+        # The apply callback reads self._notes_text live, so register it once
+        # — the notes Text can be rebuilt (layout reflow) many times.
+        if not _notes_font_registered[0]:
+            _notes_font_registered[0] = True
+            register_font_apply("notes", self._on_notes_font)
         # The Text shouldn't swallow the wheel — forward it to the outer scroll.
         txt.bind("<MouseWheel>", self._notes_wheel)
         txt.bind("<Configure>", self._on_notes_configure)
@@ -9907,7 +10239,7 @@ class CaseloadPanel:
 
     def _notes_wheel(self, event):
         try:
-            self.detail_scroll._parent_canvas.yview_scroll(
+            self.notes_col._parent_canvas.yview_scroll(
                 int(-event.delta / 120), "units")
         except Exception:
             pass
@@ -9991,7 +10323,7 @@ class CaseloadPanel:
         you want to see them, not scroll for them)."""
         def do():
             try:
-                c = self.detail_scroll._parent_canvas
+                c = self.notes_col._parent_canvas
                 c.update_idletasks()
                 bbox = c.bbox("all")
                 if not bbox:
@@ -10426,12 +10758,26 @@ class CaseloadPanel:
             self.action_bar.grid_remove()
 
     def _panel_action_scenarios(self) -> list:
-        """Scenarios offered in the panel's Fire menus: those flagged
-        'Show as a caseload-panel action' (non-batch only). Falls back to
-        every non-batch scenario when none are flagged yet, so the menu is
-        never empty for users who haven't curated."""
+        """Scenarios offered in the panel's Fire menus, in display order.
+
+        Source of truth is the Settings 'panel action order' list (chosen +
+        ordered by the user). When that's empty, fall back to the per-scenario
+        'Show as a caseload-panel action' flags, and finally to every
+        non-batch scenario — so the menu is never empty for users who haven't
+        curated yet."""
         nonbatch = [s for s in self.app.scenarios.values()
                     if s.batch is None]
+        raw = (getattr(self.app.settings, "panel_action_order", "") or "").strip()
+        if raw:
+            try:
+                import json
+                names = json.loads(raw)
+                by_name = {s.name: s for s in nonbatch}
+                ordered = [by_name[n] for n in names if n in by_name]
+                if ordered:
+                    return ordered
+            except Exception:
+                pass
         flagged = [s for s in nonbatch
                    if getattr(s, "panel_action", False)]
         return flagged or nonbatch
@@ -11220,8 +11566,8 @@ class CaseloadPanel:
         self._show_row_menu(iid, event.x_root, event.y_root)
 
     def _on_row_menu_key(self, event=None):
-        """Shift+F10 / Menu key → action menu for the focused row,
-        posted just below that row."""
+        """Shift+F10 / Menu key / Right arrow → action menu for the focused
+        row, posted just below it with 'Fire action' pre-highlighted."""
         iid = self.tree.focus()
         if not iid:
             kids = self.tree.get_children()
@@ -11237,10 +11583,11 @@ class CaseloadPanel:
         else:
             x = self.tree.winfo_rootx() + 30
             y = self.tree.winfo_rooty() + 30
-        self._show_row_menu(iid, x, y)
+        self._show_row_menu(iid, x, y, activate_fire=True)
         return "break"
 
-    def _show_row_menu(self, iid, x_root, y_root) -> None:
+    def _show_row_menu(self, iid, x_root, y_root,
+                       activate_fire: bool = False) -> None:
         """Build + post the per-row action menu: Open / Open in new tab /
         Fire scenario ▸ (this row) / Fire on N selected ▸ (the checked
         rows, when any). Curated to the panel-action scenarios."""
@@ -11259,6 +11606,7 @@ class CaseloadPanel:
         menu.add_command(
             label="Review notes",
             command=lambda q=query, l=label: self.review_notes(q, l))
+        fire_index = None
         nonbatch = self._panel_action_scenarios()
         if nonbatch:
             menu.add_separator()
@@ -11270,6 +11618,7 @@ class CaseloadPanel:
                     command=lambda s=sc, r=row: self.app._fire_on_selected(
                         s, [r], near=(x_root, y_root)))
             menu.add_cascade(label="Fire action", menu=fire_menu)
+            fire_index = menu.index("end")  # for keyboard pre-highlight
             # Fire on the whole checked selection, when there is one.
             checked = self._checked_rows()
             if checked:
@@ -11282,7 +11631,12 @@ class CaseloadPanel:
                 menu.add_cascade(
                     label=f"Fire on {len(checked)} selected", menu=sel_menu)
         try:
-            menu.tk_popup(x_root, y_root)
+            # Keyboard-invoked: activate "Fire action" so the next Right
+            # arrow / Enter opens the actions submenu immediately.
+            if activate_fire and fire_index is not None:
+                menu.tk_popup(x_root, y_root, fire_index)
+            else:
+                menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
 
@@ -14144,6 +14498,7 @@ class App:
         for p in scenario.prompts:
             value = prompt_additional_text(
                 self.root, p.label or p.var, p.prefill,
+                enter_submits=self.settings.enter_submits_note,
             )
             if value is None:
                 self._append_log(
@@ -14246,6 +14601,7 @@ class App:
         custom_bodies: dict[int, str] = {}
         custom_courses: dict[int, str] = {}
         custom_activities: dict[int, list] = {}
+        custom_types: dict[int, str] = {}
         ea_arg = None
         eas_read = False
         eas_navigated = False  # did we actually nav to the EA tab (needs re-nav)?
@@ -14303,7 +14659,10 @@ class App:
             offer_ea = (pos == 0)  # attach at most one EA per fire
             res = prompt_edit_note(
                 self.root, label, prefill, course_default,
-                list(n.academic_activities), eas if offer_ea else [])
+                list(n.academic_activities), eas if offer_ea else [],
+                enter_submits=self.settings.enter_submits_note,
+                interaction_type=n.interaction_type,
+                interaction_format=n.interaction_format)
             if res is None:
                 self._append_log(f"{label} edit cancelled; action not fired.")
                 return
@@ -14311,6 +14670,8 @@ class App:
             if res.get("course"):
                 custom_courses[i] = res["course"]
             custom_activities[i] = res.get("activities", [])
+            if "type" in res:
+                custom_types[i] = res.get("type", "")
             if offer_ea and res.get("ea"):
                 ea_arg = res["ea"]
 
@@ -14384,7 +14745,7 @@ class App:
         # Apply the fire-time course / academic-activity edits onto a copy
         # of the scenario (run_scenario reads note.course_code_override and
         # note.academic_activities); body edits go via custom_bodies.
-        if custom_courses or custom_activities:
+        if custom_courses or custom_activities or custom_types:
             import copy as _copy
             scenario = _copy.deepcopy(scenario)
             for i, cc in custom_courses.items():
@@ -14393,6 +14754,9 @@ class App:
             for i, acts in custom_activities.items():
                 if 0 <= i < len(scenario.notes):
                     scenario.notes[i].academic_activities = acts
+            for i, typ in custom_types.items():
+                if 0 <= i < len(scenario.notes):
+                    scenario.notes[i].interaction_type = typ
 
         # Send the text reviewed in step 4b (all user input is done now) —
         # before the note submit so a text-only action doesn't fall through to
@@ -15463,7 +15827,9 @@ class App:
             if n.append_clipboard and clipboard:
                 sep = "\n" if prefill and not prefill.endswith("\n") else ""
                 prefill = f"{prefill}{sep}{clipboard}"
-            edited = prompt_additional_text(self.root, label, prefill)
+            edited = prompt_additional_text(
+                self.root, label, prefill,
+                enter_submits=self.settings.enter_submits_note)
             if edited is None:
                 self._append_log(f"{label}: cancelled; {source} not started.")
                 return None
@@ -16878,6 +17244,125 @@ class App:
 
         self.worker.submit_download_caseload_csv(CASELOAD_CSV_PATH, on_done)
 
+    def _open_panel_actions_dialog(self, parent=None) -> None:
+        """Choose which actions appear in the caseload panel's 'Fire action'
+        menu (right-click / Right arrow) and in what order. Persists the
+        ordered list of chosen scenario names to settings.panel_action_order;
+        'Default' clears it to fall back to the per-scenario flags."""
+        import json
+        parent = parent or self.root
+        nonbatch = [s for s in self.scenarios.values() if s.batch is None]
+        names = [s.name for s in nonbatch]
+        raw = (getattr(self.settings, "panel_action_order", "") or "").strip()
+        selected: list = []
+        if raw:
+            try:
+                selected = [n for n in json.loads(raw) if n in names]
+            except Exception:
+                selected = []
+        if not selected:
+            selected = [s.name for s in nonbatch
+                        if getattr(s, "panel_action", False)]
+        rest = [n for n in names if n not in selected]
+        # Working model: [name, checked], chosen-in-order first.
+        work = [[n, True] for n in selected] + [[n, False] for n in rest]
+
+        dlg = ctk.CTkToplevel(parent)
+        dlg.title("Caseload panel actions")
+        dlg.geometry("420x460")
+        try:
+            dlg.transient(parent)
+        except Exception:
+            pass
+        dlg.attributes("-topmost", True)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            dlg, text="Pick + order the actions in the panel's Fire menu",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        scroll = ctk.CTkScrollableFrame(dlg)
+        scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        scroll.grid_columnconfigure(2, weight=1)
+
+        def move(idx, delta):
+            j = idx + delta
+            if 0 <= j < len(work):
+                work[idx], work[j] = work[j], work[idx]
+                redraw()
+
+        def redraw():
+            for w in scroll.winfo_children():
+                w.destroy()
+            if not work:
+                ctk.CTkLabel(
+                    scroll, text="No non-batch actions yet.",
+                    text_color=("gray40", "gray65"),
+                ).grid(row=0, column=0, columnspan=3, padx=8, pady=16)
+                return
+            for i, pair in enumerate(work):
+                var = ctk.BooleanVar(value=pair[1])
+
+                def on_toggle(p=pair, v=var):
+                    p[1] = v.get()
+
+                ctk.CTkButton(
+                    scroll, text="▲", width=26,
+                    command=lambda ix=i: move(ix, -1), **SECONDARY_BTN_KWARGS,
+                ).grid(row=i, column=0, padx=(2, 0), pady=1)
+                ctk.CTkButton(
+                    scroll, text="▼", width=26,
+                    command=lambda ix=i: move(ix, 1), **SECONDARY_BTN_KWARGS,
+                ).grid(row=i, column=1, padx=(2, 4), pady=1)
+                ctk.CTkCheckBox(
+                    scroll, text=pair[0], variable=var, command=on_toggle,
+                ).grid(row=i, column=2, sticky="w", padx=4, pady=1)
+
+        redraw()
+
+        def _close():
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            dlg.destroy()
+            # Hand the modal grab back to the Settings dialog we opened over.
+            try:
+                if parent is not None and parent is not self.root:
+                    parent.grab_set()
+            except Exception:
+                pass
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 10))
+
+        def do_apply():
+            chosen = [p[0] for p in work if p[1]]
+            self.settings.panel_action_order = json.dumps(chosen)
+            save_settings(self.settings)
+            _close()
+
+        def reset_default():
+            self.settings.panel_action_order = ""
+            save_settings(self.settings)
+            _close()
+
+        ctk.CTkButton(
+            btns, text="Default", width=80, command=reset_default,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btns, text="Cancel", width=80, command=_close,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btns, text="Apply", width=80, command=do_apply).pack(
+            side="right")
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+
     def _open_settings(self) -> None:
         """Modal for user preferences. Currently the advanced /
         developer-mode toggle + Caseload Tool view status. Designed
@@ -17275,6 +17760,39 @@ class App:
             values=list(_NC_MODE_LABELS.keys()),
         ).pack(side="left", padx=(8, 0))
 
+        # Note editors: Enter submits the note (Shift+Enter = newline).
+        enter_var = ctk.BooleanVar(
+            value=getattr(self.settings, "enter_submits_note", True))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Enter submits the note (Shift+Enter for a new line)",
+            variable=enter_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("When off, Enter inserts a new line and notes are "
+                  "submitted only with the button."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
+        # Caseload panel "Fire action" menu: which actions show + their order.
+        pa_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        pa_row.pack(fill="x", padx=20, pady=(0, 2))
+        ctk.CTkLabel(pa_row, text="Caseload panel actions:").pack(side="left")
+        ctk.CTkButton(
+            pa_row, text="Configure…", width=120,
+            command=lambda: self._open_panel_actions_dialog(parent=dialog),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Choose which actions appear in the panel's right-click / "
+                  "Right-arrow Fire menu, and their order."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
 
@@ -17314,6 +17832,8 @@ class App:
             self.settings.name_capitalization = _NC_MODE_LABELS.get(
                 nc_var.get().strip(), "standard")
             self._sync_name_cap_mode()  # apply immediately to the builders
+            # Note editors: Enter-to-submit vs Enter-for-newline.
+            self.settings.enter_submits_note = bool(enter_var.get())
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
             if changed:
