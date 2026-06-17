@@ -276,13 +276,28 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
                 except Exception:
                     return False
 
-            if not _activities_present(12_000) and data.interaction_type:
-                # Re-select the interaction type to re-trigger the section
-                # render (Playwright dispatches change even for the same value).
+            if not _activities_present(6_000) and data.interaction_type:
+                # The section is reactively added when the note TYPE changes. On
+                # a cold first fire the initial select can stick in the DOM
+                # WITHOUT the component re-rendering (its change handler isn't
+                # wired / early-returns on an unchanged value), so re-selecting
+                # the SAME value does nothing — 'activities: []'. Force a real
+                # change: switch to a different option, then back to the target.
                 try:
                     sel = selectors.interaction_type_select(page)
                     _wait_enabled(sel, timeout_ms=4_000)
-                    sel.select_option(label=data.interaction_type, timeout=8_000)
+                    others = sel.evaluate(
+                        """el => Array.from(el.options)
+                               .map(o => (o.label || o.textContent || '').trim())
+                               .filter(t => t)""")
+                    other = next(
+                        (t for t in (others or [])
+                         if t != data.interaction_type), None)
+                    if other:
+                        sel.select_option(label=other, timeout=8_000)
+                        page.wait_for_timeout(350)
+                    sel.select_option(
+                        label=data.interaction_type, timeout=8_000)
                 except Exception:
                     pass
                 _activities_present(12_000)
