@@ -2748,13 +2748,44 @@ class BrowserWorker:
         # and the locator query (especially right after the auto-
         # download download-tab closed). Treat any failure as "no
         # student visible" rather than crashing the run.
+        from src import selectors
+        # The note panel's PRESENCE is the note BODY EDITOR (the field
+        # fill_note needs) — NOT the student-name header, which doesn't parse
+        # on the standalone Contact record view (where off-caseload students
+        # opened via Salesforce global search land). So gate on the editor,
+        # and read the name only best-effort (for logging + caseload lookup).
+        def _panel_ready() -> bool:
+            try:
+                loc = selectors.note_body_editor(target)
+                return loc.count() > 0 and loc.first.is_visible()
+            except Exception:
+                return False
+
         try:
             student = get_active_student_name(target)
-        except Exception as e:
-            self.on_status(
-                f"No visible note panel (page state issue: {e}). "
-                "Open one and try again."
-            )
+        except Exception:
+            student = None
+        if not _panel_ready() and not student:
+            # No note panel here. If we're on a Contact record (e.g. the user
+            # navigated to an off-caseload student via Salesforce global
+            # search), re-ground via the deep-link, which reloads the record
+            # and polls until the note panel renders — the same reliable path
+            # caseload notes use.
+            cid = ""
+            try:
+                m = re.search(r"/Contact/(003[0-9A-Za-z]{12,15})",
+                              target.url or "")
+                cid = m.group(1) if m else ""
+            except Exception:
+                cid = ""
+            if cid and self._navigate_to_contact(ctx, cid):
+                target = self._active_page(ctx) or target
+                try:
+                    student = get_active_student_name(target)
+                except Exception:
+                    student = None
+        if not _panel_ready():
+            self.on_status("No visible note panel. Open one and try again.")
             return False
         # Look up the Caseload row once: gets course code, student ID,
         # and email in a single pass. Tolerates the same kind of
@@ -2769,18 +2800,37 @@ class BrowserWorker:
             if student:
                 self.on_status(f"Active student: {student}")
         else:
-            if not student:
-                self.on_status("No visible note panel. Open one and try again.")
-                return False
-            self.on_status(f"Active student: {student}")
+            if student:
+                self.on_status(f"Active student: {student}")
             detected = info.get("course_code", "")
-            if not detected:
+            if detected:
+                course_code = detected
+                self.on_status(f"Auto-detected course code: {course_code}")
+            elif any((getattr(n, "course_code_override", "") or "").strip()
+                     for n in scenario.notes):
+                # Off-caseload student (no caseload row → no auto-detect). Fall
+                # back to the per-note course code(s) set in the fire-time edit
+                # dialog or the action config. run_scenario applies
+                # note.course_code_override per note, so a course is still
+                # available even though we couldn't detect one here.
+                course_code = ""
                 self.on_status(
-                    f"Could not auto-detect for {student}. Type a code in the field."
-                )
+                    "No caseload row for this student — using the per-note "
+                    "course code(s).")
+            else:
+                self.on_status(
+                    f"Could not auto-detect for {student}. Type a code in the "
+                    "course field (or set it in the fire-time note dialog).")
                 return False
-            course_code = detected
-            self.on_status(f"Auto-detected course code: {course_code}")
+        # No caseload row matched for this fire (e.g. a student opened via
+        # Salesforce global search who's assigned to another instructor).
+        # Essential Actions are keyed to YOUR assigned caseload, so they aren't
+        # shown/offered here — make that explicit so an empty EA offer doesn't
+        # look like a bug. The note itself still files normally.
+        if not info and ea is None:
+            self.on_status(
+                "ℹ Essential Actions aren't shown for students outside your "
+                "assigned caseload — filing the note(s) only.")
         # Essential-Action path: open the note form via the EA's row action
         # ("Add Note to EA" / "& Close EA") so the note is tied to the EA.
         # run_scenario then fills that form just like the embedded panel.
