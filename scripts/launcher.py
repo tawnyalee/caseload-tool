@@ -9989,6 +9989,25 @@ class CaseloadPanel:
         return self._row_by_iid.get(iid) if iid else None
 
     def _on_row_highlight(self, event=None) -> None:
+        # Debounce: each highlight rebuilds the whole quick view (destroying +
+        # recreating many CTk widgets), so arrowing fast through rows would
+        # render every intermediate student and lag. Coalesce to one render a
+        # short pause after the last keypress — feels instant when you stop,
+        # but skips the in-between rows while you're holding/repeating Down.
+        h = getattr(self, "_qv_highlight_after", None)
+        if h:
+            try:
+                self.frame.after_cancel(h)
+            except Exception:
+                pass
+        try:
+            self._qv_highlight_after = self.frame.after(
+                70, self._render_highlighted_row)
+        except Exception:
+            self._render_highlighted_row()
+
+    def _render_highlighted_row(self) -> None:
+        self._qv_highlight_after = None
         row = self._focused_row()
         if row is not None:
             self.show_quick_view(row)
@@ -10472,9 +10491,25 @@ class CaseloadPanel:
             course = self._cell(row, "CourseCode")
             if course:
                 params["subject"] = course
-            pm_email = _first_present_value(row, _CSV_PM_EMAIL_COLS)
-            if pm_email:
-                params["cc"] = pm_email
+            # CC the Program Mentor — prefer a REAL email: a PM-email CSV
+            # column if present, else the address captured the last time we
+            # emailed/noted this student (logged in note_log.csv, injected as
+            # _pm_email_logged). Fall back to the PM's NAME, which Outlook
+            # resolves against the WGU directory just like typing it.
+            pm_cc = _first_present_value(row, _CSV_PM_EMAIL_COLS)
+            if not pm_cc:
+                pm_cc = self._cell(row, "_pm_email_logged")
+            if not pm_cc:
+                pm_name = self._cell(row, "MentorName")
+                # "Last, First" → "First Last" so the comma isn't read as a
+                # recipient separator by the mail client.
+                if "," in pm_name:
+                    bits = [b.strip() for b in pm_name.split(",", 1)]
+                    if len(bits) == 2 and all(bits):
+                        pm_name = f"{bits[1]} {bits[0]}"
+                pm_cc = pm_name
+            if pm_cc:
+                params["cc"] = pm_cc
         url = f"mailto:{addr}"
         if params:
             url += "?" + urlencode(params, quote_via=quote)
@@ -16810,12 +16845,15 @@ class App:
 
     def _note_log_latest_maps(self):
         """Latest note_log.csv entry per student and per (student, course),
-        read once. Each value is ``(timestamp_str, action_name)``. Lets the
-        derived columns get Last Action Type / Days Since Last Action without
-        re-reading the file per row. Recency by ISO-timestamp string compare
-        (matches last_logged_action)."""
+        read once. Returns ``(by_sid, by_key, pm_by_sid)`` where by_sid/by_key
+        values are ``(timestamp_str, action_name)`` (for Last Action Type /
+        Days Since Last Action) and pm_by_sid maps student_id → the most recent
+        non-empty Program-Mentor email we logged (the batch scrapes it from the
+        row's 'Email Student' mailto; reused so the viewer's email-click can CC
+        the PM's REAL address). Recency by ISO-timestamp string compare."""
         by_sid: dict = {}
         by_key: dict = {}
+        pm_by_sid: dict = {}
         try:
             with Path(NOTE_LOG_CSV).open(encoding="utf-8", newline="") as f:
                 for r in csv.DictReader(f):
@@ -16830,11 +16868,15 @@ class App:
                     k = (sid, course)
                     if k not in by_key or ts > by_key[k][0]:
                         by_key[k] = (ts, scen)
+                    pm = (r.get("pm_email") or "").strip()
+                    if pm and "@" in pm and (
+                            sid not in pm_by_sid or ts > pm_by_sid[sid][0]):
+                        pm_by_sid[sid] = (ts, pm)
         except FileNotFoundError:
             pass
         except Exception:
             pass
-        return by_sid, by_key
+        return by_sid, by_key, pm_by_sid
 
     def _apply_derived_columns_to_rows(self) -> None:
         """Inject computed signal columns into each cached caseload row so
@@ -16854,7 +16896,7 @@ class App:
         rows = self._caseload_rows or []
         if not rows:
             return
-        by_sid, by_key = self._note_log_latest_maps()
+        by_sid, by_key, pm_by_sid = self._note_log_latest_maps()
         try:
             stall = history.task_stall_days()
         except Exception:
@@ -16881,6 +16923,10 @@ class App:
                 r["LastActionType"] = ""
                 r["DaysSinceLastAction"] = ""
             r["TaskStalledDays"] = _num(stall.get((sid, course)))
+            # PM email captured from a prior fire/email for this student — used
+            # by the panel email-click CC (real address vs the name fallback).
+            pm = pm_by_sid.get(sid)
+            r["_pm_email_logged"] = pm[1] if pm else ""
 
     # Curated value vocabulary for the task-status filter columns (the
     # aggregate "Task Status" holds combos, so deriving from data would be

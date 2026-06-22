@@ -283,24 +283,34 @@ def fill_note(page: Page, data: NoteData, *, timeout_ms: int = 10_000) -> None:
                 # wired / early-returns on an unchanged value), so re-selecting
                 # the SAME value does nothing — 'activities: []'. Force a real
                 # change: switch to a different option, then back to the target.
+                # RETRY this toggle a few times — on a slow/cold render one pass
+                # isn't always enough (an "Email from Student" note then fails
+                # with Submit gated and activities empty; works on re-fire).
                 try:
                     sel = selectors.interaction_type_select(page)
-                    _wait_enabled(sel, timeout_ms=4_000)
-                    others = sel.evaluate(
-                        """el => Array.from(el.options)
-                               .map(o => (o.label || o.textContent || '').trim())
-                               .filter(t => t)""")
-                    other = next(
-                        (t for t in (others or [])
-                         if t != data.interaction_type), None)
-                    if other:
-                        sel.select_option(label=other, timeout=8_000)
-                        page.wait_for_timeout(350)
-                    sel.select_option(
-                        label=data.interaction_type, timeout=8_000)
                 except Exception:
-                    pass
-                _activities_present(12_000)
+                    sel = None
+                for _ in range(3):
+                    if sel is None:
+                        break
+                    try:
+                        _wait_enabled(sel, timeout_ms=4_000)
+                        others = sel.evaluate(
+                            """el => Array.from(el.options)
+                                   .map(o => (o.label || o.textContent || '').trim())
+                                   .filter(t => t)""")
+                        other = next(
+                            (t for t in (others or [])
+                             if t != data.interaction_type), None)
+                        if other:
+                            sel.select_option(label=other, timeout=8_000)
+                            page.wait_for_timeout(450)
+                        sel.select_option(
+                            label=data.interaction_type, timeout=8_000)
+                    except Exception:
+                        pass
+                    if _activities_present(6_000):
+                        break
 
             page.wait_for_timeout(400)  # let the reactive re-render finish
             for label in data.academic_activities:
