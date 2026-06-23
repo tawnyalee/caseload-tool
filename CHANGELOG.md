@@ -3,6 +3,44 @@
 Notable changes per release. Versions follow the scheme in `src/version.py`
 (MAJOR = scenarios.yaml format break, MINOR = new features, PATCH = fixes).
 
+## 0.12.0 — 2026-06-23
+
+Momentum calibration and a new **Data** tab, support for students who aren't on
+your caseload, and a batch of viewer polish — building on the 0.11.0 notes
+release.
+
+### Major features
+- **Momentum calibration** — the tool ingests WGU's "Archive (last 30 days)"
+  results export (`results_archive*.csv`) into a local outcomes store and
+  measures how well the **Momentum** prediction actually tracks who passes. It
+  freezes each student's *entry-time* Momentum — the only fair basis, since
+  Momentum self-corrects as a student progresses — and reports pass-rate vs.
+  predicted band, per course. Fresh downloads are auto-detected and ingested on
+  reload, with a staleness reminder. A **📈 Momentum** button opens the
+  calibration report (entry-fair / entry-proxy / exit-diagnostic modes, filtered
+  by course and by student course-load).
+- **Data tab** — a new "Data" tab in the activity area with four views:
+  **Pass-rate vs prediction** (per-course calibration bars), **At-risk**
+  students (current Low / Med-Low, with juggling-course flags), **Momentum
+  trajectory** (entry→exit drift), and **Pass rate over time**. Charts draw on a
+  native canvas (no matplotlib, keeping the build lean), pop out to a second
+  monitor, and support a course picker and preset date ranges.
+- **Off-caseload students** — look up and act on students in your course who are
+  assigned to another instructor: type a Student ID or email in the viewer
+  search to **find and open their record via Salesforce global search**, and
+  **file notes** for them through that nav path.
+
+### Improvements
+- **Viewer polish** — clicking a student email now CCs the PM, row scrolling is
+  smoother, and note filling is sturdier.
+- **Note subject** UI and **Success Path** foundations; a **Salesforce session
+  pre-check** runs before fires.
+- More robust data-collection scrapes and fresher caseload tooltips.
+
+### Internal
+- Temporary task-unlock probe wired behind a hidden viewer-search keyword
+  (feature on hold pending a live example).
+
 ## 0.11.0 — 2026-06-15
 
 Faster note filing, smoother fires, and a snappier window — building on the
