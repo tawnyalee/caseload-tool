@@ -133,6 +133,45 @@ CASELOAD_CSV_PATH = USER_CONFIG_DIR / "caseload.csv"
 # straight into pandas; see src/history.py.
 HISTORY_DB = USER_CONFIG_DIR / "history.db"
 
+# WGU's "passed in the last 30 days" caseload view, downloaded as CSV like any
+# caseload export. It's the ONLY source of final pass outcomes (the live
+# caseload drops passers), so it's ingested into history.db's `outcomes` table.
+# The user drops the file here (or it's auto-detected in Downloads); the glob
+# tolerates the browser's "(1)" dedupe suffixes.
+OUTCOMES_ARCHIVE_GLOB = "results_archive*.csv"
+
+
+def outcomes_archive_search_dirs() -> list[Path]:
+    """Folders scanned (newest match wins) for a freshly-downloaded passed
+    archive: the user config dir (where the user drops it) and the OS Downloads
+    folder (where the browser saves it)."""
+    dirs = [USER_CONFIG_DIR]
+    try:
+        downloads = Path.home() / "Downloads"
+        if downloads.exists():
+            dirs.append(downloads)
+    except Exception:
+        pass
+    return dirs
+
+
+def find_latest_outcomes_archive() -> Optional[Path]:
+    """Most recently modified ``results_archive*.csv`` across the search dirs,
+    or None if there isn't one. Used for auto-ingest on reload."""
+    best: Optional[Path] = None
+    best_mtime = -1.0
+    for d in outcomes_archive_search_dirs():
+        try:
+            for p in d.glob(OUTCOMES_ARCHIVE_GLOB):
+                if not p.is_file():
+                    continue
+                m = p.stat().st_mtime
+                if m > best_mtime:
+                    best, best_mtime = p, m
+        except Exception:
+            continue
+    return best
+
 # Local per-student Success Path state (see src/success_path.py): the data
 # the user enters (field_values) plus an append-only log of step
 # completions/skips (step_log). Deliberately SEPARATE from history.db —
@@ -310,6 +349,15 @@ class Settings:
     # fall back to the per-scenario "Show as a caseload-panel action" flags
     # (or every non-batch scenario when none are flagged).
     panel_action_order: str = ""
+    # Passed-outcomes archive (results_archive*.csv → history.db `outcomes`):
+    # remind, on reload, to download a fresh archive once the last-downloaded
+    # one is older than this many DAYS. The view is a rolling 30-day window, so
+    # 14 keeps full coverage with margin. 0 = never remind. A freshly-downloaded
+    # archive found in the search dirs is auto-ingested regardless.
+    outcomes_archive_reminder_days: int = 14
+    # Geometry "WxH+X+Y" of the Data panel when popped out into its own window.
+    # Empty means "use the default size".
+    data_window_geometry: str = ""
 
 
 def load_settings() -> Settings:

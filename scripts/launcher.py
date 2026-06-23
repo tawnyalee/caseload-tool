@@ -9517,6 +9517,13 @@ class CaseloadPanel:
             command=self._open_departures_dialog, **SECONDARY_BTN_KWARGS,
         )
         self.departures_btn.pack(side="left", padx=(0, 4))
+        # Momentum calibration: entry-time prediction vs. actual outcome.
+        self.calibration_btn = ctk.CTkButton(
+            self.bar_actions, text="📈 Momentum", width=105,
+            command=self._open_momentum_calibration_dialog,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.calibration_btn.pack(side="left", padx=(0, 4))
         self.export_history_btn = ctk.CTkButton(
             self.bar_actions, text="⤓ Export history", width=110,
             command=self._export_history, **SECONDARY_BTN_KWARGS,
@@ -10157,12 +10164,29 @@ class CaseloadPanel:
         dlg.grid_rowconfigure(1, weight=1)
 
         fu = sum(1 for d in deps if d["classification"] == "followup")
+        hdr = ctk.CTkFrame(dlg, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
         ctk.CTkLabel(
-            dlg,
+            hdr,
             text=(f"{len(deps)} departed since last capture — "
                   f"{fu} need follow-up"),
             font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        ).pack(anchor="w")
+        # Passed-outcomes archive status (the durable record of completions,
+        # ingested from WGU's "passed in last 30 days" view).
+        try:
+            oc = history.outcomes_count()
+            stale = history.outcomes_stale_days()
+            fresh = ("archive never downloaded" if stale is None
+                     else f"archive {stale} day(s) old")
+            ctk.CTkLabel(
+                hdr,
+                text=f"{oc} resolved outcomes recorded · {fresh}",
+                text_color=("gray40", "gray65"),
+                font=ctk.CTkFont(size=11),
+            ).pack(anchor="w")
+        except Exception:
+            pass
 
         scroll = ctk.CTkScrollableFrame(dlg)
         scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -10205,6 +10229,10 @@ class CaseloadPanel:
             command=self._export_history, **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
         ctk.CTkButton(
+            btns, text="⤒ Ingest passed archive", width=180,
+            command=self._ingest_outcomes_archive, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
             btns, text="Close", width=80, command=dlg.destroy,
         ).pack(side="right")
 
@@ -10225,6 +10253,264 @@ class CaseloadPanel:
             messagebox.showwarning("Export history", f"Export failed: {e}")
             return
         self.app._append_log(f"Exported {n} history rows → {path}")
+
+    # Momentum-calibration view modes: label -> cohort key.
+    #   entry (FAIR)  — at-enrollment reading (course started while we tracked);
+    #                   the only fair performance-vs-prediction test.
+    #   proxy         — earliest reading for everyone; mid-course (already
+    #                   self-corrected) for pre-tracking starters → less fair.
+    #   exit (DIAG.)  — Momentum at departure; self-corrected, so NOT a fair
+    #                   test — only a diagnostic of whether the model converges.
+    _CALIB_MODES = {
+        "Entry — fair": "entry",
+        "Entry — proxy": "all",
+        "Exit — diagnostic": "exit",
+    }
+    # Course-load filter: 'single' = only this course (the cleanest test of the
+    # prediction); 'multi' = juggling 1+ other courses (often told to finish
+    # those first, so a non-pass here may be deliberate, not a Momentum miss).
+    _CALIB_LOADS = {"All loads": "all", "Single course": "single",
+                    "Multi-course": "multi"}
+
+    def _open_momentum_calibration_dialog(self) -> None:
+        """Momentum prediction vs. actual outcome, per band. Three modes:
+        - 'Entry · new starts': clean at-enrollment reading (course started since
+          we began collecting) — the rigorous test, but young/low-volume.
+        - 'Entry · all': earliest reading for everyone (mid-course proxy for
+          pre-collection starters).
+        - 'At exit (archive)': Momentum as recorded in the passed/not-passed
+          archive — full volume now; tests whether Momentum self-corrects toward
+          the outcome (note the archive is departure-only, so pass-enriched)."""
+        dlg = ctk.CTkToplevel(self.frame)
+        dlg.title("Momentum calibration")
+        dlg.geometry("800x600")
+        try:
+            dlg.transient(self.frame.winfo_toplevel())
+        except Exception:
+            pass
+        dlg.attributes("-topmost", True)
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            dlg, text="Momentum prediction vs. actual outcome",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
+        sub = ctk.CTkLabel(dlg, text="", text_color=("gray40", "gray65"),
+                           font=ctk.CTkFont(size=11), justify="left", anchor="w")
+        sub.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
+
+        cohort = {"key": "entry", "load": "all"}
+        ctrls = ctk.CTkFrame(dlg, fg_color="transparent")
+        ctrls.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        seg = ctk.CTkSegmentedButton(
+            ctrls, values=list(self._CALIB_MODES),
+            command=lambda v: _switch("key", self._CALIB_MODES.get(v, "entry")))
+        seg.set("Entry — fair")
+        seg.pack(side="left")
+        load_seg = ctk.CTkSegmentedButton(
+            ctrls, values=list(self._CALIB_LOADS),
+            command=lambda v: _switch("load", self._CALIB_LOADS.get(v, "all")))
+        load_seg.set("All loads")
+        load_seg.pack(side="left", padx=(14, 0))
+
+        table = ctk.CTkScrollableFrame(dlg)
+        table.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        for ci in range(9):
+            table.grid_columnconfigure(ci, weight=(2 if ci == 0 else 1))
+
+        cols = ["Band", "Predicted", "Passed\n(in time)", "Late", "Not\npassed",
+                "Missed", "In\nprogress", "Resolved", "Actual\npass rate"]
+
+        note = ctk.CTkLabel(
+            dlg, justify="left", anchor="w", text_color=("gray40", "gray65"),
+            font=ctk.CTkFont(size=10), wraplength=760, text="")
+        note.grid(row=4, column=0, sticky="ew", padx=12, pady=(2, 2))
+
+        def _switch(field, value):
+            cohort[field] = value
+            render()
+
+        def render():
+            for w in table.winfo_children():
+                w.destroy()
+            key, load = cohort["key"], cohort["load"]
+            if key == "exit":
+                data = history.momentum_calibration_at_exit(course_load=load)
+            else:
+                elig = "2026-06-10" if key == "entry" else "1900-01-01"
+                data = history.momentum_calibration(eligible_from=elig,
+                                                    course_load=load)
+            for ci, txt in enumerate(cols):
+                ctk.CTkLabel(
+                    table, text=txt, justify="center",
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                ).grid(row=0, column=ci, padx=4, pady=(2, 6), sticky="nsew")
+            for ri, b in enumerate(data["bands"], start=1):
+                vals = [b["label"], b["predicted_range"] + "%",
+                        b["passed_in_time"], b["passed_late"], b["not_passed"],
+                        b["missed"], b["in_progress"], b["resolved"]]
+                for ci, val in enumerate(vals):
+                    ctk.CTkLabel(table, text=str(val)).grid(
+                        row=ri, column=ci, padx=4, pady=2, sticky="nsew")
+                rate = b["pass_in_time_rate"]
+                if rate is None:
+                    txt, color = "—", ("gray45", "gray70")
+                else:
+                    pct = round(100 * rate)
+                    lo, hi = (int(x) for x in b["predicted_range"].split("-"))
+                    if b["resolved"] < 5:
+                        color = ("gray45", "gray70")   # too few to judge
+                    elif lo <= pct <= hi:
+                        color = "#2e9e4f"              # calibrated
+                    else:
+                        color = "#d04545"              # off prediction
+                    txt = f"{pct}%  (n={b['resolved']})"
+                ctk.CTkLabel(
+                    table, text=txt, text_color=color,
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                ).grid(row=ri, column=8, padx=4, pady=2, sticky="nsew")
+
+            load_lbl = {"all": "all loads", "single": "single-course only",
+                        "multi": "multi-course only"}.get(load, load)
+            cov = history.outcomes_entry_coverage()
+            if key == "exit":
+                drift = (f"{cov['drifted']}/{cov['both']}" if cov['both']
+                         else "—")
+                sub.configure(text=(
+                    f"As of {data['as_of']}  ·  Momentum at exit (archive)  ·  "
+                    f"{load_lbl}  ·  {data['eligible_total']} resolved outcomes "
+                    f"({data['no_entry_band']} no Momentum band)"))
+                note.configure(text=(
+                    "DIAGNOSTIC, NOT a fair performance test: this is "
+                    "self-corrected Momentum (recorded at departure), which "
+                    f"already moved toward the outcome — it changed for {drift} "
+                    "students who have both an entry and exit reading. It only "
+                    "tells you whether the model CONVERGES; for performance vs. "
+                    "prediction use an Entry view. Watch the gradient, not "
+                    "absolute rates (the archive is departure-only and "
+                    "pass-enriched). 'Single' load isolates focused students."))
+            else:
+                cname = ("FAIR — at-enrollment reading (CourseStart ≥ 2026-06-10)"
+                         if key == "entry"
+                         else "PROXY — earliest reading (mid-course for old starts)")
+                sub.configure(text=(
+                    f"As of {data['as_of']}  ·  {cname}  ·  {load_lbl}  ·  "
+                    f"{data['eligible_total']} students "
+                    f"({data['not_started']} not started)  ·  fair coverage: "
+                    f"{cov['captured']}/{cov['total']} resolved have an entry "
+                    f"reading"))
+                note.configure(text=(
+                    "ENTRY Momentum (reading nearest CourseStart) vs. the result "
+                    "— the FAIR test: it uses the prediction made BEFORE the "
+                    "student progressed, so the model can't have adjusted to the "
+                    "outcome. It firms up as outcomes resolve (today only the "
+                    f"{cov['captured']} captured-entry resolved students count; "
+                    "the rest started before we tracked them). 'Proxy' trades "
+                    "fairness for volume (earliest reading is mid-course for old "
+                    "starters). Rates = RESOLVED only; 'Not passed' is "
+                    "authoritative from CourseStatus. Pass = on/before IC End "
+                    "(else Term End). <5 greyed. 'Single' load = cleanest test."))
+
+        render()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.grid(row=5, column=0, sticky="ew", padx=8, pady=(2, 10))
+        ctk.CTkButton(
+            btns, text="⤓ Export rows", width=130,
+            command=lambda: self._export_calibration(cohort["key"],
+                                                     cohort["load"]),
+            **SECONDARY_BTN_KWARGS,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btns, text="Close", width=80, command=dlg.destroy,
+        ).pack(side="right")
+
+    def _export_calibration(self, cohort_key: str, load: str = "all") -> None:
+        """Dump the per-student calibration detail for the selected mode +
+        course-load filter to a CSV the user picks. Entry modes export the
+        per-student entry-band + outcome; the at-exit mode exports the raw
+        archive outcomes."""
+        from tkinter import filedialog, messagebox
+        path = filedialog.asksaveasfilename(
+            title="Export momentum calibration",
+            defaultextension=".csv", initialfile="momentum_calibration.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if cohort_key == "exit":
+            try:
+                import csv as _csv
+                rows = history.all_outcomes()
+                if load == "single":
+                    rows = [r for r in rows if not r.get("other_course_count")]
+                elif load == "multi":
+                    rows = [r for r in rows if r.get("other_course_count")]
+                cols = ["student_id", "course_code", "name",
+                        "momentum_at_outcome", "momentum_rank_at_outcome",
+                        "outcome", "pass_date", "ic_end_date", "term_end_date",
+                        "other_course_count", "other_courses"]
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    w = _csv.DictWriter(f, fieldnames=cols,
+                                        extrasaction="ignore")
+                    w.writeheader()
+                    w.writerows(rows)
+                n = len(rows)
+            except Exception as e:
+                messagebox.showwarning("Export calibration",
+                                       f"Export failed: {e}")
+                return
+            self.app._append_log(f"Exported {n} archive outcome rows → {path}")
+            return
+        elig = "2026-06-10" if cohort_key == "entry" else "1900-01-01"
+        try:
+            n = history.export_calibration_csv(path, eligible_from=elig,
+                                               course_load=load)
+        except Exception as e:
+            messagebox.showwarning("Export calibration", f"Export failed: {e}")
+            return
+        self.app._append_log(f"Exported {n} calibration rows → {path}")
+
+    def _ingest_outcomes_archive(self) -> None:
+        """Pick a 'passed in last 30 days' archive CSV and ingest it into the
+        outcomes table. The reload path also auto-ingests fresh downloads; this
+        is the manual escape hatch (e.g. an archive saved somewhere unusual)."""
+        from tkinter import filedialog, messagebox
+        path = filedialog.askopenfilename(
+            title="Ingest passed-outcomes archive (results_archive*.csv)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        res = history.ingest_outcomes_csv(path)
+        status = res.get("status")
+        if status == "ok":
+            messagebox.showinfo(
+                "Outcomes archive ingested",
+                f"{res['ingested']} rows read "
+                f"({res.get('passed', 0)} passed, "
+                f"{res.get('not_passed', 0)} not passed)\n"
+                f"{res['new']} new · {res['updated']} updated\n"
+                f"{res['total_outcomes']} total resolved outcomes recorded.",
+            )
+            self.app._append_log(
+                f"Outcomes archive ingested: {res['new']} new, "
+                f"{res['updated']} updated ({res.get('passed', 0)} passed, "
+                f"{res.get('not_passed', 0)} not passed), "
+                f"{res['total_outcomes']} total.")
+        elif status == "empty":
+            messagebox.showwarning(
+                "Passed archive",
+                "No usable rows found (each row needs a StudentID and "
+                "CourseCode). Is this the right CSV?")
+        else:
+            messagebox.showwarning(
+                "Passed archive", f"Ingest failed: {res.get('error')}")
 
     def _cell(self, row: dict, key: str) -> str:
         return str(row.get(key, "") or "").strip()
@@ -12267,6 +12553,248 @@ class CaseloadPanel:
         self.freshness_lbl.configure(text=txt, text_color=color)
 
 
+class DataPanel:
+    """Analytics/graphs shown as a 'Data' tab in the activity area, with a
+    pop-out/dock option (mirrors the caseload panel). A view-selector dropdown
+    keeps it extensible — more charts/tables drop in without new tabs. First
+    view: actual student pass rate vs. the Momentum-predicted band, drawn on a
+    native tk.Canvas (no plotting dependency, to keep the build lean)."""
+
+    # Calibration basis + course-load options (label -> key), mirroring the
+    # 📈 Momentum dialog so the two stay consistent.
+    _BASES = {"Entry — fair": "entry", "Entry — proxy": "all",
+              "Exit — diagnostic": "exit"}
+    _LOADS = {"All loads": "all", "Single course": "single",
+              "Multi-course": "multi"}
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.tab = None             # the docked Data-tab frame (constant)
+        self.window = None          # pop-out Toplevel when popped
+        self.popped = False
+        self.basis = "entry"
+        self.load = "all"
+        self.canvas = None
+        self._data = None
+
+    # ---- mount / pop-out -------------------------------------------------
+    def attach(self, tab) -> None:
+        """Bind to the docked Data-tab frame and build into it."""
+        self.tab = tab
+        self.mount(tab)
+
+    def mount(self, parent) -> None:
+        """(Re)build the whole panel into ``parent`` (the tab or a pop-out)."""
+        for w in parent.winfo_children():
+            w.destroy()
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        ctrls = ctk.CTkFrame(parent, fg_color="transparent")
+        ctrls.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        self.view_menu = ctk.CTkOptionMenu(
+            ctrls, width=185, values=["Pass rate vs prediction"],
+            command=lambda v: self._render())
+        self.view_menu.set("Pass rate vs prediction")
+        self.view_menu.pack(side="left")
+        self.basis_menu = ctk.CTkOptionMenu(
+            ctrls, width=150, values=list(self._BASES),
+            command=lambda v: self._set("basis", self._BASES.get(v, "entry")))
+        self.basis_menu.set("Entry — fair")
+        self.basis_menu.pack(side="left", padx=(6, 0))
+        self.load_menu = ctk.CTkOptionMenu(
+            ctrls, width=130, values=list(self._LOADS),
+            command=lambda v: self._set("load", self._LOADS.get(v, "all")))
+        self.load_menu.set("All loads")
+        self.load_menu.pack(side="left", padx=(6, 0))
+        self.popout_btn = ctk.CTkButton(
+            ctrls, text=("⧉ Dock" if self.popped else "⧉ Pop out"), width=80,
+            command=self._toggle_popout, **SECONDARY_BTN_KWARGS)
+        self.popout_btn.pack(side="right")
+
+        dark = ctk.get_appearance_mode() == "Dark"
+        self.canvas = tk.Canvas(parent, bd=0, highlightthickness=0,
+                                bg=("#1d1e1e" if dark else "#f9f9fa"))
+        self.canvas.grid(row=1, column=0, sticky="nsew", padx=4, pady=(2, 2))
+        self.canvas.bind("<Configure>", lambda e: self._on_configure())
+        self.status = ctk.CTkLabel(
+            parent, text="", font=ctk.CTkFont(size=10), justify="left",
+            anchor="w", text_color=("gray40", "gray65"), wraplength=560)
+        self.status.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        # LAZY: don't query the DB until the tab is actually shown (first real
+        # <Configure>), so building the panel adds nothing to startup.
+
+    def _on_configure(self) -> None:
+        """Canvas laid out/resized. Compute on the first real size (tab shown),
+        then just redraw from cached data on later resizes — no DB hit per
+        frame."""
+        if self.canvas is None or self.canvas.winfo_width() < 120:
+            return
+        self._render() if self._data is None else self._draw()
+
+    def _set(self, field, value) -> None:
+        setattr(self, field, value)
+        self._render()
+
+    def _toggle_popout(self) -> None:
+        self._dock() if self.popped else self._pop_out()
+
+    def _pop_out(self) -> None:
+        win = ctk.CTkToplevel(self.app.root)
+        win.title("Data")
+        win.minsize(440, 320)
+        geo = (getattr(self.app.settings, "data_window_geometry", "") or "").strip()
+        win.geometry(geo if geo else "780x540")
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(0, weight=1)
+        win.protocol("WM_DELETE_WINDOW", self._dock)
+        self.window = win
+        self.popped = True
+        body = ctk.CTkFrame(win)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=1)
+        self.mount(body)
+        self._show_tab_placeholder()
+        win.after(80, win.lift)
+
+    def _dock(self) -> None:
+        win = self.window
+        if win is not None:
+            try:
+                self.app.settings.data_window_geometry = win.geometry()
+                save_settings(self.app.settings)
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self.window = None
+        self.popped = False
+        if self.tab is not None:
+            self.mount(self.tab)
+
+    def _show_tab_placeholder(self) -> None:
+        """While popped out, the in-tab area shows a dock prompt."""
+        if self.tab is None:
+            return
+        for w in self.tab.winfo_children():
+            w.destroy()
+        box = ctk.CTkFrame(self.tab, fg_color="transparent")
+        box.grid(row=0, column=0)
+        ctk.CTkLabel(box, text="Data panel is in its own window.",
+                     text_color=("gray40", "gray65")).pack(pady=(20, 8))
+        ctk.CTkButton(box, text="⧉ Dock", width=90, command=self._dock,
+                      **SECONDARY_BTN_KWARGS).pack()
+
+    # ---- data + drawing --------------------------------------------------
+    def refresh(self) -> None:
+        """Recompute + redraw after a fresh outcomes ingest — but only if the
+        panel has already been shown (``_data`` set). If the user never opened
+        the Data tab, do nothing; it'll compute lazily when first viewed."""
+        if self.canvas is not None and self._data is not None:
+            self._render()
+
+    def _render(self) -> None:
+        if self.canvas is None:
+            return
+        if self.basis == "exit":
+            self._data = history.momentum_calibration_at_exit(
+                course_load=self.load)
+        else:
+            elig = "2026-06-10" if self.basis == "entry" else "1900-01-01"
+            self._data = history.momentum_calibration(
+                eligible_from=elig, course_load=self.load)
+        try:
+            cov = history.outcomes_entry_coverage()
+        except Exception:
+            cov = {"total": 0, "captured": 0, "both": 0, "drifted": 0}
+        if self.basis == "exit":
+            drift = f"{cov['drifted']}/{cov['both']}" if cov["both"] else "—"
+            txt = ("Exit (diagnostic): self-corrected Momentum — NOT a fair "
+                   f"test (changed for {drift} students entry→exit). "
+                   f"{self._data['eligible_total']} resolved outcomes.")
+        else:
+            lbl = "Entry (fair)" if self.basis == "entry" else "Entry (proxy)"
+            txt = (f"{lbl}: actual pass rate among RESOLVED students vs the "
+                   f"model's predicted band. Fair coverage "
+                   f"{cov['captured']}/{cov['total']} resolved have an entry "
+                   "reading. Bars grey when <5 resolved.")
+        self.status.configure(text=txt)
+        self._draw()
+
+    def _draw(self) -> None:
+        c = self.canvas
+        if c is None or not self._data:
+            return
+        c.delete("all")
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 120 or H < 120:
+            return
+        dark = ctk.get_appearance_mode() == "Dark"
+        fg = "#c0c0c0" if dark else "#444444"
+        grid = "#333333" if dark else "#dddddd"
+        pred_col = "#4a9eff"
+        L, R, T, B = 44, 16, 26, 52
+        pw, ph = W - L - R, H - T - B
+        if pw < 60 or ph < 60:
+            return
+
+        def y_at(pct):
+            return T + ph * (1 - pct / 100.0)
+
+        for g in (0, 25, 50, 75, 100):
+            y = y_at(g)
+            c.create_line(L, y, L + pw, y, fill=grid)
+            c.create_text(L - 6, y, text=str(g), anchor="e", fill=fg,
+                          font=("", 8))
+        c.create_text(L, 12, anchor="w", fill=fg, font=("", 10, "bold"),
+                      text="Actual pass rate vs. Momentum-predicted band (%)")
+
+        bands = list(reversed(self._data["bands"]))   # Low → High
+        n = len(bands)
+        mids = []
+        for i, b in enumerate(bands):
+            cx = L + pw * (i + 0.5) / n
+            lo, hi = (int(v) for v in b["predicted_range"].split("-"))
+            zw = pw / n * 0.6
+            c.create_rectangle(cx - zw / 2, y_at(hi), cx + zw / 2, y_at(lo),
+                               outline=pred_col, dash=(3, 2))
+            mids.append((cx, y_at((lo + hi) / 2)))
+            rate = b["pass_in_time_rate"]
+            if rate is not None:
+                pct = 100 * rate
+                within = lo <= pct <= hi
+                col = ("#777777" if b["resolved"] < 5
+                       else ("#3fb950" if within else "#e0844f"))
+                bw = pw / n * 0.32
+                c.create_rectangle(cx - bw / 2, y_at(pct), cx + bw / 2,
+                                   y_at(0), fill=col, outline="")
+                c.create_text(cx, y_at(pct) - 8, text=f"{round(pct)}%",
+                              fill=fg, font=("", 8, "bold"))
+            c.create_text(cx, H - B + 14, text=b["label"], fill=fg,
+                          font=("", 8))
+            c.create_text(cx, H - B + 28, text=f"n={b['resolved']}", fill=fg,
+                          font=("", 7))
+        for i in range(len(mids) - 1):
+            c.create_line(*mids[i], *mids[i + 1], fill=pred_col, width=1)
+        for cx, cy in mids:
+            c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=pred_col,
+                          outline="")
+        # legend
+        ly = H - 8
+        c.create_rectangle(L, ly - 7, L + 12, ly - 1, fill="#3fb950",
+                           outline="")
+        c.create_text(L + 16, ly - 4, text="actual pass rate", anchor="w",
+                      fill=fg, font=("", 8))
+        c.create_line(L + 140, ly - 4, L + 162, ly - 4, fill=pred_col, width=1)
+        c.create_oval(L + 148, ly - 7, L + 154, ly - 1, fill=pred_col,
+                      outline="")
+        c.create_text(L + 168, ly - 4, text="predicted band", anchor="w",
+                      fill=fg, font=("", 8))
+
+
 # ============================================================
 # Main app
 # ============================================================
@@ -12651,6 +13179,12 @@ class App:
         self.log.tag_configure("logok", foreground="#3fb950")  # success green
         self.log.configure(state="disabled")
         register_font_box("activity", self.log)  # Ctrl +/-, Ctrl+wheel
+        # Data tab: analytics/graphs (pop-out capable). See DataPanel.
+        self._data_tab = self.log_tabview.add("Data")
+        self._data_tab.grid_columnconfigure(0, weight=1)
+        self._data_tab.grid_rowconfigure(0, weight=1)
+        self.data_panel = DataPanel(self)
+        self.data_panel.attach(self._data_tab)
         pane.grid_rowconfigure(6, weight=1)
 
         # Bottom row. Quit is packed first (side=right) so it always
@@ -20046,7 +20580,78 @@ class App:
             except Exception as e:
                 if not silent:
                     self._append_log(f"(history snapshot skipped: {e})")
+        # Auto-ingest a freshly-downloaded passed-outcomes archive (the only
+        # source of final pass results — the live caseload drops passers) and
+        # remind, once per session, when that data has gone stale.
+        self._auto_ingest_outcomes_archive()
         return True
+
+    def _auto_ingest_outcomes_archive(self) -> None:
+        """Ingest a newly-downloaded 'passed in last 30 days' archive if one is
+        present in the search dirs, then (once per session) remind the user when
+        the archive has gone stale. Fully non-fatal — never breaks the reload."""
+        from src import config as _cfg
+        # 1) Ingest a genuinely newer download (skip pointless re-ingests, which
+        #    would also reset the staleness clock).
+        try:
+            path = _cfg.find_latest_outcomes_archive()
+        except Exception:
+            path = None
+        if path is not None:
+            try:
+                # Truncate to seconds: the stored mtime has second precision,
+                # so comparing against a microsecond stat() would re-ingest the
+                # SAME file every reload (and reset the staleness clock).
+                file_mtime = datetime.fromtimestamp(
+                    path.stat().st_mtime).replace(microsecond=0)
+                prev = history.outcomes_archive_mtime()
+                if prev is None or file_mtime > prev:
+                    res = history.ingest_outcomes_csv(str(path))
+                    if res.get("status") == "ok":
+                        self._append_log(
+                            f"Outcomes archive ingested ({path.name}): "
+                            f"{res['new']} new, {res['updated']} updated "
+                            f"({res.get('passed', 0)} passed, "
+                            f"{res.get('not_passed', 0)} not passed), "
+                            f"{res['total_outcomes']} total.")
+                        dp = getattr(self, "data_panel", None)
+                        if dp is not None:
+                            try:
+                                dp.refresh()
+                            except Exception:
+                                pass
+                    elif res.get("status") == "error":
+                        self._append_log(
+                            f"(outcomes ingest failed: {res.get('error')})",
+                            error=True)
+            except Exception as e:
+                self._append_log(f"(outcomes ingest skipped: {e})")
+        # 2) Staleness reminder (at most once per session, so it isn't nagging).
+        if getattr(self, "_outcomes_reminder_shown", False):
+            return
+        try:
+            days = int(getattr(self.settings,
+                               "outcomes_archive_reminder_days", 14) or 0)
+        except Exception:
+            days = 14
+        if days <= 0:
+            return
+        try:
+            stale = history.outcomes_stale_days()
+        except Exception:
+            return
+        if stale is None:
+            self._outcomes_reminder_shown = True
+            self._append_log(
+                "Tip: download the caseload “Archive (last 30 days)” view "
+                "(results_archive*.csv) to track pass/not-pass outcomes vs. "
+                "Momentum — drop it in your app folder or Downloads.")
+        elif stale >= days:
+            self._outcomes_reminder_shown = True
+            self._append_log(
+                f"Reminder: the outcomes archive is {stale} days old — "
+                f"download a fresh “Archive (last 30 days)” view so no "
+                f"departures are missed (rolling 30-day window).")
 
     def _read_clipboard_content(self) -> str:
         """Pull text from clipboard. If image data is also present,
