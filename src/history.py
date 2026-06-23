@@ -818,6 +818,66 @@ def all_outcomes(*, db_path=HISTORY_DB) -> list[dict]:
         conn.close()
 
 
+def _to_int(x):
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
+
+def at_risk_students(*, db_path=HISTORY_DB, ranks=(1, 2)) -> list[dict]:
+    """Current-caseload students the Momentum model flags at-risk (Low / Med-Low
+    by default), still in progress, with triage fields for a sortable table.
+
+    Reads the latest snapshot (the live caseload) and excludes any student who
+    already has a resolved outcome. Sorted by urgency: fewest term-days-left
+    first, then most days stalled on a task. Each row carries the fields an
+    instructor triages on (days since last task / contact, term days left,
+    number of other courses, IC extension date)."""
+    conn = _connect(db_path)
+    try:
+        latest = conn.execute("SELECT collected_at FROM collections "
+                              "ORDER BY collected_at DESC LIMIT 1").fetchone()
+        if latest is None:
+            return []
+        rows = conn.execute("SELECT * FROM snapshots WHERE collected_at = ?",
+                            (latest["collected_at"],)).fetchall()
+        resolved = {(r["student_id"], r["course_code"]) for r in
+                    conn.execute("SELECT student_id, course_code FROM outcomes")}
+    finally:
+        conn.close()
+
+    out = []
+    for r in rows:
+        if r["momentum_rank"] not in ranks:
+            continue
+        key = (r["student_id"], r["course_code"])
+        if key in resolved:
+            continue
+        try:
+            e = json.loads(r["extra_json"] or "{}")
+        except Exception:
+            e = {}
+        out.append({
+            "momentum_rank": r["momentum_rank"],
+            "momentum": r["momentum"] or "",
+            "name": r["name"] or "",
+            "student_id": r["student_id"],
+            "course_code": r["course_code"],
+            "task_status": r["latest_task_status"] or "",
+            "days_since_task": _to_int(_ej_get(e, "NumberOfDaysSinceLastTaskDate")),
+            "days_since_contact": _to_int(_ej_get(e, "DaysSinceLastCourseContact")),
+            "term_days_left": _to_int(_ej_get(e, "TermDaysLeft")),
+            "other_courses": count_other_courses(_ej_get(e, "OtherCourses"),
+                                                 r["course_code"]),
+            "ic_end": _ej_get(e, "Icenddate"),
+        })
+    out.sort(key=lambda a: (
+        a["term_days_left"] if a["term_days_left"] is not None else 1 << 30,
+        -(a["days_since_task"] or 0)))
+    return out
+
+
 # ----------------------------------------------------------------------
 # momentum calibration (entry prediction vs actual outcome)
 # ----------------------------------------------------------------------
@@ -857,8 +917,25 @@ _MOMENTUM_BANDS = [
 ]
 
 
+def course_codes(*, db_path=HISTORY_DB) -> list[str]:
+    """Distinct course codes seen across snapshots + outcomes, sorted — the
+    options for the calibration course picker."""
+    conn = _connect(db_path)
+    try:
+        s = set()
+        for q in ("SELECT DISTINCT course_code FROM snapshots",
+                  "SELECT DISTINCT course_code FROM outcomes"):
+            for r in conn.execute(q):
+                if r[0]:
+                    s.add(r[0])
+    finally:
+        conn.close()
+    return sorted(s)
+
+
 def momentum_calibration(*, db_path=HISTORY_DB, eligible_from="2026-06-10",
-                         course_load="all",
+                         course_load="all", course=None,
+                         date_from=None, date_to=None,
                          now: Optional[datetime] = None) -> dict:
     """Compare each student's ENTRY-time Momentum band to their actual outcome.
 
@@ -883,6 +960,17 @@ def momentum_calibration(*, db_path=HISTORY_DB, eligible_from="2026-06-10",
     from collections import defaultdict
     today = (now or datetime.now()).date()
     elig = _parse_date(eligible_from)
+    # Optional resolution-date window. When active, ONLY students whose outcome
+    # resolved in the window are counted (in-progress + out-of-window resolved
+    # are excluded) — i.e. "of students who finished in this period, …".
+    df = _parse_date(date_from) if date_from else None
+    dto = _parse_date(date_to) if date_to else None
+    date_active = df is not None or dto is not None
+
+    def _in_window(o):
+        d = _resolution_date(o)
+        return (d is not None and (df is None or d >= df)
+                and (dto is None or d <= dto))
 
     conn = _connect(db_path)
     try:
@@ -921,8 +1009,12 @@ def momentum_calibration(*, db_path=HISTORY_DB, eligible_from="2026-06-10",
 
     keys = set(per) | set(outcomes)
     for key in keys:
+        if course and key[1] != course:
+            continue
         rows = per.get(key, [])
         oc = outcomes.get(key)
+        if date_active and (oc is None or not _in_window(oc)):
+            continue       # date window = resolved-in-window students only
         latest_ej = json.loads(rows[-1]["extra_json"] or "{}") if rows else {}
 
         # Course start (eligibility). Prefer a snapshot's value; fall back to the
@@ -1017,6 +1109,7 @@ def momentum_calibration(*, db_path=HISTORY_DB, eligible_from="2026-06-10",
     return {
         "eligible_from": eligible_from,
         "course_load": course_load,
+        "course": course,
         "as_of": today.isoformat(),
         "bands": bands,
         "eligible_total": eligible,
@@ -1029,6 +1122,7 @@ def momentum_calibration(*, db_path=HISTORY_DB, eligible_from="2026-06-10",
 
 
 def momentum_calibration_at_exit(*, db_path=HISTORY_DB, course_load="all",
+                                 course=None, date_from=None, date_to=None,
                                  now: Optional[datetime] = None) -> dict:
     """Calibration of Momentum AS RECORDED IN THE ARCHIVE (at course exit) vs.
     the actual outcome — i.e. how well the *final* Momentum reading matched the
@@ -1047,8 +1141,16 @@ def momentum_calibration_at_exit(*, db_path=HISTORY_DB, course_load="all",
 
     cells = {rank: {"passed_in_time": 0, "passed_late": 0, "not_passed": 0}
              for rank, _, _ in _MOMENTUM_BANDS}
+    df = _parse_date(date_from) if date_from else None
+    dto = _parse_date(date_to) if date_to else None
     no_band = 0
     for oc in outs:
+        if course and (oc.get("course_code") or "") != course:
+            continue
+        if df or dto:
+            d = _resolution_date(oc)
+            if d is None or (df and d < df) or (dto and d > dto):
+                continue
         cnt = oc.get("other_course_count")
         if cnt is None:
             cnt = count_other_courses(oc.get("other_courses") or "",
@@ -1092,6 +1194,94 @@ def momentum_calibration_at_exit(*, db_path=HISTORY_DB, course_load="all",
         "no_entry_band": no_band, "skipped_no_start": 0,
         "skipped_pre_window": 0, "rows": [],
     }
+
+
+def _resolution_date(o):
+    """The date an outcome resolved: pass_date for a pass, else the Term End
+    (or IC End) deadline for a non-pass. None if unparseable. Shared by the
+    over-time chart and the date-range filters."""
+    if (o.get("outcome") or "") == "passed":
+        return _parse_date(o.get("pass_date"))
+    return (_parse_date(o.get("term_end_date"))
+            or _parse_date(o.get("ic_end_date")))
+
+
+def outcomes_over_time(*, db_path=HISTORY_DB, weeks_back=16,
+                       date_from=None, date_to=None,
+                       now: Optional[datetime] = None) -> dict:
+    """Resolved outcomes bucketed by ISO week (Monday) for a completions /
+    pass-rate-over-time chart. Resolution date = pass_date for a pass, else the
+    Term End (or IC End) deadline for a non-pass. Only PAST resolutions count —
+    a non-pass whose deadline is still in the future hasn't resolved yet, so
+    it's excluded until its term ends. The window is ``[date_from, date_to]``
+    when given (else the last ``weeks_back`` weeks up to today). Each week
+    carries passed / not_passed / total / rate."""
+    from datetime import timedelta
+    today = (now or datetime.now()).date()
+    lower = _parse_date(date_from) or (today - timedelta(weeks=weeks_back))
+    upper = _parse_date(date_to) or today
+    upper = min(upper, today)
+    buckets = {}
+    for o in all_outcomes(db_path=db_path):
+        d = _resolution_date(o)
+        if d is None or d < lower or d > upper:
+            continue
+        wk = d - timedelta(days=d.weekday())
+        b = buckets.setdefault(wk, {"passed": 0, "not_passed": 0})
+        b["passed" if o["outcome"] == "passed" else "not_passed"] += 1
+    weeks = []
+    for w in sorted(buckets):
+        p, np_ = buckets[w]["passed"], buckets[w]["not_passed"]
+        t = p + np_
+        weeks.append({"week": w.isoformat(), "passed": p, "not_passed": np_,
+                      "total": t, "rate": (p / t if t else None)})
+    return {"weeks": weeks}
+
+
+def momentum_drift(*, db_path=HISTORY_DB, course_load="all",
+                   date_from=None, date_to=None) -> dict:
+    """How each entry-band's students MOVED by exit, for the resolved students
+    where we have both a frozen entry reading and an exit reading. Per entry
+    band: counts of improved / same / declined (exit rank higher / equal /
+    lower than entry). This is the evidence that exit Momentum self-corrects —
+    and so can't fairly score the entry prediction. ``course_load`` filters the
+    same way as the calibration views."""
+    conn = _connect(db_path)
+    try:
+        outs = [dict(r) for r in conn.execute(
+            "SELECT * FROM outcomes WHERE entry_captured = 1 "
+            "AND entry_momentum_rank IS NOT NULL "
+            "AND momentum_rank_at_outcome IS NOT NULL")]
+    finally:
+        conn.close()
+
+    df = _parse_date(date_from) if date_from else None
+    dto = _parse_date(date_to) if date_to else None
+    rows = []
+    for o in outs:
+        cnt = o.get("other_course_count")
+        if cnt is None:
+            cnt = count_other_courses(o.get("other_courses") or "",
+                                      o.get("course_code"))
+        if course_load == "single" and cnt:
+            continue
+        if course_load == "multi" and not cnt:
+            continue
+        if df or dto:
+            d = _resolution_date(o)
+            if d is None or (df and d < df) or (dto and d > dto):
+                continue
+        rows.append(o)
+
+    bands = []
+    for rank, label, _ in _MOMENTUM_BANDS:    # High → Low
+        grp = [o for o in rows if o["entry_momentum_rank"] == rank]
+        imp = sum(1 for o in grp if o["momentum_rank_at_outcome"] > rank)
+        same = sum(1 for o in grp if o["momentum_rank_at_outcome"] == rank)
+        dec = sum(1 for o in grp if o["momentum_rank_at_outcome"] < rank)
+        bands.append({"rank": rank, "label": label, "improved": imp,
+                      "same": same, "declined": dec, "total": len(grp)})
+    return {"bands": bands, "total": len(rows), "course_load": course_load}
 
 
 def export_calibration_csv(dest_path, *, db_path=HISTORY_DB,
