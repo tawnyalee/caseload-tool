@@ -127,6 +127,16 @@ def compose_email(
         raise OSError(f"Couldn't reach Outlook via COM: {e}") from e
 
     mail = outlook.CreateItem(0)  # 0 = olMailItem
+    # Force HTML body format up front. If the user's Outlook default compose
+    # format is Plain Text, the message (and every `<a href>` in it) gets
+    # downgraded to plain text on send — links silently stripped. Setting
+    # BodyFormat = olFormatHTML (2) before touching the body overrides that
+    # default so links/formatting survive regardless of the local setting.
+    # Best-effort: a restricted config that rejects it shouldn't break send.
+    try:
+        mail.BodyFormat = 2  # olFormatHTML
+    except Exception:
+        pass
     mail.To = to or ""
     if cc:
         mail.CC = cc
