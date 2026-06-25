@@ -81,3 +81,9 @@ capture-*.json
 # Salesforce notes DOM. Contain student PII; never commit.
 dom_dump.html
 temp/
+
+# Inline-edit / task-unlock diagnostic dumps written at runtime to debug
+# Salesforce commit failures. Contain captured DOM (may include PII); the app
+# writes them under USER_CONFIG_DIR — a repo-root copy is a stale artifact.
+flup_probe.txt
+unlock_probe.txt

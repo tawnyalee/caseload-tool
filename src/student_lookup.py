@@ -451,6 +451,78 @@ def scan_task_status_window(table, seen_sids) -> tuple[dict, int]:
             (res.get("sids") if res else None) or [])
 
 
+def _commit_inline_edit(cell) -> str:
+    """Best-effort commit of an open inline-cell edit via an explicit in-cell
+    confirm/Save control, if the grid build has one. Newer Lightning grids
+    require it — and clicking OUTSIDE the cell to blur can CANCEL the pending
+    edit instead of saving it (the suspected 'no value after commit' cause).
+    Returns the selector that was clicked, or "" if none was found."""
+    for sel in ('button[title="Save"]', 'button[title^="Save"]',
+                'button[aria-label="Save"]', 'button[title="Confirm"]',
+                'button[title^="Confirm"]',
+                'lightning-button-icon[icon-name="utility:check"]',
+                'button[title="Done"]'):
+        try:
+            b = cell.locator(sel)
+            if b.count() > 0 and b.first.is_visible():
+                b.first.click()
+                return sel
+        except Exception:
+            pass
+    return ""
+
+
+def _followup_cell_diag(cell, page) -> dict:
+    """Snapshot the OPEN inline-edit cell — its buttons, inputs, an HTML slice,
+    plus any page-level Save/Confirm bar — to work out why a Followup commit
+    isn't sticking when it fails. Best-effort; returns {} on any failure."""
+    diag: dict = {}
+    try:
+        diag["cell"] = cell.evaluate(
+            r'''(td) => {
+              const btns = [...td.querySelectorAll(
+                  'button, lightning-button-icon, [role="button"]')].map(b => ({
+                tag: b.tagName.toLowerCase(),
+                title: b.getAttribute('title') || '',
+                aria: b.getAttribute('aria-label') || '',
+                icon: b.getAttribute('icon-name') || '',
+                text: (b.textContent || '').trim().slice(0, 30),
+                cls: (b.className || '').toString().slice(0, 90),
+              }));
+              const inputs = [...td.querySelectorAll('input, textarea')].map(i => ({
+                tag: i.tagName.toLowerCase(),
+                type: i.getAttribute('type') || '',
+                val: (i.value || '').slice(0, 40),
+              }));
+              return {buttons: btns, inputs,
+                      html: (td.outerHTML || '').slice(0, 1800)};
+            }''')
+    except Exception as e:
+        diag["cell_error"] = str(e)
+    try:
+        diag["save_bars"] = page.evaluate(
+            r'''() => {
+              const out = [];
+              const scan = (root) => {
+                for (const b of root.querySelectorAll('button')) {
+                  const t = ((b.textContent || '').trim()
+                             || b.getAttribute('title')
+                             || b.getAttribute('aria-label') || '');
+                  if (/save|confirm|done|apply/i.test(t))
+                    out.push({text: t.slice(0, 30),
+                              cls: (b.className || '').toString().slice(0, 90)});
+                }
+                for (const el of root.querySelectorAll('*'))
+                  if (el.shadowRoot) scan(el.shadowRoot);
+              };
+              scan(document);
+              return out.slice(0, 25);
+            }''')
+    except Exception as e:
+        diag["save_bars_error"] = str(e)
+    return diag
+
+
 def set_followup_date(page: Page, date_str: str) -> dict:
     """Set the Followup Date cell on the Caseload LIST to `date_str`
     (MM/DD/YYYY). The CALLER must have row-filtered the list to ONE student
@@ -492,16 +564,23 @@ def set_followup_date(page: Page, date_str: str) -> dict:
     except Exception as e:
         return {"ok": False, "value": "",
                 "error": f"date input didn't appear: {e}"}
-    # Commit. The custom grid commits inline — try Enter, then blur via Tab.
-    for key in ("Enter", "Tab"):
-        try:
-            inp.press(key)
-        except Exception:
-            pass
+    # Snapshot the open editor for failure diagnostics (SF inline-edit drifts).
+    editor_diag = _followup_cell_diag(cell, page)
+    # Commit. PREFER an explicit in-cell confirm/Save control if present (some
+    # builds require it and cancel on outside-click); else the original
+    # Enter-then-Tab the custom grid commits on.
+    committed_via = _commit_inline_edit(cell)
+    if not committed_via:
+        for key in ("Enter", "Tab"):
+            try:
+                inp.press(key)
+            except Exception:
+                pass
     try:
         page.wait_for_timeout(900)
     except Exception:
         pass
+    post_diag = _followup_cell_diag(cell, page)
     # Re-read the cell to confirm what stuck (format may normalize).
     value = ""
     try:
@@ -522,9 +601,24 @@ def set_followup_date(page: Page, date_str: str) -> dict:
         pass
     if value.strip().lower() == "date picker":  # assistive-text leak guard
         value = ""
-    return {"ok": bool(value), "value": value,
-            "error": "" if value else
-            "no value after commit — the commit trigger may differ"}
+    # If the date input is still on-screen, the value read is the open editor's
+    # text, not a committed value (the 'local-yes, browser-no' false positive).
+    still_open = False
+    try:
+        ed = cell.locator('input[type="text"]')
+        still_open = ed.count() > 0 and ed.first.is_visible()
+    except Exception:
+        still_open = False
+    diag = {"pre": editor_diag, "post": post_diag,
+            "committed_via": committed_via, "value_read": value,
+            "still_open": still_open}
+    committed = bool(value) and not still_open
+    return {"ok": committed, "value": value,
+            "committed_via": committed_via,
+            "error": "" if committed else
+            ("editor still open — commit didn't persist" if still_open else
+             "no value after commit — the commit trigger may differ"),
+            "diag": diag}
 
 
 def set_followup_note(page: Page, note_text: str) -> dict:
@@ -565,22 +659,37 @@ def set_followup_note(page: Page, note_text: str) -> dict:
     except Exception as e:
         return {"ok": False, "value": "",
                 "error": f"note editor didn't appear: {e}"}
-    # Commit: the grid commits inline on BLUR. Tab can land on the in-cell
-    # 'Clear' button (focus never leaves the cell → no commit), so blur the
-    # textarea directly AND click a neutral spot outside the cell to force
-    # focus out. (Enter is avoided — it would add a newline in a textarea.)
+    # Snapshot the open editor up front so a failed commit can report exactly
+    # what confirm/save controls the cell has (SF inline-edit UI drifts).
+    editor_diag = _followup_cell_diag(cell, page)
+    # Commit. PREFER an explicit in-cell confirm/Save control (newer grid
+    # builds require it; clicking outside the cell can CANCEL the edit). Fall
+    # back to a plain blur, which older builds commit on. (Enter is avoided —
+    # it would add a newline in a textarea.)
+    committed_via = _commit_inline_edit(cell)
+    if not committed_via:
+        # Mirror the DATE write's working commit: a keyboard Tab (focus-out)
+        # commits the custom cDataGrid cell. Tab only MOVES focus (it doesn't
+        # activate the in-cell Clear button — that needs Enter/Space), so it's
+        # safe. Avoid Enter (newline in a textarea) and avoid clicking OUTSIDE
+        # the cell (e.g. the search bar), which can CANCEL the pending edit —
+        # the suspected cause of the note never persisting.
+        try:
+            ta.press("Tab")
+        except Exception:
+            pass
+        try:
+            ta.evaluate("el => el.blur()")
+        except Exception:
+            pass
+    # Snapshot AGAIN after the commit attempt: did a grid Save bar appear, did
+    # the editor close, what does the read-state show? (Captured always while
+    # we diagnose why the commit isn't persisting to Salesforce.)
     try:
-        ta.evaluate("el => el.blur()")
+        page.wait_for_timeout(400)
     except Exception:
         pass
-    try:
-        fb = page.locator(
-            'input[placeholder="Search All Rows..."]'
-        ).filter(visible=True).first
-        if fb.count() > 0:
-            fb.click()
-    except Exception:
-        pass
+    post_diag = _followup_cell_diag(cell, page)
     # Re-read the committed note (retry briefly while the read-state renders).
     clearing = not (note_text or "").strip()
     value = ""
@@ -603,11 +712,27 @@ def set_followup_note(page: Page, note_text: str) -> dict:
             pass
     # An intentional clear commits an empty cell, so an empty read-back IS the
     # success case — don't treat it as "commit trigger may differ".
+    # Verify the editor actually CLOSED — if the textarea is still on-screen the
+    # value we read is just the open editor's text, not a committed value (the
+    # 'local-yes, browser-no' false positive). Treat still-open as not committed.
+    still_open = False
+    try:
+        ed = cell.locator('textarea')
+        still_open = ed.count() > 0 and ed.first.is_visible()
+    except Exception:
+        still_open = False
+    diag = {"pre": editor_diag, "post": post_diag,
+            "committed_via": committed_via, "value_read": value,
+            "still_open": still_open}
     if clearing:
-        return {"ok": True, "value": "", "error": ""}
-    return {"ok": bool(value), "value": value,
-            "error": "" if value else
-            "no note after commit — the commit trigger may differ"}
+        return {"ok": True, "value": "", "error": "", "diag": diag}
+    committed = bool(value) and not still_open
+    return {"ok": committed, "value": value,
+            "committed_via": committed_via,
+            "error": "" if committed else
+            ("editor still open — commit didn't persist" if still_open else
+             "no note after commit — the commit trigger may differ"),
+            "diag": diag}
 
 
 # ----- Essential Actions (EA) -----

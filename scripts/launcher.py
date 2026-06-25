@@ -2521,6 +2521,7 @@ class BrowserWorker:
             res = set_followup_date(target, date_str)
         except Exception as e:
             res = {"ok": False, "value": "", "error": str(e)}
+        self._persist_followup_diag(res, "date")
         # Restore the filter so the live list is whole again.
         try:
             if fi is not None and fi.count() > 0:
@@ -2554,6 +2555,7 @@ class BrowserWorker:
             res = set_followup_note(target, note_text)
         except Exception as e:
             res = {"ok": False, "value": "", "error": str(e)}
+        self._persist_followup_diag(res, "note")
         try:
             if fi is not None and fi.count() > 0:
                 fi.click(); fi.fill(""); fi.press("Enter")
@@ -2561,6 +2563,23 @@ class BrowserWorker:
         except Exception:
             pass
         return res
+
+    def _persist_followup_diag(self, res: dict, kind: str) -> None:
+        """When a Followup write fails to commit, dump the captured editor DOM
+        to flup_probe.txt so the inline-edit save control can be identified."""
+        if not (res and res.get("diag")):
+            return
+        try:
+            import json
+            from src.config import USER_CONFIG_DIR
+            p = USER_CONFIG_DIR / "flup_probe.txt"
+            p.write_text(
+                f"=== followup {kind} commit failed ===\n"
+                + json.dumps(res["diag"], indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            res["diag_path"] = str(p)
+        except Exception:
+            pass
 
     def _scrape_all_task_status(self, ctx, expected_sids=None) -> dict:
         """Bulk '2a' scrape: scroll-load the whole live Caseload list, then
@@ -10807,6 +10826,8 @@ class CaseloadPanel:
         ctk.CTkButton(
             frame, text="Set", width=46, command=do_set,
         ).grid(row=0, column=3, padx=2)
+        # Enter in the date field = click Set.
+        entry.bind("<Return>", lambda _e: do_set())
 
         # Follow-up note row (writes back to Salesforce; commit = blur). Own
         # sub-frame so the entry can stretch full width between label + Set.
@@ -10839,6 +10860,8 @@ class CaseloadPanel:
         if cur_note:
             note_entry.insert(0, cur_note)
         note_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        # Enter in the note field = click Set.
+        note_entry.bind("<Return>", lambda _e: do_set_note())
         return r + 1
 
     def _qv_field(self, r, row, label, key, kind) -> int:
@@ -21369,10 +21392,19 @@ class App:
                     self._append_log(
                         f"Set follow-up date failed: {(res or {}).get('error')}",
                         error=True)
+                    if res and res.get("diag_path"):
+                        self._append_log(
+                            f"  ↳ editor DOM dumped to {res['diag_path']} "
+                            "(send it to me to fix the commit).")
                 else:
                     self._append_log(
                         f"Follow-up date set to {res.get('value') or date_str} "
-                        f"for {sid}.")
+                        f"for {sid}"
+                        + (f" (via {res.get('committed_via')})"
+                           if res.get('committed_via') else "") + ".")
+                    if res.get("diag_path"):
+                        self._append_log(
+                            f"  ↳ editor DOM dumped to {res['diag_path']}.")
                 if on_apply:
                     try:
                         on_apply(res or {})
@@ -21410,8 +21442,18 @@ class App:
                     self._append_log(
                         f"Set follow-up note failed: {(res or {}).get('error')}",
                         error=True)
+                    if res and res.get("diag_path"):
+                        self._append_log(
+                            f"  ↳ editor DOM dumped to {res['diag_path']} "
+                            "(send it to me to fix the commit).")
                 else:
-                    self._append_log(f"Follow-up note set for {sid}.")
+                    self._append_log(
+                        f"Follow-up note set for {sid}"
+                        + (f" (via {res.get('committed_via')})"
+                           if res.get('committed_via') else "") + ".")
+                    if res.get("diag_path"):
+                        self._append_log(
+                            f"  ↳ editor DOM dumped to {res['diag_path']}.")
                 if on_apply:
                     try:
                         on_apply(res or {})
