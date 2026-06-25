@@ -384,6 +384,73 @@ def read_loaded_task_status(table) -> dict:
     return result
 
 
+def scan_task_status_window(table, seen_sids) -> tuple[dict, int]:
+    """Read one window of the bulk task scan in a SINGLE page.evaluate.
+
+    Replaces the old `read_loaded_task_status` call inside the scroll loop,
+    which re-parsed EVERY already-seen row on every iteration (the O(n²) cost
+    that pegged the machine on a 250-row caseload). Here we walk the rendered
+    rows once and SKIP the expensive task-cell read for any Student ID already
+    in `seen_sids`, so each student's cells are parsed exactly once across the
+    whole scroll-load. Skipping seen rows is safe whether the grid accumulates
+    rows or virtualizes/recycles them, because we key on the student's stable
+    Student ID, never on row position.
+
+    Scrolling stays in the caller (the proven `_scroll_datatable_to_bottom` +
+    `scroll_into_view_if_needed` pair drives the lazy-load reliably; a bare JS
+    scrollTop did not). `seen_sids` is any iterable of Student IDs already
+    captured. Returns (new_statuses_by_sid, total_row_count, seen_sids_window);
+    the dict has the same shape as `read_loaded_task_status` but only for
+    not-yet-seen rows. `seen_sids_window` is EVERY Student ID rendered in this
+    window (task-bearing or not) so the caller can tell when it has scrolled
+    past all the students it cares about. Only the task cells
+    (`span[class*='cellColor']`) are read — never the other columns' content;
+    the per-row scan stops at the Student ID cell."""
+    res = table.evaluate(
+        r'''(tbl, seenArr) => {
+          const seen = new Set(seenArr);
+          const out = [];
+          const sids = [];
+          let count = 0;
+          for (const r of tbl.querySelectorAll('tr')) {
+            let sid = '';
+            for (const td of r.querySelectorAll('td')) {
+              const t = (td.textContent || '').trim();
+              if (/^\d{9,10}$/.test(t)) { sid = t; break; }
+            }
+            if (!sid) continue;
+            count++;
+            sids.push(sid);
+            if (seen.has(sid)) continue;   // already captured — skip the read
+            const cells = [];
+            for (const s of r.querySelectorAll("span[class*='cellColor']")) {
+              cells.push({cls: s.className || '',
+                          title: s.getAttribute('title') || ''});
+            }
+            if (cells.length) out.push({sid, cells});
+          }
+          return {rows: out, count, sids};
+        }''',
+        list(seen_sids),
+    )
+    new_status: dict = {}
+    for row in (res.get("rows") if res else None) or []:
+        sid = row.get("sid")
+        if not sid:
+            continue
+        statuses: dict = {}
+        for c in row.get("cells", []):
+            parsed = _parse_task_cell(c.get("cls", ""), c.get("title", ""))
+            if parsed:
+                tnum, info = parsed
+                statuses[tnum] = info
+        if statuses:
+            new_status[sid] = statuses
+    return (new_status,
+            (res.get("count", 0) if res else 0),
+            (res.get("sids") if res else None) or [])
+
+
 def set_followup_date(page: Page, date_str: str) -> dict:
     """Set the Followup Date cell on the Caseload LIST to `date_str`
     (MM/DD/YYYY). The CALLER must have row-filtered the list to ONE student

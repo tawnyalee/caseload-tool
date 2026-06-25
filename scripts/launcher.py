@@ -392,12 +392,17 @@ class BrowserWorker:
         self.q.put(("FETCH_TASK_STATUS", query, on_done))
 
     def submit_scrape_all_task_status(
-        self, on_done: Callable[[dict], None],
+        self, on_done: Callable[[dict], None], expected_sids=None,
     ) -> None:
         """Bulk '2a' scrape: scroll-load the whole Caseload list and read
         every task cell's live pass/fail, keyed by Student ID.
-        on_done({by_sid: {sid: {tnum: {...}}}, count}) or {error}."""
-        self.q.put(("SCRAPE_ALL_TASK_STATUS", on_done))
+        on_done({by_sid: {sid: {tnum: {...}}}, count}) or {error}.
+
+        `expected_sids` (optional) is the set of Student IDs the caller already
+        knows have a task (from the CSV's Task columns). When given, the scroll-
+        load stops as soon as it has scrolled PAST all of them — no need to grind
+        out the trailing 'stable' passes once every task-bearer is in hand."""
+        self.q.put(("SCRAPE_ALL_TASK_STATUS", on_done, expected_sids))
 
     def submit_send_text(
         self, payload: dict, on_done: Callable[[dict], None],
@@ -729,10 +734,10 @@ class BrowserWorker:
             finally:
                 on_done(res)
         elif cmd[0] == "SCRAPE_ALL_TASK_STATUS":
-            _, on_done = cmd
+            _, on_done, expected_sids = cmd
             res = {}
             try:
-                res = self._scrape_all_task_status(ctx)
+                res = self._scrape_all_task_status(ctx, expected_sids)
             finally:
                 on_done(res)
         elif cmd[0] == "SEND_TEXT":
@@ -2557,14 +2562,23 @@ class BrowserWorker:
             pass
         return res
 
-    def _scrape_all_task_status(self, ctx) -> dict:
+    def _scrape_all_task_status(self, ctx, expected_sids=None) -> dict:
         """Bulk '2a' scrape: scroll-load the whole live Caseload list, then
         read every task cell's pass/fail (the colour the CSV export drops),
         keyed by Student ID. Returns {"by_sid": {sid: {tnum: {...}}},
         "count": N} or {"error": msg}. Runs in the background after a refresh
         (App._maybe_bulk_scrape_task_status); the ~5-9s cost is the scroll-
-        load, the read itself is ~instant."""
-        from src.student_lookup import read_loaded_task_status
+        load, the read itself is ~instant.
+
+        `expected_sids` (optional): the Student IDs known from the CSV to have a
+        task. When supplied, the scroll-load stops the moment it has scrolled
+        PAST all of them — we've already captured every task-bearer, so the
+        trailing 'stable' passes are wasted work. Safe against under-reading:
+        the first time a task-bearer's row is seen its cells are read, so
+        'scrolled past all expected' implies 'captured all that have cells'."""
+        want = {s for s in (expected_sids or []) if s}
+        from src.student_lookup import scan_task_status_window
+        from src.proc_priority import browser_low_priority
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return {"error": "caseload table didn't load"}
@@ -2594,44 +2608,70 @@ class BrowserWorker:
         # every window and stopping only after the row count is stable for
         # THREE passes captures rows before they recycle and survives a slow
         # lazy-load chunk.
+        #
+        # Each step is now ONE page.evaluate (read new rows + count + scroll,
+        # via scan_task_status_window) that SKIPS rows whose Student ID we
+        # already have — so each student's task cells are parsed exactly once
+        # across the whole load, not re-scanned every pass (the O(n²) work that
+        # pegged the machine). And we drop the browser's CPU priority for the
+        # duration so this background pass doesn't starve the rest of the
+        # machine; it's restored when the `with` block exits.
         by_sid: dict = {}
+        seen_all: set = set()
         last_count, stable = -1, 0
+        iters, stop_reason = 0, "max_iters"
         MAX_ITERS = 300
-        for _ in range(MAX_ITERS):
-            # Yield to the user: this background scroll-load is the slow part
-            # (~5-9s), and the worker is single-threaded, so a note/email/text
-            # action fired mid-scrape would otherwise wait for the whole thing.
-            # The moment any user command is queued, bail out — the caller
-            # re-runs the scrape once the worker is free again.
-            if not self.q.empty():
-                return {"interrupted": True}
-            try:
-                window = read_loaded_task_status(table)
-            except Exception:
-                window = {}
-            for sid, st in window.items():
-                if sid not in by_sid:
-                    by_sid[sid] = st
-            rows = table.locator("tr")
-            count = rows.count()
-            if count == last_count:
-                stable += 1
-                if stable >= 3:
+        with browser_low_priority() as lowered:
+            lowered_n = len(lowered or [])
+            for _ in range(MAX_ITERS):
+                iters += 1
+                # Yield to the user: this background scroll-load is the slow part
+                # (~5-9s), and the worker is single-threaded, so a note/email/
+                # text action fired mid-scrape would otherwise wait for the whole
+                # thing. The moment any user command is queued, bail out — the
+                # caller re-runs the scrape once the worker is free again.
+                if not self.q.empty():
+                    return {"interrupted": True, "lowered": lowered_n}
+                # Read this window (skips already-seen Student IDs — the CPU win)
+                try:
+                    new_status, count, sids = scan_task_status_window(
+                        table, by_sid.keys())
+                except Exception:
+                    new_status, count, sids = {}, last_count, []
+                for sid, st in new_status.items():
+                    by_sid.setdefault(sid, st)
+                seen_all.update(sids)
+                # Early stop: once we've scrolled past every task-bearer the CSV
+                # told us about, we're done — skip the trailing 'stable' passes.
+                if want and want <= seen_all:
+                    stop_reason = "all_tasks_found"
                     break
-            else:
-                stable = 0
-            last_count = count
-            self._scroll_datatable_to_bottom(table)
-            try:
-                if count > 0:
-                    rows.nth(count - 1).scroll_into_view_if_needed(timeout=2000)
-            except Exception:
-                pass
-            try:
-                target.wait_for_timeout(400)
-            except Exception:
-                pass
-        return {"by_sid": by_sid, "count": len(by_sid)}
+                if count == last_count:
+                    stable += 1
+                    if stable >= 3:
+                        stop_reason = "stable"
+                        break
+                else:
+                    stable = 0
+                last_count = count
+                # Scroll to pull the next lazy-load chunk — the ORIGINAL proven
+                # pair (container-to-bottom + the last row into view). The bare
+                # JS scrollTop alone under-triggered Lightning's load.
+                self._scroll_datatable_to_bottom(table)
+                try:
+                    rows = table.locator("tr")
+                    rc = rows.count()
+                    if rc > 0:
+                        rows.nth(rc - 1).scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                try:
+                    target.wait_for_timeout(400)
+                except Exception:
+                    pass
+        return {"by_sid": by_sid, "count": len(by_sid),
+                "rows": max(last_count, 0),
+                "lowered": lowered_n, "iters": iters, "stop": stop_reason}
 
     MONGOOSE_DASHBOARD_URL = "https://sms.mongooseresearch.com/legacy-dashboard"
 
@@ -21546,6 +21586,13 @@ class App:
                 self._append_log(
                     f"Live task pass/fail: {len(by_sid)} student(s) scraped, "
                     f"{matched} joined to caseload rows. Tasks: {tstr}")
+                # Diagnostics for the perf work: did the browser get de-
+                # prioritized (option 2), and how did the scroll-load end?
+                self._append_log(
+                    f"  ↳ scan: reached {res.get('rows', 0)} of {len(csv_sids)} "
+                    f"list rows ({len(by_sid)} have tasks); de-prioritized "
+                    f"{res.get('lowered', 0)} browser process(es); "
+                    f"{res.get('iters', 0)} passes; stop={res.get('stop', '?')}")
                 if by_sid and matched < len(by_sid):
                     self._append_log(
                         f"  ⚠ {len(by_sid) - matched} scraped student(s) "
@@ -21566,7 +21613,18 @@ class App:
 
         self._append_log("Reading live task pass/fail in the background…")
         self._task_scrape_running = True
-        self.worker.submit_scrape_all_task_status(on_done)
+        # Tell the scan which students actually have a task (non-empty CSV Task
+        # column) so it can stop scrolling once it's passed all of them instead
+        # of grinding to the very bottom. Identity column = StudentID.
+        import re as _re
+        rows = getattr(self, "_caseload_rows", None) or []
+        task_cols = [k for k in (rows[0].keys() if rows else [])
+                     if _re.fullmatch(r"Task\d+", k)]
+        expected = {(r.get("StudentID") or "").strip()
+                    for r in rows
+                    if any((r.get(c) or "").strip() for c in task_cols)}
+        expected.discard("")
+        self.worker.submit_scrape_all_task_status(on_done, expected_sids=expected)
 
     def _review_notes(self, query: str, label: str, panel) -> None:
         """Fetch a student's notes on the worker thread and render them into
