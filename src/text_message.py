@@ -338,11 +338,40 @@ def switch_department(page: Page, course: str, *, timeout_ms: int = 10_000) -> N
     # Not confirmed in time — proceed; select_inbox will fail loudly if wrong.
 
 
+def _wait_loader_gone(page: Page, *, timeout_ms: int = 20_000) -> None:
+    """Wait for Mongoose's Cadence-web loading overlay (#cw_loader) to clear.
+    It covers the whole app and INTERCEPTS POINTER EVENTS while data loads, so
+    clicking Compose/Preview/Schedule through it times out — the recurring
+    'compose modal didn't reach the recipient step' failure, worst right after
+    a heavy page load (e.g. the startup caseload scan). `state="hidden"`
+    resolves whether the overlay is hidden or detached, and returns at once if
+    it was never there. Best-effort: a changed selector just falls through."""
+    try:
+        page.locator("#cw_loader").wait_for(state="hidden", timeout=timeout_ms)
+    except Exception:
+        pass
+
+
 def _click_button(page: Page, name: str, *, timeout_ms: int = 10_000) -> None:
-    """Click a Vuetify button by its visible text/accessible name."""
-    page.get_by_role("button", name=name, exact=True).filter(
-        visible=True
-    ).first.click(timeout=timeout_ms)
+    """Click a Vuetify button by its visible text/accessible name, retrying
+    through the loading overlay. Waiting for #cw_loader to clear BEFORE the
+    click isn't enough: on the first compose of a session the overlay pops up
+    DURING the click and intercepts it (the 'compose didn't reach the recipient
+    step' cold-start failure). So: wait → click → if intercepted, wait for the
+    overlay to clear and click once more."""
+    btn = page.get_by_role("button", name=name, exact=True).filter(
+        visible=True).first
+    last = None
+    for attempt in range(2):
+        _wait_loader_gone(page)
+        try:
+            btn.click(timeout=timeout_ms)
+            return
+        except PWTimeout as e:
+            last = e
+            _wait_loader_gone(page, timeout_ms=25_000)
+    if last is not None:
+        raise last
 
 
 def close_compose(page: Page, *, timeout_ms: int = 5_000) -> None:
