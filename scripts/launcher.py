@@ -11038,6 +11038,8 @@ class CaseloadPanel:
             font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
         ).grid(row=0, column=0, sticky="e", padx=8, pady=(6, 2))
 
+        # Captured for the per-step edit menu (Mark done / Skip / Reset).
+        self._sp_sid, self._sp_course = sid, course
         for i, st in enumerate(computed, start=1):
             glyph, lc, dc, dim = self._PATH_STATUS_STYLE.get(
                 st["status"], ("•", "gray55", "gray55", True))
@@ -11049,20 +11051,82 @@ class CaseloadPanel:
             rowf.grid(row=i, column=0, sticky="ew", padx=6,
                       pady=(0, 2 if i == len(computed) else 0))
             rowf.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(
+            gl = ctk.CTkLabel(
                 rowf, text=glyph, width=18, text_color=(lc, dc),
-                font=ctk.CTkFont(size=13, weight="bold"),
-            ).grid(row=0, column=0, sticky="w", padx=(6, 2), pady=1)
+                font=ctk.CTkFont(size=13, weight="bold"))
+            gl.grid(row=0, column=0, sticky="w", padx=(6, 2), pady=1)
             label = st["description"]
             if st["status"] == "skipped":
                 label += "  (skipped)"
-            ctk.CTkLabel(
-                rowf, text=label, anchor="w", justify="left", wraplength=210,
+            tl = ctk.CTkLabel(
+                rowf, text=label, anchor="w", justify="left", wraplength=188,
                 font=ctk.CTkFont(size=12,
                                  weight="bold" if is_next else "normal"),
-                text_color=(("gray55", "gray55") if dim else ("gray20", "gray90")),
-            ).grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=1)
+                text_color=(("gray55", "gray55") if dim else ("gray20", "gray90")))
+            tl.grid(row=0, column=1, sticky="ew", padx=(0, 4), pady=1)
+            # ✎ edit affordance — click the pencil (or the row) to mark the
+            # support done / skip it / reset it.
+            ed = ctk.CTkLabel(
+                rowf, text="✎", width=16, text_color=("gray45", "gray60"),
+                font=ctk.CTkFont(size=12), cursor="hand2")
+            ed.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=1)
+            for w in (rowf, gl, tl, ed):
+                w.configure(cursor="hand2")
+                w.bind("<Button-1>",
+                       lambda e, s=st: self._open_step_menu(s, e))
         frame.grid()
+
+    def _open_step_menu(self, st: dict, event) -> None:
+        """Per-step edit menu (Mark done / Skip / Reset). Writes the chosen
+        event to step_log for the shown student, then re-renders so the path
+        updates immediately."""
+        sid = getattr(self, "_sp_sid", "")
+        course = getattr(self, "_sp_course", "")
+        step_id = st.get("id")
+        if not (sid and course and step_id):
+            return
+        from src import success_path as sp
+        status = st.get("status")
+        menu = tk.Menu(self.frame, tearoff=0)
+        if status != "done":
+            menu.add_command(
+                label="✓  Mark done",
+                command=lambda: self._set_step(
+                    sid, course, step_id, sp.EVENT_COMPLETED))
+            if status != "skipped":
+                menu.add_command(
+                    label="⊘  Skip",
+                    command=lambda: self._set_step(
+                        sid, course, step_id, sp.EVENT_DISMISSED))
+        if status in ("done", "skipped"):
+            menu.add_command(
+                label="↺  Reset to not-done",
+                command=lambda: self._set_step(
+                    sid, course, step_id, sp.EVENT_RESET))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _set_step(self, sid: str, course: str, step_id: str, event: str) -> None:
+        """Log a manual step event (completed / dismissed / reset) and refresh
+        the panel. `source='manual'` distinguishes it from action-fired ones."""
+        from src import success_path as sp
+        try:
+            sp.log_step(sid, course, step_id, event, source="manual")
+        except Exception:
+            pass
+        try:
+            self.app._append_log(
+                f"Success Path: {step_id!r} → {event} ({course}, manual).")
+        except Exception:
+            pass
+        row = getattr(self, "_qv_row", None)
+        if row:
+            try:
+                self._render_success_path(row)
+            except Exception:
+                pass
 
     def _qv_latest_note(self, r, row, parent=None) -> int:
         """Render the latest course note (CSV `LatestCourseNote`) with its
@@ -12194,7 +12258,7 @@ class CaseloadPanel:
         menu = tk.Menu(self.fire_sel_btn, tearoff=0)
         for sc in nonbatch:
             menu.add_command(
-                label=sc.name,
+                label=self.app._action_display_name(sc),
                 command=lambda s=sc: self.app._fire_on_selected(
                     s, self._checked_rows()))
         try:
@@ -12994,7 +13058,7 @@ class CaseloadPanel:
             fire_menu = tk.Menu(menu, tearoff=0)
             for sc in nonbatch:
                 fire_menu.add_command(
-                    label=sc.name,
+                    label=self.app._action_display_name(sc),
                     command=lambda s=sc, r=row: self.app._fire_on_selected(
                         s, [r], near=(x_root, y_root)))
             menu.add_cascade(label="Fire action", menu=fire_menu)
@@ -13005,7 +13069,7 @@ class CaseloadPanel:
                 sel_menu = tk.Menu(menu, tearoff=0)
                 for sc in nonbatch:
                     sel_menu.add_command(
-                        label=sc.name,
+                        label=self.app._action_display_name(sc),
                         command=lambda s=sc: self.app._fire_on_selected(
                             s, self._checked_rows(), near=(x_root, y_root)))
                 menu.add_cascade(
@@ -14303,6 +14367,14 @@ class App:
             self._btn_hide_taskbar.configure(text="Hide", width=60)
             self._btn_open_log.configure(text="Log", width=50)
 
+    @staticmethod
+    def _action_display_name(sc) -> str:
+        """Display label for an action. A ✎ pencil prefix marks a RECORD-ONLY
+        action — it records a Success Path support and sends nothing — to set it
+        apart from send actions at a glance (button + panel menus)."""
+        name = getattr(sc, "name", "") or ""
+        return f"✎ {name}" if getattr(sc, "record_only", False) else name
+
     def _rebuild_scenario_buttons(self) -> None:
         """Render the scenario button list. Layout depends on whether
         the user has defined any groups:
@@ -14323,7 +14395,8 @@ class App:
 
         def _scenario_btn(parent, name: str, sc: ScenarioConfig,
                           color: Optional[str] = None) -> ctk.CTkButton:
-            label = name + (f"  ({sc.hotkey})" if sc.hotkey else "")
+            label = self._action_display_name(sc) + (
+                f"  ({sc.hotkey})" if sc.hotkey else "")
             kwargs: dict = dict(
                 text=label, command=lambda s=sc: self._fire(s),
                 width=160, height=36,
