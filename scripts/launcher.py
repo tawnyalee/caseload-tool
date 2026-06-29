@@ -10273,6 +10273,15 @@ class CaseloadPanel:
         self.qv_ea_frame.grid(row=1, column=0, sticky="new", padx=4,
                               pady=(2, 4))
         self.qv_ea_frame.grid_columnconfigure(0, weight=1)
+        # Success Path: the course's step checklist with live per-student status
+        # (Done / Due / Blocked / Skipped) + the recommended next action. Hidden
+        # when the student's course has no success path defined.
+        self.qv_path_frame = ctk.CTkFrame(
+            self.qv_col, fg_color=("gray90", "gray22"), corner_radius=6)
+        self.qv_path_frame.grid(row=2, column=0, sticky="new", padx=4,
+                                pady=(2, 4))
+        self.qv_path_frame.grid_columnconfigure(0, weight=1)
+        self.qv_path_frame.grid_remove()   # shown by _render_success_path
 
         # Notes area: last action + latest course note pinned at the top
         # (qv_notehead), then the full notes.
@@ -10845,6 +10854,8 @@ class CaseloadPanel:
         self._qv_render_notehead(row)
         # Essential Actions for this student (left column, below info).
         self._qv_render_ea(row)
+        # Success Path for this student's course (left column, below EA).
+        self._render_success_path(row)
         # New student → reset the notes area to the hint.
         self._notes_hint()
         # Make sure the whole quick view is visible by default.
@@ -10967,6 +10978,81 @@ class CaseloadPanel:
                 wraplength=240, font=ctk.CTkFont(size=11),
                 text_color=("gray35", "gray70"),
             ).grid(row=rr, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+    # ----- success path -----
+
+    # Per-status display: (glyph, light_color, dark_color, dim?).
+    _PATH_STATUS_STYLE = {
+        "done":    ("✓", "#2e7d32", "#7bd88f", False),
+        "due":     ("▶", "#1a73e8", "#79b8ff", False),
+        "blocked": ("•", "gray55", "gray55", True),
+        "skipped": ("⊘", "gray50", "gray55", True),
+    }
+
+    def _render_success_path(self, row) -> None:
+        """Fill the Success Path panel for this student: the course's steps with
+        live status (Done / Due / Blocked / Skipped) and the recommended next
+        action highlighted. Hidden when the course has no success path."""
+        frame = getattr(self, "qv_path_frame", None)
+        if frame is None:
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        course = self._cell(row, "CourseCode") or self._cell(row, "Course Code")
+        sid = self._cell(row, "StudentID") or self._cell(row, "Student ID")
+        paths = getattr(self.app, "success_paths", {}) or {}
+        path = paths.get(course)
+        if not path or not path.steps:
+            frame.grid_remove()
+            return
+        from src import success_path as sp
+        try:
+            events = sp.step_status(sid, course) if sid else {}
+            fields = sp.get_fields(sid, course) if sid else {}
+        except Exception:
+            events, fields = {}, {}
+        try:
+            computed = sp.compute_steps(path.steps, row, events, fields)
+        except Exception:
+            frame.grid_remove()
+            return
+
+        ctk.CTkLabel(
+            frame, text=f"Success Path · {course}", anchor="w",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("gray35", "gray70"),
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+        done_n = sum(1 for s in computed if s["status"] == "done")
+        ctk.CTkLabel(
+            frame, text=f"{done_n} of {len(computed)} done", anchor="e",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+        ).grid(row=0, column=0, sticky="e", padx=8, pady=(6, 2))
+
+        for i, st in enumerate(computed, start=1):
+            glyph, lc, dc, dim = self._PATH_STATUS_STYLE.get(
+                st["status"], ("•", "gray55", "gray55", True))
+            is_next = st["is_next"]
+            rowf = ctk.CTkFrame(
+                frame, fg_color=(("#e8f0fe", "#1f3a5f") if is_next
+                                 else "transparent"),
+                corner_radius=4)
+            rowf.grid(row=i, column=0, sticky="ew", padx=6,
+                      pady=(0, 2 if i == len(computed) else 0))
+            rowf.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                rowf, text=glyph, width=18, text_color=(lc, dc),
+                font=ctk.CTkFont(size=13, weight="bold"),
+            ).grid(row=0, column=0, sticky="w", padx=(6, 2), pady=1)
+            label = st["description"]
+            if st["status"] == "skipped":
+                label += "  (skipped)"
+            ctk.CTkLabel(
+                rowf, text=label, anchor="w", justify="left", wraplength=210,
+                font=ctk.CTkFont(size=12,
+                                 weight="bold" if is_next else "normal"),
+                text_color=(("gray55", "gray55") if dim else ("gray20", "gray90")),
+            ).grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=1)
+        frame.grid()
 
     def _qv_latest_note(self, r, row, parent=None) -> int:
         """Render the latest course note (CSV `LatestCourseNote`) with its

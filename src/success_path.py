@@ -48,6 +48,13 @@ EVENT_COMPLETED = "completed"
 EVENT_DISMISSED = "dismissed"
 EVENT_RESET = "reset"
 
+# Computed DISPLAY status for a step (see compute_steps) — NOT stored; derived
+# live from the latest event + the gate/skip-when conditions.
+STATUS_DONE = "done"        # the step's action fired, or ticked done
+STATUS_SKIPPED = "skipped"  # dismissed by the user, OR auto-skipped by skip_when
+STATUS_DUE = "due"          # gate satisfied, not done — actionable now
+STATUS_BLOCKED = "blocked"  # gate not satisfied yet (an earlier step is pending)
+
 
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS field_values (
@@ -248,6 +255,70 @@ def all_step_status(*, db_path=SUCCESS_PATH_DB) -> dict:
         return out
     finally:
         conn.close()
+
+
+def compute_steps(steps, row, events, fields=None, *, today=None) -> list:
+    """Compute each step's live DISPLAY status for one student on a course.
+
+    Pure logic (no DB / no I/O) — the caller supplies the inputs:
+      ``steps``  ordered PathStep-likes (need .id/.description/.action/.gate/
+                 .skip_when),
+      ``row``    the student's caseload row (dict of column -> value),
+      ``events`` ``{step_id: latest_event}`` from ``step_status()``,
+      ``fields`` ``{field_name: value}`` path field values (merged into the row
+                 so gate/skip_when predicates can reference them by name).
+
+    Status precedence per step: a logged ``completed`` -> Done and a logged
+    ``dismissed`` -> Skipped always win (an explicit user/action decision).
+    Otherwise ``skip_when`` (any predicate list that fully matches) auto-skips;
+    else the ``gate`` decides Due vs Blocked. An EMPTY gate is the linear
+    default — satisfied once the PREVIOUS step is Done/Skipped — so by default
+    exactly the first not-done step is Due and the rest Blocked. A non-empty
+    gate is evaluated against the row independently (it can be Due out of order).
+
+    Returns a list of dicts (step order preserved):
+      ``{id, description, action, status, auto_skipped, is_next}`` where
+    ``is_next`` marks the single recommended next action (first Due step)."""
+    from src import caseload_filter as cf
+    ctx = dict(row or {})
+    if fields:
+        ctx.update(fields)
+    events = events or {}
+
+    def _all(preds) -> bool:
+        try:
+            return all(cf.evaluate_filter(p, ctx, today=today) for p in preds)
+        except Exception:
+            return False
+
+    out: list = []
+    prev_satisfied = True   # the first step's linear gate is satisfied
+    next_assigned = False
+    for step in steps:
+        ev = events.get(step.id)
+        auto = False
+        if ev == EVENT_COMPLETED:
+            status = STATUS_DONE
+        elif ev == EVENT_DISMISSED:
+            status = STATUS_SKIPPED
+        elif step.skip_when and _all(step.skip_when):
+            status, auto = STATUS_SKIPPED, True
+        else:
+            gate_ok = _all(step.gate) if step.gate else prev_satisfied
+            status = STATUS_DUE if gate_ok else STATUS_BLOCKED
+        is_next = status == STATUS_DUE and not next_assigned
+        if is_next:
+            next_assigned = True
+        out.append({
+            "id": step.id,
+            "description": step.description or step.id,
+            "action": step.action,
+            "status": status,
+            "auto_skipped": auto,
+            "is_next": is_next,
+        })
+        prev_satisfied = status in (STATUS_DONE, STATUS_SKIPPED)
+    return out
 
 
 def step_events(student_id: str, course_code: str, step_id: Optional[str] = None,

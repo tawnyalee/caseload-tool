@@ -36,6 +36,8 @@ caseload.csv.*
 # (covers history.db and any -journal/-wal/-shm sidecars + CSV exports).
 history.db*
 caseload_history.csv
+# Local per-student Success Path state (field values + step log) — PII, FERPA.
+success_path.db*
 # Mongoose contacts/segment exports (Contact ids + names + mobiles) — PII.
 # These can be named anything (e.g. "all C769 students-cfad.csv"), so the
 # narrow patterns below aren't enough on their own.
