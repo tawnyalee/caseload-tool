@@ -11208,7 +11208,7 @@ class CaseloadPanel:
 
         dlg = ctk.CTkToplevel(self.frame)
         dlg.title("Departed students")
-        dlg.geometry("580x460")
+        dlg.geometry("600x500")
         try:
             dlg.transient(self.frame.winfo_toplevel())
         except Exception:
@@ -11280,22 +11280,26 @@ class CaseloadPanel:
                     scroll, text=detail, anchor="w", justify="left",
                 ).grid(row=i, column=1, padx=4, pady=2, sticky="w")
 
+        # Action buttons on their OWN row (so they can't get clipped by the
+        # dialog width / widget scaling), with Close on a separate row.
         btns = ctk.CTkFrame(dlg, fg_color="transparent")
-        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 10))
+        btns.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 0))
         ctk.CTkButton(
-            btns, text="⤓ Export history", width=120,
+            btns, text="⤓ Export history", width=130,
             command=self._export_history, **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
         ctk.CTkButton(
-            btns, text="⤓ Update archive now", width=170,
+            btns, text="⤓ Update archive", width=140,
             command=self._update_outcomes_archive, **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
         ctk.CTkButton(
-            btns, text="⤒ Ingest passed archive", width=180,
+            btns, text="⤒ Ingest archive", width=140,
             command=self._ingest_outcomes_archive, **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
+        close_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        close_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(6, 10))
         ctk.CTkButton(
-            btns, text="Close", width=80, command=dlg.destroy,
+            close_row, text="Close", width=90, command=dlg.destroy,
         ).pack(side="right")
 
     def _export_history(self) -> None:
