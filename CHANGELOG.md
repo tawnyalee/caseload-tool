@@ -35,6 +35,22 @@ fixes.
   *record-only* action type (shown with a ✎) records a support without sending
   anything.
 
+### Security
+- **Encrypt local student data at rest (app password).** The local files that
+  hold student PII — the caseload cache, history, success-path data, and note
+  log — can be encrypted on disk and unlocked with an app password, so they're
+  unreadable if the laptop is lost or the files are copied off it. The data is
+  decrypted into place while the app runs and re-encrypted (plaintext shredded)
+  on exit. Stdlib-only crypto (scrypt + HMAC-SHA256), no heavyweight dependency.
+  First launch offers to turn it on; **Settings → "Require app password"** sets
+  how often it's needed (every launch / after each restart / weekly — remembered
+  within a boot session via Windows DPAPI), with **Change password** there too.
+  Data-loss-averse by design: plaintext is shredded only after its encrypted
+  copy is verified, and a crash leaves the latest data recoverable.
+- **Capture scrubbing + retention** — captured network logs scrub session tokens
+  before they touch disk, and old capture/probe/screenshot debug artifacts are
+  auto-deleted after 7 days.
+
 ### Reliability + safety
 - **Loud STOP button** — a red, always-visible button aborts a running batch or
   fire at the next safe point, including a text mid-compose (before it's sent).
@@ -56,8 +72,6 @@ fixes.
 ### Under the hood
 - Network-capture now records response bodies; an `auraprobe:` probe and the
   note-save Aura replay (`apinote:`) underpin the new API note filing above.
-- Captured network logs now scrub session tokens before they touch disk, and
-  old capture/probe/screenshot debug artifacts are auto-deleted after 7 days.
 
 ## 0.12.0 — 2026-06-23
 
