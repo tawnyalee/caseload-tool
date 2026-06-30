@@ -52,7 +52,9 @@ from src.config import (
     USER_CONFIG_DIR, Settings, load_settings, save_settings,
     set_templates_dir, templates_dir,
     DEFAULT_EMAIL_LINK_COLOR, email_link_color, set_email_link_color,
+    VAULT_PATH, ENCRYPTED_DATA_FILES,
 )
+from src import crypto_store
 from src.version import __version__
 from src.note_form import NoteData
 from src.scenarios import (
@@ -14489,6 +14491,141 @@ class DataPanel:
 
 
 # ============================================================
+# Data-at-rest unlock dialogs (pre-root: their own temporary Tk)
+# ============================================================
+
+def _center_tk(win, w: int, h: int) -> None:
+    try:
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+    except Exception:
+        pass
+
+
+def _vault_unlock_prompt(*, wrong: bool = False) -> Optional[str]:
+    """Modal password prompt shown BEFORE the main window exists (its own
+    throwaway Tk root). Returns the typed password, or None if the user
+    cancelled (which the caller treats as 'quit — data stays encrypted')."""
+    import tkinter as tk
+    root = tk.Tk()
+    root.title("Unlock — Salesforce Automation")
+    root.resizable(False, False)
+    result = {"pw": None}
+    frm = tk.Frame(root, padx=24, pady=20)
+    frm.pack(fill="both", expand=True)
+    tk.Label(frm, text="Enter your app password to unlock your data",
+             font=("Segoe UI", 11, "bold")).pack(anchor="w")
+    if wrong:
+        tk.Label(frm, text="Incorrect password — try again.",
+                 fg="#c0392b").pack(anchor="w", pady=(4, 0))
+    ent = tk.Entry(frm, show="•", width=34, font=("Segoe UI", 11))
+    ent.pack(fill="x", pady=(12, 4))
+    ent.focus_set()
+
+    def ok(*_a):
+        result["pw"] = ent.get()
+        root.destroy()
+
+    def cancel(*_a):
+        result["pw"] = None
+        root.destroy()
+
+    btns = tk.Frame(frm)
+    btns.pack(fill="x", pady=(14, 0))
+    tk.Button(btns, text="Unlock", width=12, command=ok,
+              default="active").pack(side="right")
+    tk.Button(btns, text="Quit", width=8, command=cancel).pack(
+        side="right", padx=(0, 8))
+    root.bind("<Return>", ok)
+    root.bind("<Escape>", cancel)
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    _center_tk(root, 380, 190)
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    root.mainloop()
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    return result["pw"]
+
+
+def _vault_setup_prompt() -> Optional[str]:
+    """First-run offer to enable encryption. Returns the chosen password, or
+    None if the user declined ('Not now'). Requires the two entries to match
+    and be non-empty before 'Enable' is allowed."""
+    import tkinter as tk
+    root = tk.Tk()
+    root.title("Protect your local data — Salesforce Automation")
+    root.resizable(False, False)
+    result = {"pw": None}
+    frm = tk.Frame(root, padx=24, pady=20)
+    frm.pack(fill="both", expand=True)
+    tk.Label(frm, text="Encrypt your local student data",
+             font=("Segoe UI", 12, "bold")).pack(anchor="w")
+    tk.Label(
+        frm, justify="left", wraplength=420,
+        text=("Set an app password to encrypt the files this tool keeps on "
+              "disk (caseload cache, history, success-path data, note log). "
+              "They'll be unreadable if this computer is lost or the files are "
+              "copied off it. You'll enter this password to unlock the app.\n\n"
+              "There is no recovery if you forget it — store it safely."),
+    ).pack(anchor="w", pady=(6, 12))
+    row1 = tk.Frame(frm); row1.pack(fill="x", pady=2)
+    tk.Label(row1, text="Password:", width=16, anchor="w").pack(side="left")
+    e1 = tk.Entry(row1, show="•", width=28, font=("Segoe UI", 11))
+    e1.pack(side="left", fill="x", expand=True)
+    e1.focus_set()
+    row2 = tk.Frame(frm); row2.pack(fill="x", pady=2)
+    tk.Label(row2, text="Confirm:", width=16, anchor="w").pack(side="left")
+    e2 = tk.Entry(row2, show="•", width=28, font=("Segoe UI", 11))
+    e2.pack(side="left", fill="x", expand=True)
+    msg = tk.Label(frm, text="", fg="#c0392b")
+    msg.pack(anchor="w", pady=(6, 0))
+
+    def enable(*_a):
+        p1, p2 = e1.get(), e2.get()
+        if not p1:
+            msg.config(text="Enter a password (or click Not now).")
+            return
+        if p1 != p2:
+            msg.config(text="Passwords don't match.")
+            return
+        if len(p1) < 4:
+            msg.config(text="Use at least 4 characters.")
+            return
+        result["pw"] = p1
+        root.destroy()
+
+    def decline(*_a):
+        result["pw"] = None
+        root.destroy()
+
+    btns = tk.Frame(frm); btns.pack(fill="x", pady=(14, 0))
+    tk.Button(btns, text="Enable encryption", command=enable,
+              default="active").pack(side="right")
+    tk.Button(btns, text="Not now", width=10, command=decline).pack(
+        side="right", padx=(0, 8))
+    root.bind("<Return>", enable)
+    root.bind("<Escape>", decline)
+    root.protocol("WM_DELETE_WINDOW", decline)
+    _center_tk(root, 480, 320)
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    root.mainloop()
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    return result["pw"]
+
+
+# ============================================================
 # Main app
 # ============================================================
 
@@ -14496,6 +14633,15 @@ class App:
     def __init__(self) -> None:
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
+
+        # Load prefs first (the unlock mode lives in settings), then unlock +
+        # decrypt the at-rest data files BEFORE anything reads them — note
+        # load_success_paths() below opens success_path.db. The unlock prompt
+        # runs on its own temporary Tk root (the main window isn't built yet).
+        self.settings: Settings = load_settings()
+        self._vault = None          # crypto_store.DataVault once set up/unlocked
+        self._managed = None        # crypto_store.ManagedFiles when active
+        self._run_vault_unlock()
 
         self.scenarios = load_scenarios()
         # Raw per-action YAML dicts (name -> dict), so _save_yaml can serialize
@@ -14508,11 +14654,9 @@ class App:
         # Per-course success paths (ordered step checklists) — see
         # SuccessPath. Keyed by course code; empty until the user defines one.
         self.success_paths: dict[str, SuccessPath] = load_success_paths()
-        # User preferences (advanced/dev mode toggle + future settings).
-        # Loaded once at startup; saved via the Settings dialog when
-        # the user toggles. Default state hides advanced features.
-        self.settings: Settings = load_settings()
-        self._sync_name_cap_mode()  # share the name-casing pref with builders
+        # Preferences were loaded above (before the data-unlock step). Share
+        # the name-casing pref with the template builders.
+        self._sync_name_cap_mode()
         # Overall UI scale (CustomTkinter widget scaling) — apply before
         # widgets are built.
         try:
@@ -22922,6 +23066,74 @@ class App:
     def _hide(self) -> None:
         self.root.iconify()
 
+    def _run_vault_unlock(self) -> None:
+        """Set up / unlock the at-rest data vault and decrypt the managed files
+        for this session. Runs at the very start of __init__, before any data
+        file is read. If an already-encrypted vault can't be unlocked (user
+        quits at the prompt), the app can't run on encrypted data → hard exit."""
+        try:
+            vault = crypto_store.DataVault(VAULT_PATH)
+            managed = crypto_store.ManagedFiles(vault, ENCRYPTED_DATA_FILES)
+        except Exception as e:
+            print(f"Encryption unavailable ({e}); continuing without it.",
+                  file=sys.stderr)
+            return
+
+        mode = (getattr(self.settings, "vault_unlock_mode", "per_restart")
+                or "per_restart")
+        allow_remember = mode in ("per_restart", "weekly")
+
+        if vault.is_setup:
+            if not vault.try_auto_unlock(allow_remember=allow_remember):
+                wrong = False
+                while True:
+                    pw = _vault_unlock_prompt(wrong=wrong)
+                    if pw is None:
+                        os._exit(0)   # Quit — data stays encrypted
+                    if vault.unlock(pw):
+                        break
+                    wrong = True
+                if allow_remember:
+                    vault.remember_on_this_machine()
+            errs = managed.decrypt_all()
+            self._vault, self._managed = vault, managed
+            if errs:
+                print("Decrypt issues: " + "; ".join(errs), file=sys.stderr)
+            return
+
+        # Not set up. Offer encryption ONCE; don't nag a user who declined.
+        if getattr(self.settings, "encryption_offer_seen", False):
+            return
+        pw = _vault_setup_prompt()
+        self.settings.encryption_offer_seen = True
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        if pw is None:
+            return   # declined — run unencrypted (today's behavior)
+        vault.setup(pw)
+        errs = managed.migrate_existing()
+        if allow_remember:
+            vault.remember_on_this_machine()
+        self._vault, self._managed = vault, managed
+        if errs:
+            print("Migration issues: " + "; ".join(errs), file=sys.stderr)
+
+    def _lock_vault_on_exit(self) -> None:
+        """Re-encrypt the managed plaintext files and shred them. Called from
+        _on_close after the worker is stopped (no in-flight writes). Best-effort
+        — never blocks or breaks shutdown."""
+        try:
+            if (self._managed is not None and self._vault is not None
+                    and self._vault.is_unlocked):
+                errs = self._managed.lock_all()
+                if errs:
+                    print("Lock-on-exit issues: " + "; ".join(errs),
+                          file=sys.stderr)
+        except Exception as e:
+            print(f"Lock-on-exit failed: {e}", file=sys.stderr)
+
     def _on_close(self) -> None:
         self._save_window_state()
         # Persist caseload column layout (widths the user drag-resized).
@@ -22957,6 +23169,9 @@ class App:
                 t.join(timeout=4)
         except Exception:
             pass
+        # Worker is stopped — no more writes to the data files. Re-encrypt them
+        # and shred the plaintext (verify-before-shred, so nothing is lost).
+        self._lock_vault_on_exit()
         # Cancel pending Tk `after` callbacks before destroying the root.
         # customtkinter schedules recurring jobs (DPI-scaling checks, spinner
         # ticks, button click animations); if any fire after destroy, Tcl spams

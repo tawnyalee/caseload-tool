@@ -215,6 +215,16 @@ def find_latest_outcomes_archive() -> Optional[Path]:
 # scenarios.yaml; this DB holds only per-student data.
 SUCCESS_PATH_DB = USER_CONFIG_DIR / "success_path.db"
 
+# Local data-at-rest encryption (see src/crypto_store.py). The vault metadata
+# (salt, password verifier, optional DPAPI-sealed key) lives here; the data
+# files below are decrypted to their plain paths on unlock and re-encrypted
+# (plaintext shredded) on exit. ENCRYPTED_DATA_FILES is every local file that
+# holds student PII — note that the contact-id map lives INSIDE history.db.
+VAULT_PATH = USER_CONFIG_DIR / "vault.json"
+ENCRYPTED_DATA_FILES = [
+    HISTORY_DB, SUCCESS_PATH_DB, NOTE_LOG_CSV, CASELOAD_CSV_PATH,
+]
+
 # Default to WGU's standard Caseload page. Override via .env in the user
 # config dir if your campus / org uses a different Salesforce instance.
 DEFAULT_CASELOAD_URL = "https://srm.lightning.force.com/lightning/n/Caseload_App_Page"
@@ -391,6 +401,17 @@ class Settings:
     # eligible (no Contact id, EA-attached notes, a note left unsubmitted) or
     # if the API call fails. Toggle off to file every note via the form.
     note_save_via_api: bool = True
+    # Local data-at-rest encryption: how often the app password is required.
+    #   "every_launch" — prompt on every start (nothing remembered)
+    #   "per_restart"  — remember within a boot session; re-prompt after a
+    #                    reboot (or the 7-day backstop). DPAPI-sealed key.
+    #   "weekly"       — remember for 7 days regardless of reboots
+    # Only meaningful once a vault has been set up. See src/crypto_store.py.
+    vault_unlock_mode: str = "per_restart"
+    # Set once the user has seen the "protect your data" setup offer, so a user
+    # who declined encryption isn't nagged on every launch (they can still turn
+    # it on from Settings).
+    encryption_offer_seen: bool = False
     # Caseload-panel "Fire action" menu: JSON list of scenario names, in the
     # order they appear in the right-click / Right-arrow action menu. Empty =
     # fall back to the per-scenario "Show as a caseload-panel action" flags
