@@ -23,6 +23,11 @@ fixes.
   last academic activity, course/student status, …) are layered onto the
   caseload for **history/data collection** and made available as **viewer
   fields** (opt-in via the detail panel's ⚙).
+- **Instant note loading.** The student note viewer now shows *your own* notes
+  for the course **instantly** (read from the same Aura feed, no navigating to
+  the record), with a **⤓ All notes** button to pull everyone's via the full
+  Notes History when you need it — so the common case is fast and nothing is
+  hidden.
 - **Success Paths.** Per-course checklists that show, per student, each step's
   status (Done / Due / Blocked / Skipped) and the recommended next action,
   right in the student detail. Steps are marked done automatically when their
