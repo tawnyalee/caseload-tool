@@ -10553,6 +10553,14 @@ class CaseloadPanel:
             **SECONDARY_BTN_KWARGS,
         )
         self.calibration_btn.pack(side="left", padx=(0, 4))
+        # Refresh the passed-outcomes archive (drives Momentum): switches the
+        # caseload list view to "Archive (Last 30 Days)", exports, switches back.
+        self.update_archive_btn = ctk.CTkButton(
+            self.bar_actions, text="⟳ Archive", width=95,
+            command=lambda: self._update_outcomes_archive(manual=True),
+            **SECONDARY_BTN_KWARGS,
+        )
+        self.update_archive_btn.pack(side="left", padx=(0, 4))
         self.export_history_btn = ctk.CTkButton(
             self.bar_actions, text="⤓ Export history", width=110,
             command=self._export_history, **SECONDARY_BTN_KWARGS,
@@ -10714,6 +10722,7 @@ class CaseloadPanel:
             "popout": ("⧉" if popped else "⧉") if n
                       else ("⧉ Dock" if popped else "⧉ Pop out"),
             "departures": "⚑" if n else "⚑ Departures",
+            "update_archive": "⟳" if n else "⟳ Archive",
             "export": "⤓" if n else "⤓ Export history",
         }
 
@@ -10742,6 +10751,8 @@ class CaseloadPanel:
                 text=t["popout"], width=36 if self._narrow else 80)
             self.departures_btn.configure(
                 text=t["departures"], width=36 if self._narrow else 100)
+            self.update_archive_btn.configure(
+                text=t["update_archive"], width=36 if self._narrow else 95)
             self.export_history_btn.configure(
                 text=t["export"], width=36 if self._narrow else 110)
             if self._narrow:
