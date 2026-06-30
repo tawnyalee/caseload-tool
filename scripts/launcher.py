@@ -1871,6 +1871,15 @@ class BrowserWorker:
                 by_sid[sid] = statuses
         return by_sid
 
+    def grid_rows_by_key(self) -> dict:
+        """The accumulated caseload-grid rows keyed by (StudentID, CourseCode).
+        {} if no grid captured yet. Shallow copy — the App reads it on reload to
+        layer the grid's rich fields onto the CSV rows."""
+        grid = self._grid_data
+        if not grid:
+            return {}
+        return dict(grid.get("by_key") or {})
+
     def grid_student_contact_map(self) -> dict:
         """{StudentID: contactID} harvested from the accumulated caseload grid
         (getCaseLoadMainGridData) — a COMPLETE, authoritative SF-sourced map
@@ -10326,6 +10335,14 @@ class CaseloadPanel:
         ("last_action", "Last action",   None,                 "last_action"),
         ("followup",    "Followup note", "CourseFollowupNote", "longtext"),
         ("tasks",       "Task badges",   None,                 "tasks"),
+        # Rich fields from the caseload grid (getCaseLoadMainGridData), layered
+        # onto the rows by _apply_grid_fields_to_rows — not in the CSV export.
+        # Opt-in via Settings → quick-view fields.
+        ("academic_standing",  "Academic standing", "AcademicStanding",         "text"),
+        ("student_status",     "Student status",    "StudentStatus",            "text"),
+        ("course_status",      "Course status",     "CourseStatus",             "text"),
+        ("planned_grad",       "Planned graduation", "PlannedGraduationDate",   "text"),
+        ("last_acad_activity", "Last academic activity", "LastAcademicActivityDate", "text"),
     ]
     QUICK_VIEW_DEFAULT = [
         "mentor", "term_end", "timezone", "email", "phone",
@@ -19211,6 +19228,48 @@ class App:
                 return []  # too many distinct values → keep it free-text
         return sorted(vals)
 
+    # Rich per-student fields from the caseload grid (getCaseLoadMainGridData)
+    # that the ~20-col CSV export doesn't carry. Layered onto the rows as NEW
+    # columns for data collection (history extra_json) + the viewer. Additive
+    # only — never overrides a CSV column.
+    _GRID_ENRICH_FIELDS = (
+        "AcademicStanding", "StudentStatus", "CourseStatus",
+        "PlannedGraduationDate", "StudentGraduationGoal",
+        "LastAcademicActivityDate", "NumberOfDaysSinceLastTaskDate",
+        "EnrolledCU", "TermCompletedCU", "TermDaysLeft",
+        "City", "State", "CampusCode", "ProgramName", "Programcode",
+        "MobilePhone", "TextingPreference", "StudentEmail",
+    )
+
+    def _apply_grid_fields_to_rows(self) -> None:
+        """Layer the caseload grid's rich per-student fields onto the cached CSV
+        rows as NEW columns (matched by StudentID + CourseCode). Purely additive
+        — only fills a column the row lacks or left blank, so the CSV stays the
+        base and nothing it carries is clobbered. history.record_snapshot then
+        captures these via extra_json (richer longitudinal data collection) and
+        the viewer can surface them. No-op until the grid is captured."""
+        rows = self._caseload_rows or []
+        try:
+            grid = self.worker.grid_rows_by_key()
+        except Exception:
+            grid = {}
+        if not rows or not grid:
+            return
+        for r in rows:
+            sid = str(r.get("StudentID") or r.get("Student ID") or "").strip()
+            if not sid:
+                continue
+            course = str(r.get("CourseCode") or r.get("Course Code") or "").strip()
+            g = grid.get((sid, course)) or grid.get((sid, ""))
+            if not g:
+                continue
+            for f in self._GRID_ENRICH_FIELDS:
+                val = g.get(f)
+                if val in (None, ""):
+                    continue
+                if not str(r.get(f) or "").strip():   # additive: don't clobber
+                    r[f] = val
+
     def _apply_task_status_to_rows(self) -> None:
         """Inject HIDDEN per-task facet columns into each cached caseload row
         so a single visible 'Task N' column can be filtered by date, by
@@ -22199,6 +22258,7 @@ class App:
         # rows from the CSV, dropping all the synthetic columns).
         self._apply_ea_to_rows()
         self._apply_task_status_to_rows()
+        self._apply_grid_fields_to_rows()
         self._apply_derived_columns_to_rows()
         self._refresh_caseload_panel()
         self._check_required_caseload_columns(rows, silent=silent)
