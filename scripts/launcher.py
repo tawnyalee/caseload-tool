@@ -14503,6 +14503,35 @@ def _center_tk(win, w: int, h: int) -> None:
         pass
 
 
+_GITHUB_URL = "https://github.com/ashejim/WGU-Caseload-Note-Tool"
+_AUTHOR_NAME = "Jim"
+_AUTHOR_EMAIL = "ashejim@gmail.com"
+
+
+def _vault_dialog_footer(frm) -> None:
+    """Shared credits/links footer for the pre-root unlock + setup dialogs:
+    author + email, a clickable GitHub link for the latest updates, and an
+    invitation for bug reports / suggestions."""
+    import tkinter as tk
+    import webbrowser
+    tk.Frame(frm, height=1, bg="#d0d0d0").pack(fill="x", pady=(16, 8))
+    tk.Label(
+        frm, fg="#666", font=("Segoe UI", 8), anchor="w",
+        text=f"WGU Caseload Note Tool — by {_AUTHOR_NAME} ({_AUTHOR_EMAIL})",
+    ).pack(anchor="w")
+    link = tk.Label(
+        frm, text="Latest updates & releases on GitHub  →",
+        fg="#1a73e8", cursor="hand2", font=("Segoe UI", 8, "underline"),
+    )
+    link.pack(anchor="w")
+    link.bind("<Button-1>", lambda _e: webbrowser.open(_GITHUB_URL))
+    tk.Label(
+        frm, fg="#666", font=("Segoe UI", 8), justify="left", wraplength=420,
+        anchor="w", text=("Bug reports & suggestions welcome — email me or "
+                          "open an issue on GitHub."),
+    ).pack(anchor="w", pady=(2, 0))
+
+
 def _vault_unlock_prompt(*, wrong: bool = False) -> Optional[str]:
     """Modal password prompt shown BEFORE the main window exists (its own
     throwaway Tk root). Returns the typed password, or None if the user
@@ -14537,10 +14566,11 @@ def _vault_unlock_prompt(*, wrong: bool = False) -> Optional[str]:
               default="active").pack(side="right")
     tk.Button(btns, text="Quit", width=8, command=cancel).pack(
         side="right", padx=(0, 8))
+    _vault_dialog_footer(frm)
     root.bind("<Return>", ok)
     root.bind("<Escape>", cancel)
     root.protocol("WM_DELETE_WINDOW", cancel)
-    _center_tk(root, 380, 190)
+    _center_tk(root, 400, 300)
     try:
         root.attributes("-topmost", True)
     except Exception:
@@ -14609,10 +14639,11 @@ def _vault_setup_prompt() -> Optional[str]:
               default="active").pack(side="right")
     tk.Button(btns, text="Not now", width=10, command=decline).pack(
         side="right", padx=(0, 8))
+    _vault_dialog_footer(frm)
     root.bind("<Return>", enable)
     root.bind("<Escape>", decline)
     root.protocol("WM_DELETE_WINDOW", decline)
-    _center_tk(root, 480, 320)
+    _center_tk(root, 480, 430)
     try:
         root.attributes("-topmost", True)
     except Exception:
