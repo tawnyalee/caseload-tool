@@ -174,6 +174,10 @@ HISTORY_DB = USER_CONFIG_DIR / "history.db"
 # The user drops the file here (or it's auto-detected in Downloads); the glob
 # tolerates the browser's "(1)" dedupe suffixes.
 OUTCOMES_ARCHIVE_GLOB = "results_archive*.csv"
+# Where the AUTO-downloaded archive is saved (the app switches the caseload list
+# view to "Archive (Last 30 Days)", exports, and lands the CSV here). Ingested
+# then deleted, so no extra plaintext PII lingers.
+OUTCOMES_ARCHIVE_DOWNLOAD = USER_CONFIG_DIR / "results_archive.csv"
 
 
 def outcomes_archive_search_dirs() -> list[Path]:

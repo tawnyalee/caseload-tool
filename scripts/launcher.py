@@ -279,6 +279,11 @@ class BrowserWorker:
         # so we ACCUMULATE: {"by_key": {(StudentID, CourseCode): row}, "ts":
         # epoch} or None.
         self._grid_data: Optional[dict] = None
+        # Set while we temporarily switch the caseload list view to "Archive
+        # (Last 30 Days)" to export it — suppresses grid-data capture so the
+        # archive's (passed-student) rows don't pollute the My-Students grid
+        # (pass/fail + contact-id map). See _download_outcomes_archive.
+        self._suppress_grid_capture = False
         # Freshest harvested Aura credentials (token + context) from live /aura
         # POSTs — reused to REPLAY the note-save action via fetch (no flaky
         # form). {"token","context","ts"} or None. See _harvest_aura_creds.
@@ -578,6 +583,16 @@ class BrowserWorker:
         resulting CSV to `save_path`. `on_done(success, message)` is
         called from the worker thread when the export completes."""
         self.q.put(("DOWNLOAD_CASELOAD_CSV", save_path, on_done))
+
+    def submit_download_outcomes_archive(
+        self,
+        save_path: Path,
+        on_done: Callable[[bool, str], None],
+    ) -> None:
+        """Switch the caseload list view to 'Archive (Last 30 Days)', export it
+        to `save_path`, and switch back to the prior view. `on_done(ok, msg)`
+        fires from the worker thread."""
+        self.q.put(("DOWNLOAD_OUTCOMES_ARCHIVE", save_path, on_done))
 
     def shutdown(self) -> None:
         self.q.put(self.SHUTDOWN)
@@ -935,6 +950,15 @@ class BrowserWorker:
             success, message = False, ""
             try:
                 success, message = self._download_caseload_csv(
+                    ctx, save_path,
+                )
+            finally:
+                on_done(success, message)
+        elif cmd[0] == "DOWNLOAD_OUTCOMES_ARCHIVE":
+            _, save_path, on_done = cmd
+            success, message = False, ""
+            try:
+                success, message = self._download_outcomes_archive(
                     ctx, save_path,
                 )
             finally:
@@ -1871,6 +1895,8 @@ class BrowserWorker:
         running {(StudentID, CourseCode): row} map (newest wins) rather than
         overwriting — otherwise we'd only ever hold the last page. Best-effort:
         a read/parse failure just leaves the prior accumulation in place."""
+        if self._suppress_grid_capture:
+            return   # archive-view export in progress — don't accumulate its rows
         import json
         try:
             body = response.text()
@@ -3019,6 +3045,102 @@ class BrowserWorker:
         except Exception:
             pass
         return True, f"saved to {Path(save_path).name}"
+
+    def _download_outcomes_archive(
+        self, ctx, save_path: Path,
+    ) -> tuple[bool, str]:
+        """Switch the caseload list-view picker to 'Archive (Last 30 Days)',
+        click the same Download button, save the CSV to `save_path`, then
+        RESTORE the prior list view. Grid-data capture is suppressed for the
+        whole window so the archive's passed-student rows can't pollute the
+        My-Students grid (pass/fail + contact-id map). Returns (ok, msg).
+
+        The list-view picker is a native <select class="uiInputSelect"> whose
+        options include 'My Students' and 'Archive (Last 30 Days)' (confirmed
+        from the saved Caseload.html snapshot), so select_option drives it."""
+        target, table = self._open_caseload_table(ctx)
+        if table is None:
+            return False, "caseload table didn't load"
+        # Find the list-view <select>: the uiInputSelect that has an option
+        # matching /archive.*30/i. (Other selects on the page won't.)
+        sel = None
+        try:
+            cands = target.locator("select.uiInputSelect")
+            for i in range(min(cands.count(), 8)):
+                c = cands.nth(i)
+                has = c.evaluate(
+                    "(s) => [...s.options].some(o => /archive/i.test(o.text)"
+                    " && /30/.test(o.text))")
+                if has:
+                    sel = c
+                    break
+        except Exception as e:
+            return False, f"list-view picker not found: {e}"
+        if sel is None:
+            return False, "couldn't find the 'Archive (Last 30 Days)' view picker"
+
+        # Remember the currently-selected view so we restore exactly what the
+        # user had, and resolve the archive option's value robustly by text.
+        try:
+            prev_value = sel.input_value()
+        except Exception:
+            prev_value = ""
+        try:
+            archive_value = sel.evaluate(
+                "(s) => { const o = [...s.options].find(o =>"
+                " /archive/i.test(o.text) && /30/.test(o.text));"
+                " return o ? o.value : ''; }")
+        except Exception:
+            archive_value = ""
+        if not archive_value:
+            return False, "Archive option missing from the view picker"
+
+        self._suppress_grid_capture = True
+        try:
+            try:
+                sel.select_option(value=archive_value)
+            except Exception as e:
+                return False, f"couldn't switch to the Archive view: {e}"
+            # Let the Archive list load before exporting (the export honors the
+            # currently-shown view). Give the re-fetch a beat, then settle.
+            try:
+                target.wait_for_timeout(700)
+                _wait_grid_settled(target, 4000)
+            except Exception:
+                pass
+            # Same Download button as the My-Students export.
+            try:
+                btn = target.locator('button[title="Download"]').first
+                btn.wait_for(state="visible", timeout=10_000)
+            except Exception as e:
+                return False, f"Download button not found in Archive view: {e}"
+            try:
+                with target.expect_download(timeout=30_000) as dl_info:
+                    btn.click()
+                    self.on_status("  [archive] clicked Download (Archive view)")
+                download = dl_info.value
+            except Exception as e:
+                return False, f"archive download did not start: {e}"
+            try:
+                sp = Path(save_path)
+                sp.parent.mkdir(parents=True, exist_ok=True)
+                tmp = sp.with_name(sp.name + ".new")
+                download.save_as(str(tmp))
+                tmp.replace(sp)
+            except Exception as e:
+                return False, f"archive save failed: {e}"
+        finally:
+            # Always restore the prior list view, even on an error above, so the
+            # app is never left sitting on the Archive view.
+            try:
+                if prev_value:
+                    sel.select_option(value=prev_value)
+                    target.wait_for_timeout(500)
+                    _wait_grid_settled(target, 4000)
+            except Exception as e:
+                self.on_status(f"  [archive] couldn't restore the view: {e}")
+            self._suppress_grid_capture = False
+        return True, f"archive saved to {Path(save_path).name}"
 
     def _scroll_datatable_to_bottom(self, table) -> None:
         """Force the caseload datatable's scroll CONTAINER to its bottom to
@@ -11164,6 +11286,10 @@ class CaseloadPanel:
             btns, text="⤓ Export history", width=120,
             command=self._export_history, **SECONDARY_BTN_KWARGS,
         ).pack(side="left")
+        ctk.CTkButton(
+            btns, text="⤓ Update archive now", width=170,
+            command=self._update_outcomes_archive, **SECONDARY_BTN_KWARGS,
+        ).pack(side="left", padx=(8, 0))
         ctk.CTkButton(
             btns, text="⤒ Ingest passed archive", width=180,
             command=self._ingest_outcomes_archive, **SECONDARY_BTN_KWARGS,
@@ -23110,7 +23236,66 @@ class App:
             self._append_log(
                 f"Reminder: the outcomes archive is {stale} days old — "
                 f"download a fresh “Archive (last 30 days)” view so no "
-                f"departures are missed (rolling 30-day window).")
+                f"departures are missed (rolling 30-day window). "
+                f"Use “⤓ Update archive now” in the Departures view to fetch it "
+                f"automatically.")
+
+    def _update_outcomes_archive(self, manual: bool = True) -> None:
+        """Auto-fetch the 'Archive (Last 30 Days)' view: the worker switches the
+        caseload list view, exports it, and switches back; we ingest the CSV
+        into history.db's outcomes, refresh the Data panel, and delete the
+        plaintext CSV (it's now in the encrypted DB). Non-fatal."""
+        if getattr(self, "_is_busy", False):
+            if manual:
+                self._append_log("Busy — try again when the current task finishes.")
+            return
+        if not self.worker.ready_event.is_set():
+            if manual:
+                self._append_log("Browser not ready yet.")
+            return
+        from src import config as _cfg
+        dest = _cfg.OUTCOMES_ARCHIVE_DOWNLOAD
+        self._append_log(
+            "Updating passed-outcomes archive (switching to the Archive view "
+            "to export, then back)…")
+
+        def on_done(ok: bool, msg: str) -> None:
+            def apply() -> None:
+                if not ok:
+                    self._append_log(f"Archive update failed: {msg}", error=True)
+                    return
+                try:
+                    res = history.ingest_outcomes_csv(str(dest))
+                    if res.get("status") == "ok":
+                        self._append_log(
+                            f"Archive updated: {res['new']} new, "
+                            f"{res['updated']} updated ({res.get('passed', 0)} "
+                            f"passed, {res.get('not_passed', 0)} not passed), "
+                            f"{res['total_outcomes']} total.")
+                        dp = getattr(self, "data_panel", None)
+                        if dp is not None:
+                            try:
+                                dp.refresh()
+                            except Exception:
+                                pass
+                    else:
+                        self._append_log(
+                            f"Archive ingest: {res.get('error') or res.get('status')}",
+                            error=True)
+                except Exception as e:
+                    self._append_log(f"Archive ingest error: {e}", error=True)
+                finally:
+                    # Drop the plaintext PII CSV — it's captured in history.db now.
+                    try:
+                        Path(dest).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                apply()
+
+        self.worker.submit_download_outcomes_archive(dest, on_done)
 
     def _read_clipboard_content(self) -> str:
         """Pull text from clipboard. If image data is also present,
