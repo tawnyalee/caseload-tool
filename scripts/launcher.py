@@ -264,6 +264,10 @@ class BrowserWorker:
         # so we ACCUMULATE: {"by_key": {(StudentID, CourseCode): row}, "ts":
         # epoch} or None.
         self._grid_data: Optional[dict] = None
+        # Freshest harvested Aura credentials (token + context) from live /aura
+        # POSTs — reused to REPLAY the note-save action via fetch (no flaky
+        # form). {"token","context","ts"} or None. See _harvest_aura_creds.
+        self._aura_creds: Optional[dict] = None
         # One-shot diagnostic latches for the batch-email scrape path
         # in `_click_match_by_filter`. The first batch of the session
         # logs WHAT the row mailto carried (or didn't), and WHAT the
@@ -334,6 +338,12 @@ class BrowserWorker:
         """PROBE: test whether the Aura token/context needed to replay the note-
         save action are reachable from page JS. on_done({path, reachable, …})."""
         self.q.put(("PROBE_AURA", on_done))
+
+    def submit_api_note_test(self, contact_id: str, course: str,
+                             on_done: Callable[[dict], None]) -> None:
+        """TEST: file a harmless Admin Note via the saveNoteCmpValues API replay
+        (no UI form) for one contact. on_done({ok}|{error})."""
+        self.q.put(("API_NOTE_TEST", contact_id, course, on_done))
 
     def submit_close_record_tabs(
         self, on_done: Callable[[dict], None],
@@ -668,6 +678,17 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_aura(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "API_NOTE_TEST":
+            _, contact_id, course, on_done = cmd
+            res = {}
+            try:
+                res = self._save_note_via_api(
+                    ctx, contact_id=contact_id, note_type="Admin Note",
+                    course_code=course, subject="Admin Note",
+                    body_html="<p>API replay test — safe to delete.</p>",
+                    activities=[])
             finally:
                 on_done(res)
         elif cmd[0] == "CLOSE_RECORD_TABS":
@@ -1722,16 +1743,21 @@ class BrowserWorker:
         return list(self._capture_log)
 
     def _on_request(self, request) -> None:
-        """Context-level request listener. Only records when capture
-        mode is active AND the request looks like a Salesforce data
-        write (POST / PATCH / PUT against a Salesforce host). Filters
-        out auth + asset traffic so the user doesn't drown in noise."""
-        if not self._capture_active:
-            return
+        """Context-level request listener. ALWAYS harvests the live aura.token +
+        aura.context from Aura POSTs (so we can replay actions like the note
+        save); ADDITIONALLY, in capture mode, records Salesforce write requests
+        for probing."""
         try:
             url = request.url or ""
             method = request.method or ""
         except Exception:
+            return
+        # Always-on: harvest the freshest Aura credentials (token + context).
+        # They ride in every /aura POST body and are reused across requests, so
+        # a recent one is valid for replaying saveNoteCmpValues via fetch().
+        if method.upper() == "POST" and "/aura" in url:
+            self._harvest_aura_creds(request)
+        if not self._capture_active:
             return
         if method.upper() not in ("POST", "PATCH", "PUT"):
             return
@@ -1834,6 +1860,122 @@ class BrowserWorker:
             by_key[(sid, course)] = row
         store["ts"] = time.time()
         self._grid_data = store   # silent — the scan's result line reports it
+
+    def _harvest_aura_creds(self, request) -> None:
+        """Pull aura.token + aura.context out of an Aura POST body and keep the
+        freshest pair. They're reused across requests, so a recent one is valid
+        for replaying saveNoteCmpValues. Best-effort; silent."""
+        try:
+            pd = request.post_data or ""
+        except Exception:
+            return
+        if "aura.token" not in pd:
+            return
+        from urllib.parse import parse_qs
+        try:
+            q = parse_qs(pd)
+        except Exception:
+            return
+        tok = (q.get("aura.token") or [""])[0]
+        ctx = (q.get("aura.context") or [""])[0]
+        if tok and ctx:
+            self._aura_creds = {"token": tok, "context": ctx, "ts": time.time()}
+
+    # Academic-activity label -> the saveNoteCmpValues boolean field. Positional
+    # zip of the selector labels with the payload's note{} flags (confirmed from
+    # a real capture 2026-06-30).
+    _ACTIVITY_FIELD_BY_LABEL = {
+        "Course/Program Information Discussed": "CourseProgramInfoDiscussed__c",
+        "Course/Program Information Requested": "CourseProgramInformationRequested__c",
+        "Set Academic Goals": "SetAcademicGoals__c",
+        "Student Learning Occurred": "StudentLearningOccurred__c",
+        "Personal obstacles/non-academic content covered":
+            "NonAcademicContentCovered__c",
+    }
+
+    def _save_note_via_api(self, ctx, *, contact_id, note_type, course_code,
+                           subject, body_html, activities) -> dict:
+        """Replay the saveNoteCmpValues Aura action via fetch() from inside the
+        page — files a note WITHOUT driving the form (so no reactive Academic
+        Activity gate / cold-start flakiness; activities go in as booleans).
+        Returns {"ok": True, "note_id"?} or {"error": ...}. Caller falls back to
+        the UI form on error."""
+        import json as _json
+        creds = self._aura_creds
+        if not creds:
+            return {"error": "no Aura credentials harvested yet"}
+        if not (contact_id or "").startswith("003"):
+            return {"error": f"bad contactId {contact_id!r}"}
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        note = {
+            "Type__c": "", "Name": "",
+            "CourseProgramInfoDiscussed__c": False,
+            "CourseProgramInformationRequested__c": False,
+            "SetAcademicGoals__c": False,
+            "StudentLearningOccurred__c": False,
+            "NonAcademicContentCovered__c": False,
+        }
+        for label in (activities or []):
+            field = self._ACTIVITY_FIELD_BY_LABEL.get((label or "").strip())
+            if field:
+                note[field] = True
+        params = {
+            "contactId": contact_id, "note": note, "extNote": {},
+            "survey": {"Student__c": contact_id},
+            "saveNoteEAs": [], "saveNoteAndCloseEAs": [],
+            "saveExtNoteEAs": [], "saveExtNoteAndCloseEAs": [],
+            "noteType": note_type, "courseCode": course_code or "",
+            "subject": (subject or note_type),
+            "text": body_html or "", "removedEAJunctionIds": [],
+        }
+        message = _json.dumps({"actions": [{
+            "id": "1;a",
+            "descriptor": "apex://NotesController/ACTION$saveNoteCmpValues",
+            "callingDescriptor": "markup://c:NoteCmp",
+            "params": params}]})
+        page_uri = f"/lightning/r/Contact/{contact_id}/view"
+        js = """async ([message, ctxs, token, pageUri]) => {
+            const body = new URLSearchParams();
+            body.set('message', message);
+            body.set('aura.context', ctxs);
+            body.set('aura.pageURI', pageUri);
+            body.set('aura.token', token);
+            const resp = await fetch('/aura?other.Notes.saveNoteCmpValues=1', {
+                method: 'POST', credentials: 'include',
+                headers: {'Content-Type':
+                          'application/x-www-form-urlencoded;charset=UTF-8'},
+                body: body.toString(),
+            });
+            const txt = await resp.text();
+            return {status: resp.status, body: txt.slice(0, 4000)};
+        }"""
+        try:
+            res = target.evaluate(
+                js, [message, creds["context"], creds["token"], page_uri])
+        except Exception as e:
+            return {"error": f"fetch failed: {e}"}
+        body = (res or {}).get("body", "") or ""
+        # Aura may prefix with while(1); — find the JSON envelope.
+        i = body.find("{")
+        try:
+            env = _json.loads(body[i:]) if i >= 0 else {}
+        except Exception:
+            env = {}
+        actions = env.get("actions") or []
+        state = actions[0].get("state") if actions else ""
+        if state == "SUCCESS":
+            return {"ok": True}
+        # surface the server's error (e.g. expired token, validation) for the log
+        err = ""
+        try:
+            err = (env.get("exceptionEvent") and env.get("exceptionMessage")) \
+                or (actions[0].get("error") if actions else "")
+        except Exception:
+            err = ""
+        return {"error": f"state={state!r} http={res.get('status')} "
+                f"{str(err)[:200] or body[:200]}"}
 
     def _grid_rows_to_task_status(self, rows) -> dict:
         """Convert getCaseLoadMainGridData rows → {sid: {tnum: info}} — the SAME
@@ -12260,6 +12402,11 @@ class CaseloadPanel:
         if q.lower().startswith("auraprobe"):
             self.app._probe_aura()
             return "break"
+        # TEST: "apinote:" files a harmless Admin Note via the saveNoteCmpValues
+        # API replay for the highlighted student (proves #3 before integration).
+        if q.lower().startswith("apinote"):
+            self.app._test_api_note()
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -16958,6 +17105,45 @@ class App:
                 show()
 
         self.worker.submit_probe_aura(on_done)
+
+    def _test_api_note(self) -> None:
+        """TEST (apinote:): file a harmless Admin Note via the saveNoteCmpValues
+        API replay for the highlighted student, to prove the replay works before
+        wiring it into the real fire flow. Verify it appears in Salesforce."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        panel = getattr(self, "caseload_panel", None)
+        row = getattr(panel, "_qv_row", None) if panel else None
+        if not row:
+            self._append_log("apinote: highlight a student in the viewer first.")
+            return
+        sid = str(row.get("StudentID") or row.get("Student ID") or "").strip()
+        course = self._norm_course_code(
+            str(row.get("CourseCode") or row.get("Course Code") or "").strip())
+        cid = (self._contact_ids.get(sid) or "").strip()
+        if not cid:
+            self._append_log(f"apinote: no Contact id known for {sid}.")
+            return
+        self._append_log(
+            f"apinote: filing a test Admin Note via the Aura API for {sid} "
+            f"({course}, contact {cid})…")
+
+        def on_done(res):
+            def show():
+                if res and res.get("ok"):
+                    self._append_log(
+                        "apinote: ✓ note filed via API — check Salesforce; it "
+                        "should appear (no form was driven).", success=True)
+                else:
+                    self._append_log(
+                        f"apinote: ✗ {(res or {}).get('error')}", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_api_note_test(cid, course, on_done)
 
     def _open_student_global(self, query: str) -> None:
         """Find a student ANYWHERE in Salesforce (global search) by Student ID
