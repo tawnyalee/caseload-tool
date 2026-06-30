@@ -28,6 +28,13 @@ CaseloadNotes-*.zip
 # Per-user session log (created at runtime in dev mode).
 note_log.csv
 
+# Local data-at-rest encryption (src/crypto_store.py). vault.json holds the
+# password salt + verifier + DPAPI-sealed key; *.enc are the encrypted student
+# data files; *.tmp is atomic-write scratch. Never commit any of these.
+vault.json
+*.enc
+*.tmp
+
 # Cached caseload export — student PII, FERPA, never commit.
 caseload.csv
 # Backups/temp written by the download anti-clobber guard (also PII).
