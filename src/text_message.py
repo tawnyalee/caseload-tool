@@ -618,6 +618,24 @@ def send_text(
         if stop():
             raise TextAborted()
 
+    # Per-phase timing so a slow batch can be diagnosed. Recipients are the
+    # usual suspect — each is a separate typed search + autocomplete round-trip
+    # to Mongoose — so they're broken out with a per-student average.
+    _t = {"start": time.monotonic()}
+
+    def _mark(k: str) -> None:
+        _t[k] = time.monotonic()
+
+    def _emit_timing(added: int) -> None:
+        g = lambda a, b: _t.get(b, _t["start"]) - _t.get(a, _t["start"])
+        recip = g("compose", "recips")
+        say("  ⏱ text[{}]: reset {:.1f} · dept {:.1f} · compose {:.1f} · "
+            "{} recip {:.1f}s ({:.2f}/ea) · msg {:.1f} · sched {:.1f} · "
+            "total {:.1f}s".format(
+                msg.course or "?", g("start", "reset"), g("reset", "dept"),
+                g("dept", "compose"), added, recip, recip / max(added, 1),
+                g("recips", "msg"), g("msg", "end"), g("start", "end")))
+
     # Clear any leftover compose modal FIRST. A previous group that failed (e.g.
     # "no recipients could be added") raises with the modal still open, and its
     # overlay intercepts pointer events — which would make the very next step
@@ -626,15 +644,18 @@ def send_text(
     # this a failed group wedges every following text until the modal is gone.
     close_compose(page)
     _ck()
+    _mark("reset")
     # Make sure Mongoose is on the right department first (Compose only offers
     # the current department's inbox). Playwright-driven, so it also wakes a
     # frozen/backgrounded renderer.
     if msg.course:
         switch_department(page, msg.course)
     _ck()
+    _mark("dept")
     # Open Compose + select the inbox, retrying once if it doesn't reach the
     # recipient step (the first compose of a session is flaky — warm-up).
     open_compose_to_recipient_step(page, msg.inbox_label, say)
+    _mark("compose")
 
     added = 0
     for raw in msg.recipients_mobile:
@@ -643,6 +664,7 @@ def send_text(
             added += 1
         else:
             say(f"  text: no Mongoose match for {raw!r} — skipped")
+    _mark("recips")
     if added == 0:
         raise RuntimeError("No recipients could be added to the text.")
     say(f"  text: {added} recipient(s) added")
@@ -653,6 +675,7 @@ def send_text(
     _ck()
     # Advance from compose to the confirm step.
     _click_button(page, "Preview")
+    _mark("msg")
 
     if msg.schedule is None:
         say("  text: composed — review and click Send Now" if not msg.commit
@@ -660,6 +683,8 @@ def send_text(
         _ck()   # last chance to bail before the text actually goes out
         if msg.commit:
             _click_button(page, "Send Now")
+        _mark("end")
+        _emit_timing(added)
         return True
 
     # Schedule path: open the schedule step, name it, fill date/time.
@@ -680,6 +705,8 @@ def send_text(
     _ck()   # last chance to bail before the text is actually scheduled
     if msg.commit:
         _click_button(page, "Schedule")
+    _mark("end")
+    _emit_timing(added)
     return True
 
 
