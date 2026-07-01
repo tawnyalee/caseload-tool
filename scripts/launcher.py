@@ -363,6 +363,11 @@ class BrowserWorker:
         save action are reachable from page JS. on_done({path, reachable, …})."""
         self.q.put(("PROBE_AURA", on_done))
 
+    def submit_probe_ea_feed(self, on_done: Callable[[dict], None]) -> None:
+        """DISCOVERY: capture the Essential Actions dashboard's Aura data feed to
+        ea_feed_probe.txt. on_done({path, captured, found, descriptor})."""
+        self.q.put(("PROBE_EA_FEED", on_done))
+
     def submit_api_note_test(self, contact_id: str, course: str,
                              on_done: Callable[[dict], None]) -> None:
         """TEST: file a harmless Admin Note via the saveNoteCmpValues API replay
@@ -721,6 +726,13 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._probe_aura(ctx)
+            finally:
+                on_done(res)
+        elif cmd[0] == "PROBE_EA_FEED":
+            _, on_done = cmd
+            res = {}
+            try:
+                res = self._probe_ea_feed(ctx)
             finally:
                 on_done(res)
         elif cmd[0] == "API_NOTE_TEST":
@@ -3796,6 +3808,91 @@ class BrowserWorker:
         return {"eas": rows,
                 "secs": round(time.perf_counter() - t0, 1),
                 "read_secs": round(t_read - t0, 1)}
+
+    def _probe_ea_feed(self, ctx) -> dict:
+        """DISCOVERY (EA JSON path 2): navigate to the Essential Actions
+        dashboard with a response listener and record every /aura action it
+        fetches, flagging the one whose returnValue looks like EA rows (Reason /
+        Intervention / Event Progress / Student…). Writes ea_feed_probe.txt so we
+        can build a JSON reader instead of scraping the table. Read-only."""
+        from src.config import ESSENTIAL_ACTIONS_URL, USER_CONFIG_DIR
+        import json as _json
+        target = self._active_page(ctx)
+        if target is None:
+            return {"error": "no active page"}
+        captured = []
+
+        def _cap(resp):
+            try:
+                if "/aura" in (resp.url or ""):
+                    captured.append((resp.url, resp.text()))
+            except Exception:
+                pass
+
+        target.on("response", _cap)
+        try:
+            target.goto(ESSENTIAL_ACTIONS_URL, wait_until="domcontentloaded")
+            target.wait_for_timeout(5500)   # let the datatable's actions fire
+            # nudge a scroll in case rows lazy-load on scroll
+            try:
+                target.mouse.wheel(0, 2000)
+                target.wait_for_timeout(1500)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            target.remove_listener("response", _cap)
+        except Exception:
+            pass
+
+        HINTS = ("Reason", "EssentialAction", "Intervention", "EventProgress",
+                 "Event Progress", "Follow-Up", "FollowUp", "DateAdded",
+                 "Date Added", "StudentID", "Student ID", "InterventionType")
+        lines = [f"=== EA feed probe @ {ESSENTIAL_ACTIONS_URL} ===",
+                 f"captured {len(captured)} /aura response(s)", ""]
+        best = None
+        for url, body in captured:
+            try:
+                i = (body or "").find("{")
+                env = _json.loads(body[i:]) if i >= 0 else {}
+            except Exception:
+                env = {}
+            for a in (env.get("actions") or []):
+                desc = a.get("descriptor", "")
+                rv = a.get("returnValue")
+                s = _json.dumps(rv)[:300000] if rv is not None else ""
+                hits = sum(1 for h in HINTS if h in s)
+                n = 0
+                if isinstance(rv, list):
+                    n = len(rv)
+                elif isinstance(rv, dict):
+                    for v in rv.values():
+                        if isinstance(v, list):
+                            n = max(n, len(v))
+                lines.append(f"action {desc}  state={a.get('state')}  "
+                             f"listlen~{n}  ea_hits={hits}  bodylen={len(s)}")
+                if hits >= 3 and (best is None or hits > best[0]):
+                    best = (hits, desc, rv)
+        if best:
+            lines += ["", f">>> LIKELY EA FEED: {best[1]}  (ea_hits={best[0]})",
+                      "", "sample returnValue (first 6000 chars):",
+                      _json.dumps(best[2], indent=1)[:6000]]
+        else:
+            lines += ["", "No obvious EA feed among the aura responses "
+                      "(descriptors listed above)."]
+        path = USER_CONFIG_DIR / "ea_feed_probe.txt"
+        try:
+            path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            if CASELOAD_URL:
+                target.goto(CASELOAD_URL, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        return {"path": str(path), "captured": len(captured),
+                "found": bool(best), "descriptor": best[1] if best else ""}
 
     def _probe_aura(self, ctx) -> dict:
         """PROBE (Aura-replay phase): on the active Salesforce Lightning page,
@@ -12788,6 +12885,11 @@ class CaseloadPanel:
         if q.lower().startswith("auraprobe"):
             self.app._probe_aura()
             return "break"
+        # DISCOVERY: "eaprobe:" captures the Essential Actions dashboard's Aura
+        # data feed (ea_feed_probe.txt) so EAs can be read from JSON not scraped.
+        if q.lower().startswith("eaprobe"):
+            self.app._probe_ea_feed()
+            return "break"
         # TEST: "apinote:" files a harmless Admin Note via the saveNoteCmpValues
         # API replay for the highlighted student (proves #3 before integration).
         if q.lower().startswith("apinote"):
@@ -14932,8 +15034,14 @@ class SplashScreen:
             return
         try:
             self._lbl.configure(image=self._frames[self._i])
+            # Play through ONCE then hold the last frame — no loop. The splash
+            # stays up (last frame + title/links) until the app closes it when
+            # the viewer is ready to interact with.
+            if self._i >= len(self._frames) - 1:
+                self._job = None
+                return
             delay = self._delays[self._i]
-            self._i = (self._i + 1) % len(self._frames)
+            self._i += 1
             self._job = self.win.after(delay, self._animate)
         except Exception:
             pass
@@ -17866,6 +17974,37 @@ class App:
                 show()
 
         self.worker.submit_probe_aura(on_done)
+
+    def _probe_ea_feed(self) -> None:
+        """DISCOVERY (eaprobe:): capture the Essential Actions dashboard's Aura
+        data feed so we can read EAs from JSON instead of scraping the table."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log("Probing the Essential Actions data feed "
+                         "(navigating to the EA dashboard)…")
+
+        def on_done(res):
+            def show():
+                if res and res.get("path"):
+                    self._append_log(
+                        f"EA feed probe → {res['path']}. "
+                        f"captured {res.get('captured')} aura response(s); "
+                        + (f"LIKELY FEED: {res.get('descriptor')}"
+                           if res.get("found")
+                           else "no obvious EA feed found — see the file."),
+                        success=bool(res.get("found")),
+                        error=not res.get("found"))
+                else:
+                    self._append_log(
+                        f"EA feed probe failed: {(res or {}).get('error')}",
+                        error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_probe_ea_feed(on_done)
 
     def _test_api_note(self) -> None:
         """TEST (apinote:): file a harmless Admin Note via the saveNoteCmpValues
