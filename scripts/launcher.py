@@ -21586,30 +21586,29 @@ class App:
         Topmost + grab so it can't get buried. Saves to settings.json
         and applies the change immediately (re-runs the visibility
         pass over the toolbar + open scenario editor tabs)."""
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Settings")
-        dialog.transient(self.root)
-        dialog.attributes("-topmost", True)
-        dialog.grab_set()
-        dialog.geometry("560x520")
-        dialog.minsize(520, 360)
-        dialog.lift()
-        dialog.focus_force()
+        win = ctk.CTkToplevel(self.root)
+        win.title("Settings")
+        win.transient(self.root)
+        win.attributes("-topmost", True)
+        win.grab_set()
+        win.geometry("620x680")
+        win.minsize(520, 420)
+        win.lift()
+        win.focus_force()
+        # Pinned action bar (bottom) + a SCROLLABLE body, so the dialog never
+        # needs to be enlarged to reach a control. Everything below is built into
+        # `dialog` — now the scroll frame — so the section code stays unchanged.
+        footer = ctk.CTkFrame(win, fg_color="transparent")
+        footer.pack(side="bottom", fill="x")
+        dialog = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        dialog.pack(side="top", fill="both", expand=True)
 
         def _refit() -> None:
-            """Resize the dialog to fit its current content (after the
-            foldable Display section toggles or the UI scale changes), so
-            controls never end up clipped below the bottom edge. Uses raw
-            wm_geometry + the content's requested size so it stays correct
-            at any UI scale (CTk's geometry() would re-apply the scale)."""
-            try:
-                dialog.update_idletasks()
-                w = max(dialog.winfo_reqwidth(), 480)
-                h = min(max(dialog.winfo_reqheight(), 360),
-                        int(dialog.winfo_screenheight() * 0.9))
-                dialog.wm_geometry(f"{w}x{h}")
-            except Exception:
-                pass
+            """No-op: the body scrolls now, so the window keeps its fixed size
+            and never needs to grow to fit content (the old grow-to-content
+            behavior is what pushed controls off-screen). Kept as a stub so the
+            foldable Display toggle's callers stay valid."""
+            return
 
         advanced_var = ctk.BooleanVar(value=self.settings.advanced_mode)
         ctk.CTkLabel(
@@ -22140,8 +22139,12 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
-        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_row.pack(fill="x", padx=20, pady=(0, 18), side="bottom")
+        # Save/Cancel live in the pinned footer (outside the scroll body), with
+        # a hairline separator above so they read as an action bar.
+        ctk.CTkFrame(footer, height=1, fg_color=("gray70", "gray35")).pack(
+            fill="x")
+        btn_row = ctk.CTkFrame(footer, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(8, 12))
 
         def _do_save() -> None:
             new_mode = advanced_var.get()
@@ -22200,15 +22203,15 @@ class App:
             save_settings(self.settings)
             if changed:
                 self._apply_advanced_mode()
-            try: dialog.grab_release()
+            try: win.grab_release()
             except Exception: pass
-            try: dialog.destroy()
+            try: win.destroy()
             except Exception: pass
 
         def _do_cancel() -> None:
-            try: dialog.grab_release()
+            try: win.grab_release()
             except Exception: pass
-            try: dialog.destroy()
+            try: win.destroy()
             except Exception: pass
 
         ctk.CTkButton(
@@ -22218,9 +22221,8 @@ class App:
             btn_row, text="Cancel", width=100, command=_do_cancel,
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=4)
-        dialog.bind("<Escape>", lambda _e: _do_cancel())
-        dialog.protocol("WM_DELETE_WINDOW", _do_cancel)
-        dialog.after(0, _refit)  # size to the built content
+        win.bind("<Escape>", lambda _e: _do_cancel())
+        win.protocol("WM_DELETE_WINDOW", _do_cancel)
 
     def _setup_caseload_tool_view_with_help(self, parent_dialog=None) -> None:
         """Open the manual walkthrough for creating the Caseload Tool
