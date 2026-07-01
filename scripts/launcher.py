@@ -23188,6 +23188,26 @@ class App:
             return (str(r.get("StudentID") or r.get("Student ID") or "").strip(),
                     str(r.get("CourseCode") or r.get("Course Code") or "").strip())
 
+        def gget(g, f):
+            """Read a grid field, supporting ONE level of nested object via a
+            dotted key like 'SMFollowupNote.Body' (the follow-up text/date live
+            inside such objects)."""
+            if "." in f:
+                parent, child = f.split(".", 1)
+                v = g.get(parent)
+                return v.get(child) if isinstance(v, dict) else None
+            return g.get(f)
+
+        def gfieldnames(g):
+            """Flat + one-level-nested field names of a grid row, so a value
+            search can reach into SMFollowupNote/SMFollowupDate/caseload objects."""
+            out = []
+            for f, v in g.items():
+                out.append(f)
+                if isinstance(v, dict):
+                    out += [f"{f}.{k}" for k in v.keys()]
+            return out
+
         joined, only_csv = [], 0
         for r in csv_rows:
             k = ckey(r)
@@ -23199,30 +23219,33 @@ class App:
         csv_sids = {ckey(r)[0] for r in csv_rows}
         only_grid = sum(1 for (sid, _c) in grid.keys() if sid not in csv_sids)
 
-        # Normalized-name index of grid fields (from a sample of rows).
+        # Normalized-name index of grid fields (flat + nested, from a sample).
         gfields = {}
         for g in list(grid.values())[:20]:
-            for f in g.keys():
+            for f in gfieldnames(g):
                 gfields.setdefault(nkey(f), f)
 
-        all_gfields = {f for g in list(grid.values())[:5] for f in g.keys()}
+        all_gfields = set()
+        for g in list(grid.values())[:8]:
+            all_gfields.update(gfieldnames(g))
 
         def _best_value_field(col):
-            """Find the grid field whose values best match this CSV column — for
-            RENAMED fields the name-match missed (e.g. CourseFollowupNote may be
-            SMFollowupNote in the grid). Returns (field, pct) or (None, 0)."""
+            """Find the grid field (incl. nested, e.g. SMFollowupNote.Body) whose
+            values best match this CSV column — for RENAMED / nested fields the
+            name-match missed. Threshold is low (>=5 non-empty rows) so SPARSE
+            fields like follow-up notes still resolve. Returns (field, pct)."""
             cvs = [(nval(r.get(col)), g) for r, g in joined]
             best_f, best_pct = None, 0.0
             for gf2 in all_gfields:
                 n2 = m2 = 0
                 for cv, g in cvs:
-                    gv = nval(g.get(gf2))
+                    gv = nval(gget(g, gf2))
                     if cv == "" and gv == "":
                         continue
                     n2 += 1
                     if cv == gv:
                         m2 += 1
-                if n2 >= max(5, len(joined) * 0.3):
+                if n2 >= 5:
                     pct = 100.0 * m2 / n2
                     if pct > best_pct:
                         best_f, best_pct = gf2, pct
@@ -23260,14 +23283,14 @@ class App:
             n = m = 0
             examples = []
             for r, g in joined:
-                cv, gv = nval(r.get(col)), nval(g.get(gf))
+                cv, gv = nval(r.get(col)), nval(gget(g, gf))
                 if cv == "" and gv == "":
                     continue
                 n += 1
                 if cv == gv or (is_task and cv[:10] and cv[:10] == gv[:10]):
                     m += 1
                 elif len(examples) < 4:
-                    examples.append((r.get("StudentID", ""), r.get(col), g.get(gf)))
+                    examples.append((r.get("StudentID", ""), r.get(col), gget(g, gf)))
             pct = (100.0 * m / n) if n else 100.0
             note = ""
             if is_task and pct < 100:
