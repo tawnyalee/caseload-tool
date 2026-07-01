@@ -15,7 +15,12 @@ dist-nuitka/
 *.spec.bak
 
 # Real student data captured during inspection — FERPA, don't commit.
-resources/
+# Ignore the folder's CONTENTS (HTML/PNG snapshots) but keep the two shipped
+# app assets. (Must be `resources/*` not `resources/` so the negations apply —
+# git can't re-include a file inside a wholly-excluded directory.)
+resources/*
+!resources/app.ico
+!resources/splash.gif
 
 # Nuitka intermediates
 *.build/

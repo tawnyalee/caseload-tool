@@ -14815,7 +14815,7 @@ class SplashScreen:
     GIF or Pillow is unavailable it simply does nothing, so startup never breaks.
     Close it with .close() (idempotent)."""
 
-    def __init__(self, master, gif_path):
+    def __init__(self, master, gif_path, max_size=460):
         self.win = None
         self._job = None
         self._frames = []
@@ -14826,7 +14826,15 @@ class SplashScreen:
                 return
             img = Image.open(str(gif_path))
             for frame in ImageSequence.Iterator(img):
-                self._frames.append(ImageTk.PhotoImage(frame.convert("RGBA")))
+                fr = frame.convert("RGBA")
+                # Cap the display size — big GIFs (700px × 117 frames ≈ 230MB of
+                # PhotoImages) are wasteful for a transient splash. BILINEAR is
+                # plenty for a boot animation and keeps the load fast.
+                if max(fr.size) > max_size:
+                    s = max_size / max(fr.size)
+                    fr = fr.resize((round(fr.width * s), round(fr.height * s)),
+                                   Image.BILINEAR)
+                self._frames.append(ImageTk.PhotoImage(fr))
                 # GIF frame durations are in ms; clamp so a 0-duration frame
                 # doesn't busy-loop.
                 self._delays.append(max(int(frame.info.get("duration", 80)), 20))
