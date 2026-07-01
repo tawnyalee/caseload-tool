@@ -14815,7 +14815,8 @@ class SplashScreen:
     GIF or Pillow is unavailable it simply does nothing, so startup never breaks.
     Close it with .close() (idempotent)."""
 
-    def __init__(self, master, gif_path, max_size=460):
+    def __init__(self, master, gif_path, max_size=460, max_frames=32,
+                 loop_ms=2500):
         self.win = None
         self._job = None
         self._frames = []
@@ -14825,19 +14826,24 @@ class SplashScreen:
             if not Path(gif_path).exists():
                 return
             img = Image.open(str(gif_path))
-            for frame in ImageSequence.Iterator(img):
+            total = getattr(img, "n_frames", 1) or 1
+            # TRIM: keep ~max_frames evenly sampled (a 100+-frame GIF is slow to
+            # load + heavy in memory for a transient splash). Only the kept
+            # frames are converted, so the load cost drops with the count.
+            step = max(1, total // max_frames)
+            for i, frame in enumerate(ImageSequence.Iterator(img)):
+                if i % step:
+                    continue
                 fr = frame.convert("RGBA")
-                # Cap the display size — big GIFs (700px × 117 frames ≈ 230MB of
-                # PhotoImages) are wasteful for a transient splash. BILINEAR is
-                # plenty for a boot animation and keeps the load fast.
-                if max(fr.size) > max_size:
+                if max(fr.size) > max_size:      # cap display size
                     s = max_size / max(fr.size)
                     fr = fr.resize((round(fr.width * s), round(fr.height * s)),
                                    Image.BILINEAR)
                 self._frames.append(ImageTk.PhotoImage(fr))
-                # GIF frame durations are in ms; clamp so a 0-duration frame
-                # doesn't busy-loop.
-                self._delays.append(max(int(frame.info.get("duration", 80)), 20))
+            # Even out timing so one full loop runs in ~loop_ms (≈2.5s),
+            # regardless of the source GIF's per-frame durations.
+            per = max(20, loop_ms // max(1, len(self._frames)))
+            self._delays = [per] * len(self._frames)
         except Exception:
             self._frames = []
         if not self._frames:
@@ -14852,14 +14858,22 @@ class SplashScreen:
             self._lbl = tk.Label(self.win, bd=0, highlightthickness=0,
                                  bg="white")
             self._lbl.pack()
+            # Click anywhere on the splash to dismiss it.
+            self.win.bind("<Button-1>", lambda _e: self.close())
+            self._lbl.bind("<Button-1>", lambda _e: self.close())
             w = self._frames[0].width()
             h = self._frames[0].height()
             sw = self.win.winfo_screenwidth()
             sh = self.win.winfo_screenheight()
+            # Centered on screen, on top.
             self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
             self._i = 0
             self._animate()
             self.win.update_idletasks()   # paint the first frame right away
+            try:
+                self.win.lift()
+            except Exception:
+                pass
         except Exception:
             self.close()
 
@@ -15009,13 +15023,31 @@ class App:
         # _is_busy so the scrape's own resume-when-idle check still works.
         self._task_scrape_running = False
 
+        # Windows taskbar: register our own AppUserModelID BEFORE any window is
+        # created, so the taskbar shows/groups under OUR icon instead of
+        # python.exe's when running from source.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "WGU.CaseloadNoteTool")
+        except Exception:
+            pass
         self.root = ctk.CTk()
         self.root.title(f"Caseload Note Automation — v{__version__}")
         self.root.minsize(420, 520)
-        # App / window icon (taskbar + title bar) — best-effort, .ico on Windows.
+
+        # App / window icon (title bar + taskbar). Set now AND re-apply shortly
+        # after — CustomTkinter re-sets a default icon during its own init, which
+        # would otherwise clobber ours.
+        def _apply_icon() -> None:
+            try:
+                if Path(APP_ICON).exists():
+                    self.root.iconbitmap(str(APP_ICON))
+            except Exception:
+                pass
+        _apply_icon()
         try:
-            if Path(APP_ICON).exists():
-                self.root.iconbitmap(str(APP_ICON))
+            self.root.after(300, _apply_icon)
         except Exception:
             pass
         # Startup splash (animated GIF) shown while the browser + caseload load;
