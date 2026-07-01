@@ -405,6 +405,12 @@ class Settings:
     # eligible (no Contact id, EA-attached notes, a note left unsubmitted) or
     # if the API call fails. Toggle off to file every note via the form.
     note_save_via_api: bool = True
+    # Source the caseload from the live grid JSON (getCaseLoadMainGridData) when
+    # that feed is healthy, overlaying any CSV-only columns from the downloaded
+    # CSV — so the caseload is complete regardless of how the Salesforce list
+    # view is configured (no manual column setup). Falls back to the CSV
+    # automatically when the feed is degraded. Toggle off to always use the CSV.
+    caseload_source_json: bool = True
     # Local data-at-rest encryption: how often the app password is required.
     #   "every_launch" — prompt on every start (nothing remembered)
     #   "per_restart"  — remember within a boot session; re-prompt after a

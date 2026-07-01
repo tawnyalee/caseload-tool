@@ -23493,12 +23493,48 @@ class App:
                "overlay).")
             + f" Full report → {report.name}")
 
+    def _merge_grid_and_csv_rows(self, built, csv_rows):
+        """JSON-primary caseload rows with CSV-only columns overlaid: the live
+        grid is the roster, the CSV fills any column the grid lacks (follow-up,
+        nursing dates). No student is dropped from either source. Matched by
+        (StudentID, CourseCode)."""
+        def _k(sid, course):
+            return (str(sid or "").strip(), str(course or "").strip())
+
+        def jkey(r):
+            return _k(r.get("StudentID"), r.get("CourseCode"))
+
+        def ckey(r):
+            return _k(r.get("StudentID") or r.get("Student ID"),
+                      r.get("CourseCode") or r.get("Course Code"))
+
+        cidx = {}
+        for r in csv_rows:
+            cidx.setdefault(ckey(r), r)
+        result = []
+        seen_sc, seen_sid = set(), set()
+        for j in built:
+            k = jkey(j)
+            seen_sc.add(k)
+            seen_sid.add(k[0])
+            crow = cidx.get(k) or cidx.get((k[0], ""))
+            if crow:
+                for col, val in crow.items():
+                    if col not in j:          # overlay only CSV-only columns
+                        j[col] = val
+            result.append(j)
+        for r in csv_rows:                    # keep CSV students the grid missed
+            ck = ckey(r)
+            if ck not in seen_sc and ck[0] not in seen_sid:
+                result.append(r)
+        return result
+
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
-        """Read CASELOAD_CSV_PATH into self._caseload_rows. Returns
-        True on success, False if the file doesn't exist or can't be
-        parsed. Called on startup (silent=True — the log widget isn't
-        built yet) and from the manual Reload button (silent=False
-        so the user sees the result)."""
+        """Load the caseload into self._caseload_rows. Sources from the live grid
+        JSON when that feed is healthy (complete regardless of the SF view),
+        overlaying CSV-only columns from the downloaded CSV; falls back to the
+        CSV otherwise. Returns True on success. Called on startup (silent=True —
+        log widget not built yet) and from the manual Reload button."""
         try:
             rows = caseload_csv.load_caseload_csv(CASELOAD_CSV_PATH)
         except FileNotFoundError:
@@ -23516,19 +23552,33 @@ class App:
             self._caseload_rows = None
             self._caseload_csv_mtime = None
             return False
+        # JSON-primary: when the live grid feed is healthy, build the caseload
+        # from it (complete regardless of the SF view config) and overlay any
+        # CSV-only columns from the CSV. Any doubt → keep the CSV rows.
+        source = CASELOAD_CSV_PATH.name
+        if getattr(self.settings, "caseload_source_json", True):
+            try:
+                health = self._grid_feed_health(rows)
+                if health["ok"]:
+                    from src import grid_rows as _gr
+                    built = _gr.build_caseload_rows(
+                        self.worker.grid_rows_by_key())
+                    if built and len(built) >= len(rows) * 0.9:
+                        rows = self._merge_grid_and_csv_rows(built, rows)
+                        source = "live grid JSON (+CSV overlay)"
+            except Exception as e:
+                if not silent:
+                    self._append_log(f"  ↳ grid-source skipped: {e}")
         self._caseload_rows = rows
         self._caseload_csv_mtime = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
         self._refresh_contact_ids(rows, silent=silent)
-        # Cache whether the CSV carries a student-email column so the
-        # pre-batch warning + Settings status line don't have to scan
-        # rows again. Refreshed on every cache reload — picks up the
-        # change immediately when the user adds the column.
+        # Cache whether the rows carry a student-email column so the pre-batch
+        # warning + Settings status line don't have to scan rows again.
         self._csv_has_student_email = _csv_has_student_email_column(rows)
         if not silent:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
-                f"Caseload cache: {len(rows)} rows from "
-                f"{CASELOAD_CSV_PATH.name} ({age})"
+                f"Caseload cache: {len(rows)} rows from {source} ({age})"
             )
             if not self._csv_has_student_email:
                 self._append_log(
