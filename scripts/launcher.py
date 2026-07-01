@@ -14666,7 +14666,7 @@ def _vault_dialog_footer(frm) -> None:
     tk.Frame(frm, height=1, bg="#d0d0d0").pack(fill="x", pady=(16, 8))
     tk.Label(
         frm, fg="#666", font=("Segoe UI", 8), anchor="w",
-        text=f"WGU Caseload Note Tool — by {_AUTHOR_NAME} ({_AUTHOR_EMAIL})",
+        text=f"Caseload Tool — {_AUTHOR_NAME} ({_AUTHOR_EMAIL})",
     ).pack(anchor="w")
     link = tk.Label(
         frm, text="Latest updates & releases on GitHub  →",
@@ -14849,27 +14849,77 @@ class SplashScreen:
         if not self._frames:
             return
         try:
+            import webbrowser as _wb
+            BLUE = "#003057"       # brand navy — the splash border + accents
+            WHITE = "#ffffff"
+            LINK = "#1a56c4"
             self.win = tk.Toplevel(master)
             self.win.overrideredirect(True)
             try:
                 self.win.attributes("-topmost", True)
             except Exception:
                 pass
-            self._lbl = tk.Label(self.win, bd=0, highlightthickness=0,
-                                 bg="white")
-            self._lbl.pack()
-            # Click anywhere on the splash to dismiss it.
-            self.win.bind("<Button-1>", lambda _e: self.close())
-            self._lbl.bind("<Button-1>", lambda _e: self.close())
-            w = self._frames[0].width()
-            h = self._frames[0].height()
-            sw = self.win.winfo_screenwidth()
-            sh = self.win.winfo_screenheight()
-            # Centered on screen, on top.
-            self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+            # Blue border = a colored outer frame with the white content inset.
+            outer = tk.Frame(self.win, bg=BLUE)
+            outer.pack(fill="both", expand=True)
+            inner = tk.Frame(outer, bg=WHITE)
+            inner.pack(fill="both", expand=True, padx=4, pady=4)
+
+            def _dismiss(w):
+                w.bind("<Button-1>", lambda _e: self.close())
+
+            def _openlink(url, close=True):
+                def _h(_e):
+                    try:
+                        _wb.open(url)
+                    except Exception:
+                        pass
+                    if close:
+                        self.close()
+                return _h
+
+            _dismiss(inner)
+            _dismiss(outer)
+            # Title above the owl.
+            _t = tk.Label(inner, text="Caseload Tool", bg=WHITE, fg=BLUE,
+                          font=("Segoe UI", 20, "bold"))
+            _t.pack(pady=(14, 6))
+            _dismiss(_t)
+            # The animated owl.
+            self._lbl = tk.Label(inner, bd=0, highlightthickness=0, bg=WHITE)
+            self._lbl.pack(padx=20)
+            _dismiss(self._lbl)
+            # Version + links + author below.
+            _v = tk.Label(inner, text=f"Version {__version__}", bg=WHITE,
+                          fg="#666666", font=("Segoe UI", 10))
+            _v.pack(pady=(8, 4))
+            _dismiss(_v)
+            for _txt, _url in (
+                ("Latest releases & updates", f"{_GITHUB_URL}/releases"),
+                ("Report a bug or suggestion", f"{_GITHUB_URL}/issues"),
+            ):
+                _l = tk.Label(inner, text=_txt, bg=WHITE, fg=LINK, cursor="hand2",
+                              font=("Segoe UI", 10, "underline"))
+                _l.bind("<Button-1>", _openlink(_url))
+                _l.pack(pady=1)
+            _n = tk.Label(inner, text=_AUTHOR_NAME, bg=WHITE, fg="#333333",
+                          font=("Segoe UI", 10, "bold"))
+            _n.pack(pady=(10, 0))
+            _dismiss(_n)
+            _e = tk.Label(inner, text=_AUTHOR_EMAIL, bg=WHITE, fg=LINK,
+                          cursor="hand2", font=("Segoe UI", 10, "underline"))
+            _e.bind("<Button-1>", _openlink(f"mailto:{_AUTHOR_EMAIL}"))
+            _e.pack(pady=(0, 14))
+
             self._i = 0
             self._animate()
-            self.win.update_idletasks()   # paint the first frame right away
+            # Size to content, centered, on top.
+            self.win.update_idletasks()
+            w = self.win.winfo_reqwidth()
+            h = self.win.winfo_reqheight()
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
             try:
                 self.win.lift()
             except Exception:
@@ -15029,11 +15079,11 @@ class App:
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "WGU.CaseloadNoteTool")
+                "CaseloadTool.Desktop")
         except Exception:
             pass
         self.root = ctk.CTk()
-        self.root.title(f"Caseload Note Automation — v{__version__}")
+        self.root.title(f"Caseload Tool — v{__version__}")
         self.root.minsize(420, 520)
 
         # App / window icon (title bar + taskbar). Set now AND re-apply shortly
@@ -22295,7 +22345,7 @@ class App:
             return lbl
 
         ctk.CTkLabel(
-            dialog, text="WGU Caseload Note Tool",
+            dialog, text="Caseload Tool",
             font=ctk.CTkFont(size=17, weight="bold"), anchor="w",
         ).pack(fill="x", padx=20, pady=(14, 0))
         ctk.CTkLabel(
