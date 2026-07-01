@@ -35,8 +35,10 @@ vault.json
 *.enc
 *.tmp
 
-# Diagnostic report from the 'griddiff:' keyword — holds student values (PII).
+# Diagnostic reports from the 'griddiff:' / 'gridbuild:' keywords — hold student
+# values (PII).
 griddiff_report.txt
+gridbuild_report.txt
 
 # Cached caseload export — student PII, FERPA, never commit.
 caseload.csv

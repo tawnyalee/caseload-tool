@@ -12799,6 +12799,12 @@ class CaseloadPanel:
         if q.lower().startswith("griddiff"):
             self.app._grid_vs_csv_diff()
             return "break"
+        # DIAGNOSTIC: "gridbuild:" builds caseload rows from the JSON (the actual
+        # row-builder) and diffs them RAW against the CSV — parity proof before
+        # sourcing the caseload from the JSON. Writes gridbuild_report.txt.
+        if q.lower().startswith("gridbuild"):
+            self.app._grid_build_parity()
+            return "break"
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
             rows = self.app._caseload_rows or []
@@ -22703,6 +22709,7 @@ class App:
             targets += list(USER_CONFIG_DIR.glob("*_probe.txt"))
             targets.append(USER_CONFIG_DIR / "aura_probe.txt")
             targets.append(USER_CONFIG_DIR / "griddiff_report.txt")
+            targets.append(USER_CONFIG_DIR / "gridbuild_report.txt")
             try:
                 from src.config import SCREENSHOTS_DIR
                 targets += list(SCREENSHOTS_DIR.glob("*.png"))
@@ -23394,6 +23401,79 @@ class App:
             + (f"Critical gaps: {', '.join(gaps)}." if gaps
                else "All critical columns have a grid field.")
             + f" {len(unused)} JSON field(s) not currently used."
+            + f" Full report → {report.name}")
+
+    def _grid_build_parity(self) -> None:
+        """Build caseload rows from the grid JSON (src/grid_rows) and diff them
+        RAW/exact against the CSV rows — proves the builder produces CSV-parity
+        before we ever source the caseload from it. Read-only. 'gridbuild:'."""
+        from src import grid_rows
+        csv_rows = self._caseload_rows or []
+        try:
+            grid = self.worker.grid_rows_by_key()
+        except Exception:
+            grid = {}
+        if not csv_rows or not grid:
+            self._append_log("gridbuild: need both a loaded CSV and a grid.")
+            return
+        built = grid_rows.build_caseload_rows(grid)
+
+        def bkey(r):
+            return (str(r.get("StudentID") or "").strip(),
+                    str(r.get("CourseCode") or "").strip())
+
+        def ckey(r):
+            return (str(r.get("StudentID") or r.get("Student ID") or "").strip(),
+                    str(r.get("CourseCode") or r.get("Course Code") or "").strip())
+
+        bidx = {bkey(r): r for r in built}
+        joined = [(c, bidx.get(ckey(c))) for c in csv_rows]
+        joined = [(c, b) for c, b in joined if b is not None]
+        critical = self._required_caseload_columns()
+        cols = sorted(set(csv_rows[0].keys()) | critical)
+        lines = ["gridbuild — builder rows vs CSV (RAW exact match)",
+                 f"built {len(built)} rows · csv {len(csv_rows)} rows · "
+                 f"{len(joined)} joined", "",
+                 f"{'column':34}{'match%':>7}{'n':>6}{'in build':>10}  note",
+                 "-" * 88]
+        gaps = []
+        for col in cols:
+            in_build = any(col in b for _c, b in joined)
+            n = m = 0
+            ex = []
+            for c, b in joined:
+                cv, bv = str(c.get(col) or ""), str(b.get(col) or "")
+                if cv == "" and bv == "":
+                    continue
+                n += 1
+                if cv == bv:
+                    m += 1
+                elif len(ex) < 4:
+                    ex.append((c.get("StudentID", ""), cv, bv))
+            pct = (100.0 * m / n) if n else 100.0
+            note = ""
+            if not in_build:
+                note = "CSV-only — overlay from CSV"
+            elif pct < 99 and n:
+                note = "<-- DIFFERS"
+                if col in critical:
+                    gaps.append(col)
+            lines.append(f"{col:34}{pct:6.0f}%{n:6}"
+                         f"{('yes' if in_build else 'no'):>10}  {note}")
+            for sid, cvv, bvv in ex:
+                lines.append(f"      [{sid}] csv={cvv[:48]!r} build={bvv[:48]!r}")
+
+        from src.config import USER_CONFIG_DIR as _UCD
+        report = _UCD / "gridbuild_report.txt"
+        try:
+            report.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            self._append_log(f"gridbuild: couldn't write report: {e}")
+        self._append_log(
+            f"gridbuild: builder produced {len(built)} rows. "
+            + (f"Parity gaps (critical): {', '.join(gaps)}." if gaps
+               else "Every app-read column matches the CSV (or is a CSV-only "
+               "overlay).")
             + f" Full report → {report.name}")
 
     def _reload_caseload_cache(self, *, silent: bool = False) -> bool:
