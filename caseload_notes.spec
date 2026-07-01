@@ -6,9 +6,18 @@
 # build.py runs PyInstaller against this spec, then copies the local
 # Playwright Chromium install into the bundle so the packaged app
 # doesn't need a separate browser download on the user's machine.
+import os
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
+
+# Optional startup splash GIF + app icon. Included only if present, so the build
+# works whether or not the artist files have been dropped in yet.
+_res_datas = [
+    (p, "resources") for p in ("resources/splash.gif", "resources/app.ico")
+    if os.path.exists(p)
+]
+_app_icon = "resources/app.ico" if os.path.exists("resources/app.ico") else None
 
 # customtkinter ships theme JSON + assets it loads at runtime — make
 # sure those tag along.
@@ -26,6 +35,7 @@ a = Analysis(
     datas=[
         ("default_scenarios.yaml", "."),  # bundled sample — seeded into user dir on first run
         ("default_email_templates", "default_email_templates"),  # sample email templates
+        *_res_datas,       # splash.gif / app.ico when present
         *ctk_datas,
         *tzdata_datas,
     ],
@@ -56,6 +66,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,  # GUI app — no console window
+    icon=_app_icon,  # embedded app icon (desktop shortcut / taskbar); None if absent
 )
 coll = COLLECT(
     exe,

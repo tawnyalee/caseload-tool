@@ -78,6 +78,20 @@ BROWSER_DATA_DIR = USER_CONFIG_DIR / "browser_data"
 SCREENSHOTS_DIR = USER_CONFIG_DIR / "screenshots"
 NOTE_LOG_CSV = USER_CONFIG_DIR / "note_log.csv"
 
+
+def _resource(rel: str) -> Path:
+    """Path to a bundled resource file: the frozen bundle in a packaged build,
+    else the project's ``resources/`` in dev. Both may be absent — callers must
+    tolerate a missing file (best-effort splash/icon)."""
+    base = _bundle if _bundle is not None else PROJECT_ROOT
+    return base / rel
+
+
+# Startup splash (animated GIF) + app/window icon (.ico). Optional — drop the
+# files at these paths and they're used automatically; missing = no-op.
+SPLASH_GIF = _resource("resources/splash.gif")
+APP_ICON = _resource("resources/app.ico")
+
 # Email templates. Renamed from the bare "templates" folder. Migrate the
 # legacy folder name so upgraders keep their templates.
 EMAIL_TEMPLATES_DIR = USER_CONFIG_DIR / "email_templates"

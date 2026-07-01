@@ -52,7 +52,7 @@ from src.config import (
     USER_CONFIG_DIR, Settings, load_settings, save_settings,
     set_templates_dir, templates_dir,
     DEFAULT_EMAIL_LINK_COLOR, email_link_color, set_email_link_color,
-    VAULT_PATH, ENCRYPTED_DATA_FILES,
+    VAULT_PATH, ENCRYPTED_DATA_FILES, SPLASH_GIF, APP_ICON,
 )
 from src import crypto_store
 from src.version import __version__
@@ -14806,6 +14806,82 @@ def _vault_setup_prompt() -> Optional[str]:
 
 
 # ============================================================
+# Startup splash (animated GIF)
+# ============================================================
+
+class SplashScreen:
+    """A borderless, centered, top-most window that plays an animated GIF while
+    the app boots (browser launch + caseload load). Fully best-effort: if the
+    GIF or Pillow is unavailable it simply does nothing, so startup never breaks.
+    Close it with .close() (idempotent)."""
+
+    def __init__(self, master, gif_path):
+        self.win = None
+        self._job = None
+        self._frames = []
+        self._delays = []
+        try:
+            from PIL import Image, ImageTk, ImageSequence
+            if not Path(gif_path).exists():
+                return
+            img = Image.open(str(gif_path))
+            for frame in ImageSequence.Iterator(img):
+                self._frames.append(ImageTk.PhotoImage(frame.convert("RGBA")))
+                # GIF frame durations are in ms; clamp so a 0-duration frame
+                # doesn't busy-loop.
+                self._delays.append(max(int(frame.info.get("duration", 80)), 20))
+        except Exception:
+            self._frames = []
+        if not self._frames:
+            return
+        try:
+            self.win = tk.Toplevel(master)
+            self.win.overrideredirect(True)
+            try:
+                self.win.attributes("-topmost", True)
+            except Exception:
+                pass
+            self._lbl = tk.Label(self.win, bd=0, highlightthickness=0,
+                                 bg="white")
+            self._lbl.pack()
+            w = self._frames[0].width()
+            h = self._frames[0].height()
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            self.win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+            self._i = 0
+            self._animate()
+            self.win.update_idletasks()   # paint the first frame right away
+        except Exception:
+            self.close()
+
+    def _animate(self):
+        if not self.win:
+            return
+        try:
+            self._lbl.configure(image=self._frames[self._i])
+            delay = self._delays[self._i]
+            self._i = (self._i + 1) % len(self._frames)
+            self._job = self.win.after(delay, self._animate)
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            if self._job and self.win:
+                self.win.after_cancel(self._job)
+        except Exception:
+            pass
+        self._job = None
+        try:
+            if self.win:
+                self.win.destroy()
+        except Exception:
+            pass
+        self.win = None
+
+
+# ============================================================
 # Main app
 # ============================================================
 
@@ -14928,6 +15004,22 @@ class App:
         self.root = ctk.CTk()
         self.root.title(f"Caseload Note Automation — v{__version__}")
         self.root.minsize(420, 520)
+        # App / window icon (taskbar + title bar) — best-effort, .ico on Windows.
+        try:
+            if Path(APP_ICON).exists():
+                self.root.iconbitmap(str(APP_ICON))
+        except Exception:
+            pass
+        # Startup splash (animated GIF) shown while the browser + caseload load;
+        # closed by _minimize_browser (startup done) or a hard timeout fallback.
+        # No-op if the GIF is absent, so this never blocks startup.
+        self._splash = None
+        try:
+            self._splash = SplashScreen(self.root, SPLASH_GIF)
+            if self._splash.win is not None:
+                self.root.after(45000, self._close_splash)   # safety timeout
+        except Exception:
+            self._splash = None
         # Restore the saved window size/position if it's still sane and
         # on-screen; otherwise fall back to the default.
         self._restore_window_geometry()
@@ -24398,9 +24490,20 @@ class App:
         _NAME_CAP_MODE = (getattr(self.settings, "name_capitalization",
                                   "standard") or "standard")
 
+    def _close_splash(self) -> None:
+        """Dismiss the startup splash if it's up (idempotent)."""
+        sp = getattr(self, "_splash", None)
+        if sp is not None:
+            try:
+                sp.close()
+            except Exception:
+                pass
+            self._splash = None
+
     def _minimize_browser(self) -> None:
         """Minimize the launcher's browser once the startup caseload load is
         finished (login's done + data's in), so it's out of the way."""
+        self._close_splash()   # startup finished — take down the splash
         try:
             self.worker._minimize_browser_window()
             self._append_log("Caseload loaded — minimized the browser.")
