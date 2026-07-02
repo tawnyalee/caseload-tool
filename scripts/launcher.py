@@ -23954,6 +23954,13 @@ class App:
         Honors the user's Settings ignore-list."""
         if not rows or not hasattr(self, "log"):
             return
+        # When the cache is sourced from the live grid JSON, the caseload is
+        # complete regardless of the CSV list-view's columns — so a missing CSV
+        # column is harmless and warning about it is just noise. Only nag when
+        # we're actually relying on the CSV (the JSON feed was unavailable).
+        if getattr(self, "_caseload_from_json", False):
+            self._req_cols_warned = False
+            return
         have = set(rows[0].keys())
         ignore = self._ignored_required_columns()
         missing = sorted(
