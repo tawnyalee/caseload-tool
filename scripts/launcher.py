@@ -14632,6 +14632,18 @@ class DataPanel:
     def _course_color(self, i):
         return self._COURSE_PALETTE[i % len(self._COURSE_PALETTE)]
 
+    @staticmethod
+    def _blend(c1: str, c2: str, t: float) -> str:
+        """Blend hex color c1 toward c2 by fraction t (0→c1, 1→c2). Used to
+        fade a course color toward the canvas background for a 'faint' bar."""
+        try:
+            a, b = c1.lstrip("#"), c2.lstrip("#")
+            ch = [round(int(a[i:i+2], 16) * (1 - t) + int(b[i:i+2], 16) * t)
+                  for i in (0, 2, 4)]
+            return "#{:02x}{:02x}{:02x}".format(*ch)
+        except Exception:
+            return c1
+
     def _date_bounds(self):
         """(date_from, date_to) ISO strings for the selected window, or
         (None, None) for all dates. Window filters by RESOLUTION date."""
@@ -14861,6 +14873,7 @@ class DataPanel:
         fg = "#c0c0c0" if dark else "#444444"
         grid = "#333333" if dark else "#dddddd"
         pred_col = "#9aa0a6"
+        bg = "#1d1e1e" if dark else "#f9f9fa"   # canvas bg — for faint bars
         series = self._data or []
         L, R, T, B = 44, 16, 26, 54
         pw, ph = W - L - R, H - T - B
@@ -14900,9 +14913,12 @@ class DataPanel:
                 pct = 100 * rate
                 bx = cx - gw / 2 + bw * (si + 0.5)
                 x0, x1 = bx - bw * 0.42, bx + bw * 0.42
-                if band["resolved"] < 5:                  # thin sample → hollow
+                if band["resolved"] < 5:            # thin sample → faint fill
+                    # Faint (not dashed) so 'dashed' means ONLY the predicted
+                    # band, matching the legend + the 'faint bar = <5' note.
                     c.create_rectangle(x0, y_at(pct), x1, y_at(0),
-                                       outline=s["color"], dash=(2, 2))
+                                       fill=self._blend(s["color"], bg, 0.62),
+                                       outline="")
                 else:
                     c.create_rectangle(x0, y_at(pct), x1, y_at(0),
                                        fill=s["color"], outline="")
