@@ -10022,12 +10022,28 @@ class ScenarioEditor:
         # exclusive) and the Filters section appears underneath.
         row += 1
         self.batch_mode_var = ctk.BooleanVar(value=False)
-        _option_checkbox(
+        self.batch_mode_checkbox = _option_checkbox(
             self.frame,
             "Batch mode (apply to all matching students)",
             self.batch_mode_var,
             command=self._on_batch_mode_toggled,
-        ).grid(row=row, column=0, sticky="w", padx=8, pady=(0, 4))
+        )
+        self.batch_mode_checkbox.grid(row=row, column=0, sticky="w",
+                                      padx=8, pady=(0, 4))
+        # Single-action filtering — GATE a single/selection fire by conditions
+        # (skip + list students who don't match). Mutually exclusive with batch
+        # mode; both drive the same Filters section below.
+        row += 1
+        self.filter_single_var = ctk.BooleanVar(value=False)
+        self.filter_single_checkbox = _option_checkbox(
+            self.frame,
+            "Single-action filtering (only fire for students who match — "
+            "others are listed and skipped)",
+            self.filter_single_var,
+            command=self._on_filter_single_toggled,
+        )
+        self.filter_single_checkbox.grid(row=row, column=0, sticky="w",
+                                         padx=8, pady=(0, 4))
         row += 1
         self._batch_section_row = row
         self._build_batch_section()
@@ -10258,10 +10274,12 @@ class ScenarioEditor:
         frame.grid_columnconfigure(0, weight=1)
         self._batch_section = frame
 
-        ctk.CTkLabel(
+        self._filters_label = ctk.CTkLabel(
             frame, text="Filters",
             font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        )
+        self._filters_label.grid(row=0, column=0, sticky="w", padx=8,
+                                 pady=(6, 0))
 
         self.filters_container = ctk.CTkFrame(frame, fg_color="transparent")
         self.filters_container.grid(
@@ -10313,28 +10331,50 @@ class ScenarioEditor:
             row.set_columns(cols)
 
     def _on_batch_mode_toggled(self) -> None:
-        """Show/hide the Filters section; mutually exclusive with the
-        find-first checkbox."""
+        """Batch mode ON turns single-action filtering OFF (mutually exclusive
+        — batch SELECTS students, single-filter GATES the ones you fire on)."""
         if self.batch_mode_var.get():
+            self.filter_single_var.set(False)   # no command fired by .set()
+        self._sync_filter_modes()
+
+    def _on_filter_single_toggled(self) -> None:
+        """Single-action filtering ON turns batch mode OFF (mutually exclusive)."""
+        if self.filter_single_var.get():
+            self.batch_mode_var.set(False)
+        self._sync_filter_modes()
+
+    def _sync_filter_modes(self) -> None:
+        """Show the shared Filters section when EITHER batch or single-filter is
+        on, retitle it for the mode, and apply batch-only side effects (hide
+        find-first, block panel action)."""
+        batch = self.batch_mode_var.get()
+        single = self.filter_single_var.get()
+        if batch or single:
             self._batch_section.grid(
                 row=self._batch_section_row, column=0,
-                sticky="ew", padx=8, pady=(0, 6),
-            )
+                sticky="ew", padx=8, pady=(0, 6))
+            self._filters_label.configure(
+                text=("Filters — fire ONLY for students who match all of these"
+                      if single else "Filters"))
+        else:
+            self._batch_section.grid_remove()
+        # find-first is only meaningful for a plain single fire — batch fires
+        # over every match, so hide + force it off there. Single-filter can keep
+        # find-first (find one student, then gate them).
+        if batch:
             self.find_first_checkbox.grid_remove()
-            # Force-off find_first so a hidden checkbox can't still
-            # save to YAML via serialize().
             self.find_first_var.set(False)
-            # Batch scenarios can't be panel actions — disable + clear the
-            # toggle and explain why.
+        else:
+            self.find_first_checkbox.grid(
+                row=self._find_first_row, column=0,
+                sticky="w", padx=8, pady=(0, 8))
+        # Batch scenarios can't be panel actions; single-filter ones CAN (they
+        # fire on a hand-picked selection).
+        if batch:
             self.panel_action_var.set(False)
             self.panel_action_checkbox.configure(state="disabled")
             self.panel_action_hint.grid()
         else:
-            self._batch_section.grid_remove()
-            self.find_first_checkbox.grid(
-                row=self._find_first_row, column=0,
-                sticky="w", padx=8, pady=(0, 8),
-            )
             self.panel_action_checkbox.configure(state="normal")
             self.panel_action_hint.grid_remove()
 
@@ -11025,11 +11065,18 @@ class ScenarioEditor:
         self.filter_rows = []
         if scenario.batch is not None:
             self.batch_mode_var.set(True)
+            self.filter_single_var.set(False)
             for filt in scenario.batch.filters:
+                self._add_filter_row(filt)
+        elif getattr(scenario, "fire_filters", None):
+            self.filter_single_var.set(True)
+            self.batch_mode_var.set(False)
+            for filt in scenario.fire_filters:
                 self._add_filter_row(filt)
         else:
             self.batch_mode_var.set(False)
-        self._on_batch_mode_toggled()
+            self.filter_single_var.set(False)
+        self._sync_filter_modes()
         # Email config drives the section's visibility + widget values.
         self.send_email_var.set(scenario.email is not None)
         if scenario.email is not None:
@@ -11115,6 +11162,10 @@ class ScenarioEditor:
                 "filters": [r.serialize() for r in self.filter_rows],
                 "preview": self._batch_preview,
             }
+        elif self.filter_single_var.get():
+            ff = [r.serialize() for r in self.filter_rows]
+            if ff:
+                out["fire_filters"] = ff
         if self.use_vars_var.get():
             prompts_out = [r.serialize() for r in self.prompt_rows]
             # Drop rows with empty `var` — they're not addressable from
@@ -18905,6 +18956,30 @@ class App:
             else:
                 chosen_name = chosen
 
+        # Single-action filtering: gate THIS student by the action's filters
+        # before doing any work. (Selection fires are pre-gated in
+        # _fire_on_selected; this covers the single hotkey / find-first fire.)
+        # If we can't find a caseload row to check, fire anyway rather than
+        # wrongly block — and say so.
+        if getattr(scenario, "fire_filters", None):
+            grow = self._row_for_student(prenav_student_id, chosen_name)
+            if grow is None:
+                self._append_log(
+                    "  ↳ single-action filter: no caseload row found for this "
+                    "student, so firing without the filter check.")
+            else:
+                keep, gskip, aborted = self._apply_fire_filters(
+                    scenario, [grow], "fire")
+                if aborted:
+                    return
+                if not keep:
+                    who = (chosen_name or (gskip[0] if gskip else "")
+                           or "This student")
+                    self._append_log(
+                        f"{who} doesn't meet {scenario.name!r}'s filter "
+                        "conditions — not fired.", error=True)
+                    return
+
         # Step 2: prompts (scenario-level, feed {{var}} into emails
         # and note bodies). Collect BEFORE per-note custom edits so
         # `{{var}}` placeholders inside a custom-edited body get
@@ -20392,6 +20467,52 @@ class App:
         sid = str(row.get("StudentID", "") or row.get("Student ID", "")).strip()
         return name, (sid or name)
 
+    def _row_for_student(self, sid: str = "", name: str = "") -> "Optional[dict]":
+        """Find a cached caseload row by Student ID (preferred) or exact name.
+        None if not cached — used to gate a single fire by fire_filters."""
+        rows = self._caseload_rows or []
+        sid = (sid or "").strip()
+        name = (name or "").strip().lower()
+        if sid:
+            for r in rows:
+                if str(r.get("StudentID", "") or r.get("Student ID", "")
+                       ).strip() == sid:
+                    return r
+        if name:
+            for r in rows:
+                if str(r.get("Name", "")).strip().lower() == name:
+                    return r
+        return None
+
+    def _apply_fire_filters(self, scenario, rows, source):
+        """Single-action filtering: gate `rows` by scenario.fire_filters. Returns
+        (keep, skipped_names, aborted). Mirrors the batch filter pipeline (column
+        resolve + task-facet rewrite + missing-column guard). aborted=True means
+        a filter column is missing from the caseload → don't fire for anyone."""
+        raw = getattr(scenario, "fire_filters", None) or []
+        rows = list(rows or [])
+        if not raw or not rows:
+            return rows, [], False
+        headers = list(rows[0].keys())
+        filters = [_resolve_filter_columns(f, headers) for f in raw]
+        missing = [f.get("column", "") for f in filters
+                   if f.get("column") and f.get("column") not in headers]
+        if missing:
+            self._append_log(
+                f"{source}: filter column(s) not in the caseload export "
+                f"({', '.join(repr(c) for c in missing)}) — not firing. Add "
+                "them to your Caseload view + ↻ Caseload.", error=True)
+            return [], [], True
+        eval_filters = [_rewrite_task_filter(f) for f in filters]
+        keep, skipped = [], []
+        for r in rows:
+            if caseload_filter.apply_filters(eval_filters, [r]):
+                keep.append(r)
+            else:
+                nm, _ = self._row_name_and_query(r)
+                skipped.append(nm or "?")
+        return keep, skipped, False
+
     def _collect_note_inputs(
         self, scenario: ScenarioConfig, total: int, source: str = "batch",
     ) -> "Optional[tuple[str, dict]]":
@@ -20673,6 +20794,26 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
+            return
+
+        # Single-action filtering: gate the selection by the action's own
+        # filters BEFORE any review/prompts, so only matching students proceed
+        # and the rest are reported. (Done here so downstream position-indexed
+        # body_overrides stay aligned to the kept rows.)
+        rows, gate_skipped, aborted = self._apply_fire_filters(
+            scenario, rows, "selection")
+        if aborted:
+            return
+        if gate_skipped:
+            self._append_log(
+                f"{len(gate_skipped)} selected student(s) don't meet "
+                f"{scenario.name!r}'s conditions — skipped: "
+                f"{', '.join(gate_skipped[:12])}"
+                f"{' …' if len(gate_skipped) > 12 else ''}.")
+        if not rows:
+            self._append_log(
+                f"{scenario.name!r}: no selected students meet the filter "
+                "conditions; nothing fired.")
             return
 
         # Record-only support: no Salesforce, no sends — just log the bound

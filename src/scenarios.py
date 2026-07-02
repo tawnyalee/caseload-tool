@@ -160,6 +160,12 @@ class ScenarioConfig:
     # steps whose `action` equals this scenario's name.
     record_only: bool = False
     marks_step: str = ""
+    # Single-action filtering: when non-empty, firing this action on a student
+    # (or a hand-picked selection) GATES each student by these filter conditions
+    # — students who don't match are reported + skipped, matching ones fire.
+    # Same filter shape as BatchConfig.filters. Mutually exclusive with `batch`
+    # (batch SELECTS students; fire_filters GATES the ones you're firing on).
+    fire_filters: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -457,6 +463,7 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
             panel_action=bool(cfg.get("panel_action", False)),
             record_only=bool(cfg.get("record_only", False)),
             marks_step=str(cfg.get("marks_step", "") or "").strip(),
+            fire_filters=list(cfg.get("fire_filters") or []),
         )
     return out
 
