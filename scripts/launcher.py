@@ -18964,9 +18964,23 @@ class App:
         if getattr(scenario, "fire_filters", None):
             grow = self._row_for_student(prenav_student_id, chosen_name)
             if grow is None:
+                # Can't identify a caseload row to check → don't silently fire.
+                # Warn and let the user accept (fire) or cancel.
+                who = chosen_name or "this student"
+                if not ask_yes_no_topmost(
+                    self.root, "Can't check filter conditions",
+                    f"{scenario.name!r} only fires for students matching its "
+                    f"filter conditions, but there's no cached caseload row for "
+                    f"{who} to check against.\n\nFire anyway?",
+                    yes_label="Fire anyway", no_label="Cancel",
+                ):
+                    self._append_log(
+                        f"{scenario.name!r}: cancelled — couldn't verify the "
+                        f"filter conditions for {who}.")
+                    return
                 self._append_log(
-                    "  ↳ single-action filter: no caseload row found for this "
-                    "student, so firing without the filter check.")
+                    "  ↳ single-action filter: no caseload row to check; "
+                    "firing at your confirmation.")
             else:
                 keep, gskip, aborted = self._apply_fire_filters(
                     scenario, [grow], "fire")
