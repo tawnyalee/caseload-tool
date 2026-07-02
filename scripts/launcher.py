@@ -656,7 +656,23 @@ class BrowserWorker:
         with persistent_context() as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             if CASELOAD_URL:
-                page.goto(CASELOAD_URL)
+                # A failed FIRST navigation (no network / VPN down / DNS can't
+                # resolve the Salesforce host) must NOT crash the worker or
+                # close the browser — otherwise a transient offline moment at
+                # launch takes the whole app down. Log it and continue to the
+                # ready state; the user can reconnect and hit ↻ Caseload.
+                try:
+                    page.goto(CASELOAD_URL)
+                except Exception as e:
+                    msg = str(e).splitlines()[0]
+                    hint = ("check your network / VPN"
+                            if "ERR_NAME_NOT_RESOLVED" in msg
+                            or "ERR_INTERNET_DISCONNECTED" in msg
+                            or "ERR_" in msg else "see the error")
+                    self.on_status(
+                        f"⚠ Couldn't open the caseload page — {hint}, then use "
+                        "↻ Caseload. The browser is open and ready. "
+                        f"({msg})")
                 # TODO: popups stuck at about:blank on fresh launch — see the
                 # README workaround (right/middle-click "Open link in new tab").
                 # The hang clears after the first Playwright-driven action.
