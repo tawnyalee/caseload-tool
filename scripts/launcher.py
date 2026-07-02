@@ -25050,6 +25050,21 @@ class App:
             print(f"Lock-on-exit failed: {e}", file=sys.stderr)
 
     def _on_close(self) -> None:
+        # If an action/process is still running (a batch fire, note save,
+        # scrape, texting, etc.), confirm before quitting — closing now would
+        # cut it off mid-flight, possibly leaving a half-done action in
+        # Salesforce/Mongoose. The busy flag drives the disabled-buttons state,
+        # so this catches exactly the in-progress cases.
+        if getattr(self, "_is_busy", False):
+            what = (getattr(self, "_busy_message", "") or "").strip()
+            detail = (f"“{what}”\n\n" if what else "")
+            if not ask_yes_no_topmost(
+                self.root, "Action in progress",
+                f"{detail}An action is still finishing. Quitting now will "
+                "interrupt it. Quit anyway?",
+                yes_label="Quit anyway", no_label="Keep working",
+            ):
+                return  # user chose to wait — leave the app open
         self._save_window_state()
         # Persist caseload column layout (widths the user drag-resized).
         try:
