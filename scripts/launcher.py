@@ -246,6 +246,24 @@ def _note_body_to_html(text: str) -> str:
     return "".join(parts) or "<p><br></p>"
 
 
+def _to_iso_date(s: str) -> str:
+    """Normalize a follow-up date string to ISO 'YYYY-MM-DD' for the Aura save
+    (the UI passes MM/DD/YYYY; already-ISO passes through). Unknown formats are
+    returned unchanged."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        y, mo, d = m.groups()
+        return f"{y}-{int(mo):02d}-{int(d):02d}"
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)   # MM/DD/YYYY
+    if m:
+        mo, d, y = m.groups()
+        return f"{y}-{int(mo):02d}-{int(d):02d}"
+    return s
+
+
 class BrowserWorker:
     SHUTDOWN = object()
 
@@ -2219,18 +2237,24 @@ class BrowserWorker:
             return {"error": "no active page"}
         if note is not None:
             method = "saveCourseFollowupNoteToSF"
+            # A note is a plain string (confirmed: no JSON wrapping needed).
             params = {"theStudentAcaCourseId": acac,
                       "theCourseFollowupNote": note}
         elif date is not None:
             method = "saveCourseFollowupDateToSF"
+            # The Apex method wants the date as a JSON-QUOTED ISO string, e.g.
+            # the literal characters "2026-07-31" (quotes included) — observed
+            # in the capture. The UI passes MM/DD/YYYY, so normalize to ISO.
+            iso = _to_iso_date(date)
             params = {"theStudentAcaCourseId": acac,
-                      "theCourseFollowupDate": date}
+                      "theCourseFollowupDate": f'"{iso}"'}
         else:
             return {"error": "nothing to save (note/date both None)"}
         descriptor = f"apex://MentorForceAuraMethods/ACTION${method}"
         message = _json.dumps({"actions": [{
             "id": "1;a", "descriptor": descriptor,
-            "callingDescriptor": "UNKNOWN", "params": params}]})
+            "callingDescriptor": "markup://c:MentoringCMUtilities",
+            "params": params}]})
         page_uri = "/lightning/n/Caseload_App_Page"
         endpoint = f"/aura?other.MentorForceAuraMethods.{method}=1"
         js = """async ([message, ctxs, token, pageUri, endpoint]) => {
@@ -3544,6 +3568,19 @@ class BrowserWorker:
         q = (query or "").strip()
         if not q:
             return {"ok": False, "error": "no student id"}
+        # Fast path: persist via the Aura API (saveCourseFollowupDateToSF) —
+        # same fix as the note (the inline edit could commit a bad value). Only
+        # for a non-empty date; clearing still uses the inline "Clear" button.
+        acac = self._grid_acacourse_id(q)
+        if (date_str or "").strip() and acac and self._aura_creds:
+            api = self._save_followup_via_api(ctx, acacourse_id=acac,
+                                              date=date_str)
+            if api.get("ok"):
+                return {"ok": True, "value": date_str,
+                        "committed_via": "API"}
+            self.on_status(
+                f"  ↳ follow-up date API save failed "
+                f"({api.get('error')}); using inline edit")
         target, table = self._open_caseload_table(ctx)
         if table is None:
             return {"ok": False, "error": "caseload table didn't load"}
