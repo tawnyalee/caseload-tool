@@ -199,6 +199,27 @@ def csv_header(path: Path) -> list[str]:
         return []
 
 
+def dropped_columns(old_header, new_header) -> list[str]:
+    """Columns present in `old_header` but missing from `new_header` (order +
+    de-duped by first appearance, blanks ignored). Used by the download
+    anti-clobber guard to detect when a fresh caseload export lost columns."""
+    new = set(new_header or [])
+    out, seen = [], set()
+    for c in (old_header or []):
+        if c and c not in new and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def critical_columns_dropped(old_header, new_header, critical) -> list[str]:
+    """Subset of `critical` that `new_header` dropped relative to `old_header`
+    — i.e. join columns (e.g. StudentID) the CSV fallback can't work without.
+    Non-empty => the guard should REJECT the new export and keep the old CSV."""
+    lost = set(dropped_columns(old_header, new_header))
+    return [c for c in (critical or []) if c in lost]
+
+
 def csv_age_human(path: Path) -> str:
     """Human-readable age string for the file at `path`, used in the
     status bar. 'just now', '12 minutes ago', '3 hours ago', etc."""

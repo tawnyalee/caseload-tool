@@ -3124,9 +3124,9 @@ class BrowserWorker:
                 try:
                     old_h = caseload_csv.csv_header(sp)
                     new_h = caseload_csv.csv_header(tmp)
-                    dropped = [c for c in old_h if c and c not in new_h]
-                    critical_dropped = [
-                        c for c in self._CSV_CRITICAL_COLUMNS if c in dropped]
+                    dropped = caseload_csv.dropped_columns(old_h, new_h)
+                    critical_dropped = caseload_csv.critical_columns_dropped(
+                        old_h, new_h, self._CSV_CRITICAL_COLUMNS)
                 except Exception:
                     dropped = []
                     critical_dropped = []
@@ -19525,7 +19525,9 @@ class App:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
                 f"Batch {scenario.name!r}: using cached caseload "
-                f"({len(rows)} rows from CSV, {age})"
+                f"({len(rows)} rows from "
+                f"{'live grid JSON' if getattr(self, '_caseload_from_json', False) else 'CSV'}"
+                f", {age})"
             )
         else:
             self._append_log(
@@ -19691,7 +19693,9 @@ class App:
             age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
             self._append_log(
                 f"Batch {scenario.name!r}: using cached caseload "
-                f"({len(rows)} rows from CSV, {age})")
+                f"({len(rows)} rows from "
+                f"{'live grid JSON' if getattr(self, '_caseload_from_json', False) else 'CSV'}"
+                f", {age})")
         else:
             self._append_log(
                 f"Batch {scenario.name!r}: no CSV cache; loading caseload from "
@@ -24376,6 +24380,9 @@ class App:
                 if not silent:
                     self._append_log(f"  ↳ grid-source skipped: {e}")
         self._caseload_rows = rows
+        # Remember whether the cache is grid-JSON-backed or plain CSV so
+        # downstream logs (e.g. batch fire) label the source honestly.
+        self._caseload_from_json = source.startswith("live grid JSON")
         self._caseload_csv_mtime = caseload_csv.csv_mtime(CASELOAD_CSV_PATH)
         self._refresh_contact_ids(rows, silent=silent)
         # Cache whether the rows carry a student-email column so the pre-batch
