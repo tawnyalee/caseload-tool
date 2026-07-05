@@ -321,6 +321,76 @@ def compute_steps(steps, row, events, fields=None, *, today=None) -> list:
     return out
 
 
+def plan_history_backfill(paths, names_for_action, note_log_rows,
+                          caseload_by_course, latest_by_key, norm_course):
+    """Pure: decide which success-path completions to backfill from action-fired
+    history (e.g. note_log). No DB / no I/O — the caller supplies the inputs.
+
+      ``paths``             ``{course_key: SuccessPath}`` (course_key = yaml key).
+      ``names_for_action``  ``callable(action_display_name) -> set(names)`` — the
+                            action's current name PLUS its rename aliases, so
+                            history filed under an old name still matches.
+      ``note_log_rows``     iterable of dicts with ``scenario`` (action name),
+                            ``student_id``, ``course_code``.
+      ``caseload_by_course````{norm_course: set(student_id)}`` — only students on
+                            the CURRENT caseload are backfilled (departed ones are
+                            left out; they're not actionable anyway).
+      ``latest_by_key``     ``{(student_id, norm_course, step_id): latest_event}``
+                            from the step_log — to skip anyone already resolved.
+      ``norm_course``       ``callable(str) -> str`` course-code normalizer.
+
+    A student is backfilled for a step when they're on the caseload for that
+    course, fired the step's action (by any of its names) for that course, and
+    have NO existing event for the step — a logged ``completed`` (already done),
+    ``dismissed`` or ``reset`` (a deliberate decision) is left untouched.
+
+    Returns ``(to_mark, stats)``:
+      ``to_mark`` ordered list of ``(student_id, course_key, norm_course, step_id,
+                  matched_action_name)`` to log ``completed``;
+      ``stats``   ``{(norm_course, step_id): {"new", "already", "skipped"}}``.
+    """
+    # Index the history once: {(matched_action_name, norm_course): set(sid)}.
+    fired: dict = {}
+    for r in note_log_rows:
+        act = str(r.get("scenario") or "").strip()
+        sid = str(r.get("student_id") or "").strip()
+        nc = norm_course(r.get("course_code") or "")
+        if act and sid and nc:
+            fired.setdefault((act, nc), set()).add(sid)
+
+    to_mark: list = []
+    stats: dict = {}
+    seen_pairs: set = set()   # (sid, nc, step_id) already queued this run
+    for course_key, path in (paths or {}).items():
+        nc = norm_course(course_key)
+        case_sids = caseload_by_course.get(nc) or set()
+        if not case_sids:
+            continue
+        for st in getattr(path, "steps", []):
+            action = (getattr(st, "action", "") or "").strip()
+            if not action:
+                continue
+            names = names_for_action(action) or {action}
+            # Union the fired sets across all of the action's names.
+            fired_sids: set = set()
+            for nm in names:
+                fired_sids |= fired.get((nm, nc), set())
+            fired_sids &= case_sids
+            s = stats.setdefault((nc, st.id),
+                                 {"new": 0, "already": 0, "skipped": 0})
+            for sid in fired_sids:
+                ev = latest_by_key.get((sid, nc, st.id))
+                if ev == EVENT_COMPLETED:
+                    s["already"] += 1
+                elif ev in (EVENT_DISMISSED, EVENT_RESET):
+                    s["skipped"] += 1
+                elif (sid, nc, st.id) not in seen_pairs:
+                    seen_pairs.add((sid, nc, st.id))
+                    s["new"] += 1
+                    to_mark.append((sid, course_key, nc, st.id, action))
+    return to_mark, stats
+
+
 def step_events(student_id: str, course_code: str, step_id: Optional[str] = None,
                 *, db_path=SUCCESS_PATH_DB) -> list:
     """Full chronological event history for a student+course (optionally one

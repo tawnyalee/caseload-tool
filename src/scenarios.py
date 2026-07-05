@@ -184,6 +184,12 @@ class ScenarioConfig:
     # each student to the first branch whose conditions match (see BranchConfig)
     # and fires that branch's content instead of the top-level email/text/notes.
     branches: list[BranchConfig] = field(default_factory=list)
+    # Former names this action was renamed from (newest-first is fine; order
+    # doesn't matter). Recorded automatically on rename so historical records
+    # filed under an old name — note_log rows, and success-path step bindings —
+    # still resolve to this action. Used by success-path completion backfill and
+    # log-on-fire matching. See launcher `_save_yaml` rename handling.
+    aliases: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -499,6 +505,8 @@ def load_scenarios(path: Path = SCENARIOS_YAML) -> dict[str, ScenarioConfig]:
             marks_step=str(cfg.get("marks_step", "") or "").strip(),
             fire_filters=list(cfg.get("fire_filters") or []),
             branches=_branches_from_list(cfg.get("branches")),
+            aliases=[str(a).strip() for a in (cfg.get("aliases") or [])
+                     if str(a).strip()],
         )
     return out
 

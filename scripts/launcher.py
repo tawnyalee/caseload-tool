@@ -10354,6 +10354,10 @@ class ScenarioEditor:
         # action.
         self._record_only = getattr(scenario, "record_only", False)
         self._marks_step = getattr(scenario, "marks_step", "")
+        # Passive round-trip: former names this action was renamed from. Not
+        # editable in the UI — maintained by _save_yaml's rename handling — but
+        # preserved through an editor re-save so it isn't stripped.
+        self._aliases = list(getattr(scenario, "aliases", []) or [])
         self.capture_handler = capture_handler  # callable(on_done)
         # Caseload-column hooks for the Filters section. `get_columns`
         # returns whatever's cached now; `refresh_columns` triggers a
@@ -11576,6 +11580,8 @@ class ScenarioEditor:
             out["record_only"] = True
         if getattr(self, "_marks_step", ""):
             out["marks_step"] = self._marks_step
+        if getattr(self, "_aliases", None):
+            out["aliases"] = list(self._aliases)
         if self.send_email_var.get():
             tpl = self.email_body_combo.get().strip()
             if "(none" in tpl:  # placeholder for empty templates folder
@@ -18901,6 +18907,7 @@ class App:
         # saved YAML order is stable.
         new_doc: dict = {"scenarios": {}}
         seen: set[str] = set()
+        renames: dict[str, str] = {}   # old on-disk name -> new (current) name
         # Diagnostic latch: surface the submit state of every note being saved
         # so the user can spot a stray-uncheck. Cheap; logged once per save.
         submit_summary: list[str] = []
@@ -18939,6 +18946,8 @@ class App:
                 )
                 return
             seen.add(out_name)
+            if out_name != name:
+                renames[name] = out_name
             new_doc["scenarios"][out_name] = serialized
             unchecked = [
                 i + 1 for i, n in enumerate((serialized or {}).get("notes", []))
@@ -18967,6 +18976,33 @@ class App:
                 }
                 for g in self.groups
             ]
+
+        # Rename handling (rename-aware identity): for every action renamed this
+        # save, record the OLD name as an alias on the action and repoint any
+        # success-path step bound to the old name. Keeps completion tracking +
+        # history matching intact across renames without a stable-id column.
+        if renames:
+            existing_names = set(new_doc["scenarios"].keys())
+            for old, new in renames.items():
+                ser = new_doc["scenarios"].get(new)
+                if ser is None:
+                    continue
+                al = [a for a in (ser.get("aliases") or []) if a]
+                # Don't alias the new name or a name that's still a live action.
+                if old != new and old not in existing_names and old not in al:
+                    al.insert(0, old)
+                if al:
+                    ser["aliases"] = al
+                elif "aliases" in ser:
+                    del ser["aliases"]
+                # Repoint success-path step bindings from the old name.
+                for path in (self.success_paths or {}).values():
+                    for st in getattr(path, "steps", []):
+                        if (getattr(st, "action", "") or "").strip() == old:
+                            st.action = new
+                self._append_log(
+                    f"  ↳ renamed {old!r} → {new!r}: recorded alias + repointed "
+                    "any success-path step.")
 
         # Persist per-course success paths alongside scenarios/groups.
         if self.success_paths:
@@ -24044,6 +24080,24 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Maintenance: backfill success-path completions from action history.
+        ctk.CTkButton(
+            dialog,
+            text="Backfill success-path completions from history…",
+            command=self._backfill_success_path_from_history,
+            **SECONDARY_BTN_KWARGS,
+        ).pack(anchor="w", padx=20, pady=(6, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("Marks a success-path step “done” for students who already "
+                  "had its action filed (per this app's note_log history), "
+                  "including under the action's former names. Fixes steps that "
+                  "read “not done” because completion tracking started late or "
+                  "the action was renamed. Previews the counts before writing."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         dialog = tab_security
         # Data-at-rest encryption: how often the app password is required.
         enc_active = (getattr(self, "_vault", None) is not None
@@ -25178,6 +25232,139 @@ class App:
                     "column": self._sp_col(nc, st.id),
                 })
         return out
+
+    def _backfill_success_path_from_history(self) -> None:
+        """Maintenance: mark success-path steps 'done' for students who already
+        had the step's action filed (per note_log) — including under the
+        action's former names (aliases). Fixes steps that read 'not done'
+        because completion tracking started late or the action was renamed.
+        Previews per-step counts; only writes on confirm."""
+        rows = self._caseload_rows or []
+        if not rows:
+            self._append_log(
+                "Backfill: load the caseload first (no rows in memory).",
+                error=True)
+            return
+        paths = self._success_paths()
+        if not paths:
+            self._append_log("Backfill: no success paths defined.", error=True)
+            return
+        note_log_rows = []
+        try:
+            with Path(NOTE_LOG_CSV).open(encoding="utf-8", newline="") as f:
+                note_log_rows = list(csv.DictReader(f))
+        except FileNotFoundError:
+            self._append_log("Backfill: no note_log history found.", error=True)
+            return
+        except Exception as e:
+            self._append_log(f"Backfill: couldn't read note_log ({e}).",
+                             error=True)
+            return
+        caseload_by_course: dict = {}
+        for r in rows:
+            nc = self._norm_course(r.get("CourseCode") or "")
+            sid = (r.get("StudentID") or "").strip()
+            if nc and sid:
+                caseload_by_course.setdefault(nc, set()).add(sid)
+        latest_by_key: dict = {}
+        try:
+            for (sid, course), steps in (
+                    success_path_store.all_step_status().items()):
+                for step_id, ev in steps.items():
+                    latest_by_key[(sid, course, step_id)] = ev
+        except Exception:
+            pass
+
+        def names_for(action: str) -> set:
+            names = {action}
+            sc = self.scenarios.get(action)
+            if sc is not None:
+                names |= set(getattr(sc, "aliases", []) or [])
+            return names
+
+        to_mark, stats = success_path_store.plan_history_backfill(
+            paths, names_for, note_log_rows, caseload_by_course,
+            latest_by_key, self._norm_course)
+        if not to_mark:
+            self._append_log(
+                "Backfill: nothing to add — every already-fired step is already "
+                "recorded (or was deliberately reset/skipped).")
+            return
+        if not self._confirm_backfill(stats, len(to_mark)):
+            self._append_log("Backfill: cancelled.")
+            return
+        done = 0
+        for sid, course_key, nc, step_id, act in to_mark:
+            if success_path_store.log_step(
+                    sid, nc, step_id, success_path_store.EVENT_COMPLETED,
+                    source=f"backfill:{act}"):
+                done += 1
+        self._append_log(
+            f"✓ Backfilled {done} success-path completion(s) from history "
+            "(note_log + aliases).", success=True)
+        # Re-derive the sp:* filter columns so the change shows immediately.
+        try:
+            self._inject_success_path_columns(self._caseload_rows or [])
+        except Exception:
+            pass
+
+    def _confirm_backfill(self, stats: dict, total: int) -> bool:
+        """Preview dialog for the success-path history backfill. Lists per-step
+        new / already / skipped counts; returns True to apply."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Backfill success-path completions")
+        dialog.transient(self.root)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.geometry("520x460")
+        result = {"ok": False}
+        ctk.CTkLabel(
+            dialog,
+            text=f"Mark {total} success-path completion(s) from history?",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            dialog,
+            text="Based on actions already filed (note_log), including an "
+                 "action's former names. 'already' = recorded done; 'skipped' "
+                 "= you reset/dismissed it (left alone).",
+            wraplength=480, justify="left", text_color=("gray35", "gray70"),
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(0, 6))
+        box = ctk.CTkScrollableFrame(dialog)
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        mono = ctk.CTkFont(family="Consolas", size=11)
+        mono_b = ctk.CTkFont(family="Consolas", size=11, weight="bold")
+        ctk.CTkLabel(
+            box, text=f"{'course · step':28}{'new':>6}{'already':>9}{'skipped':>9}",
+            font=mono_b, anchor="w").pack(fill="x", padx=6)
+        for (nc, step_id), s in sorted(stats.items()):
+            if not (s["new"] or s["already"] or s["skipped"]):
+                continue
+            line = (f"{nc + ' · ' + step_id:28}{s['new']:>6}"
+                    f"{s['already']:>9}{s['skipped']:>9}")
+            color = ("gray10", "gray90") if s["new"] else ("gray45", "gray60")
+            ctk.CTkLabel(box, text=line, font=mono, text_color=color,
+                         anchor="w").pack(fill="x", padx=6)
+
+        def _close(v: bool) -> None:
+            result["ok"] = v
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkButton(btns, text=f"Apply backfill ({total})",
+                      command=lambda: _close(True)).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Cancel", command=lambda: _close(False),
+                      **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
+        dialog.bind("<Escape>", lambda _e: _close(False))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
+        dialog.lift()
+        dialog.focus_force()
+        self.root.wait_window(dialog)
+        return result["ok"]
 
     def _refresh_caseload_columns_for_editor(self) -> list[str]:
         """↻ Refresh columns button in the filter editor: forces a
