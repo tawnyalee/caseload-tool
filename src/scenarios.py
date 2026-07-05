@@ -146,6 +146,9 @@ class BranchConfig:
     email: Optional[EmailConfig] = None
     text: Optional[TextConfig] = None
     notes: list[NoteData] = field(default_factory=list)
+    # Optional tab color (hex string) shown in the editor's branch strip. Purely
+    # cosmetic — no effect on fire routing. Empty = default blue/gray scheme.
+    color: str = ""
 
 
 @dataclass
@@ -277,6 +280,7 @@ def _branches_from_list(items) -> list["BranchConfig"]:
             email=_email_from_dict(d.get("email")),
             text=_text_from_dict(d.get("text")),
             notes=[_note_from_dict(n) for n in (d.get("notes") or [])],
+            color=str(d.get("color", "") or "").strip(),
         ))
     return out
 

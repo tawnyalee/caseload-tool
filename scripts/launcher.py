@@ -60,7 +60,7 @@ from src.note_form import NoteData
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, load_groups, load_scenarios,
-    load_success_paths, run_scenario, success_path_to_dict,
+    load_success_paths, run_scenario, success_path_to_dict, _note_from_dict,
 )
 from src.student_lookup import (
     click_caseload_row,
@@ -9965,6 +9965,13 @@ _OPT_INDENT = 8
 # add-a-thing actions stand out from other controls. (light, dark) tuples.
 _ADD_BTN_BLUE = ("#2f6fed", "#2f6fed")
 _ADD_BTN_BLUE_HOVER = ("#2558c8", "#2558c8")
+# Branch tab-strip colors: the active tab is the same vivid blue as the
+# "+ Add" affordances; inactive tabs are a muted slate so the selected
+# branch reads clearly.
+_BRANCH_ACTIVE = ("#2f6fed", "#2f6fed")
+_BRANCH_ACTIVE_HOVER = ("#2558c8", "#2558c8")
+_BRANCH_INACTIVE = ("gray75", "gray32")
+_BRANCH_INACTIVE_HOVER = ("gray68", "gray38")
 
 
 class NoteEditor:
@@ -10327,6 +10334,65 @@ class NoteEditor:
 
 
 # ============================================================
+# Branch (BranchConfig) <-> plain-dict converters. The editor stores each
+# branch as a serialized dict in the SAME shape the top-level channels use
+# (so a branch round-trips straight to YAML), and swaps that dict in/out of
+# the shared email/text/notes widgets as the user switches branch tabs.
+# ============================================================
+
+def _email_cfg_to_dict(e: Optional[EmailConfig]) -> Optional[dict]:
+    if e is None:
+        return None
+    return {
+        "subject": e.subject, "body_html_file": e.body_html_file, "to": e.to,
+        "signature_file": e.signature_file,
+        "inline_images": list(e.inline_images or []),
+        "cc_pm": e.cc_pm, "pick_template": e.pick_template,
+        "font_family": e.font_family, "font_size": e.font_size,
+    }
+
+
+def _text_cfg_to_dict(t) -> Optional[dict]:
+    if t is None:
+        return None
+    return {
+        "body": t.body, "body_file": t.body_file, "schedule": True,
+        "window_start_hour": t.window_start_hour,
+        "window_end_hour": t.window_end_hour,
+        "inbox_label": t.inbox_label, "commit": t.commit,
+    }
+
+
+def _note_cfg_to_dict(n) -> dict:
+    d = {
+        "interaction_format": n.interaction_format,
+        "interaction_type": n.interaction_type,
+        "body": n.body,
+        "academic_activities": list(n.academic_activities or []),
+        "submit": n.submit,
+        "append_clipboard": n.append_clipboard,
+        "enter_additional_text": n.enter_additional_text,
+    }
+    if getattr(n, "course_code_override", ""):
+        d["course_code_override"] = n.course_code_override
+    if n.subject:
+        d["subject"] = n.subject
+    return d
+
+
+def _branch_cfg_to_dict(bc) -> dict:
+    """One BranchConfig -> the editor's in-memory branch dict."""
+    return {
+        "title": bc.title or "",
+        "conditions": list(bc.conditions or []),
+        "email": _email_cfg_to_dict(bc.email),
+        "text": _text_cfg_to_dict(bc.text),
+        "notes": [_note_cfg_to_dict(n) for n in (bc.notes or [])],
+        "color": getattr(bc, "color", "") or "",
+    }
+
+
+# ============================================================
 # Scenario editor — one per scenario, swapped into the editor pane's
 # shared content frame by the stacked group tab-strips.
 # ============================================================
@@ -10341,11 +10407,20 @@ class ScenarioEditor:
         get_groups: Optional[Callable[[], list[str]]] = None,
         get_scenario_group: Optional[Callable[[], str]] = None,
         on_group_change: Optional[Callable[[str, str], None]] = None,
+        branching_enabled: bool = False,
         get_view_columns: Optional[Callable[[], list[str]]] = None,
         get_sp_options: Optional[Callable[[], list]] = None,
     ):
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
+        # Action branching. `branches` holds one dict per branch (same shape as
+        # the top-level channels). `_active_branch` is the index currently shown
+        # in the shared email/text/notes widgets, or None when this action isn't
+        # branched. `_branching_enabled` gates only the "+ branch" create button
+        # (an already-branched action stays editable regardless).
+        self.branches: list[dict] = []
+        self._active_branch: Optional[int] = None
+        self._branching_enabled = bool(branching_enabled)
         # `email` is now fully exposed via the editor; `batch.preview`
         # still rides as a passive round-trip field for now.
         self._batch_preview = scenario.batch.preview if scenario.batch else True
@@ -10424,6 +10499,20 @@ class ScenarioEditor:
         ctk.CTkButton(
             hotkey_row, text="Press to set", width=110, command=self._start_capture,
         ).pack(side="left", padx=(8, 0))
+
+        # ===== Action branching =====
+        # A "+ branch" button (shown only when the enable_branching setting is
+        # on) turns this action into a branched one: conditional sub-actions,
+        # each with its own conditions + email/text/notes. Once branches exist,
+        # a tab strip [ branch 1 | branch 2 | + branch ] renders here and the
+        # email/text/notes widgets below edit the SELECTED branch — their
+        # contents are saved/restored as you switch tabs (see _switch_branch).
+        # Container is rebuilt by _render_branch_area().
+        row += 1
+        self._branch_area_row = row
+        self._branch_area = ctk.CTkFrame(self.frame, fg_color="transparent")
+        self._branch_area.grid(row=row, column=0, sticky="ew", padx=8, pady=(2, 4))
+        self._branch_area.grid_columnconfigure(0, weight=1)
 
         # Scenario variables — advanced, hidden by default. When on, a
         # section appears below the toggle for defining {{var_name}}
@@ -10799,7 +10888,34 @@ class ScenarioEditor:
     def _sync_filter_modes(self) -> None:
         """Show the shared Filters section when EITHER batch or single-filter is
         on, retitle it for the mode, and apply batch-only side effects (hide
-        find-first, block panel action)."""
+        find-first, block panel action).
+
+        In BRANCH mode the same Filters section becomes the active branch's
+        conditions editor: the batch/single toggles are hidden (branches carry
+        their own conditions), and the section is always shown + relabeled."""
+        if self._active_branch is not None:
+            # Branch mode: hide the batch/single toggles, repurpose Filters as
+            # the selected branch's conditions.
+            self.batch_mode_checkbox.grid_remove()
+            self.filter_single_checkbox.grid_remove()
+            self._batch_section.grid(
+                row=self._batch_section_row, column=0,
+                sticky="ew", padx=8, pady=(0, 6))
+            self._filters_label.configure(
+                text="Branch conditions — fire this branch for students who "
+                     "match ALL of these (leave empty = catch-all; put it last)")
+            # find-first stays meaningful (find one student, then route them);
+            # panel action stays allowed.
+            self.find_first_checkbox.grid(
+                row=self._find_first_row, column=0,
+                sticky="w", padx=8, pady=(0, 8))
+            self.panel_action_checkbox.configure(state="normal")
+            self.panel_action_hint.grid_remove()
+            return
+        # Non-branch: make sure the toggles are visible again (a prior branch
+        # session may have removed them).
+        self.batch_mode_checkbox.grid()
+        self.filter_single_checkbox.grid()
         batch = self.batch_mode_var.get()
         single = self.filter_single_var.get()
         if batch or single:
@@ -11469,6 +11585,498 @@ class ScenarioEditor:
             e.set_index(i)
         self._refresh_notes_visibility()
 
+    # ==================================================================
+    # Action branching — channel read/write helpers + branch operations.
+    # The email/text/notes/conditions widgets are shared; in branch mode
+    # their contents represent the ACTIVE branch and are saved/restored as
+    # the user switches tabs.
+    # ==================================================================
+
+    def _read_email_dict(self) -> Optional[dict]:
+        """Current email widgets -> a serialized email dict, or None when the
+        Email part isn't added. Single source of truth for serialize() + the
+        active-branch snapshot."""
+        if not self.send_email_var.get():
+            return None
+        tpl = self.email_body_combo.get().strip()
+        if "(none" in tpl:  # placeholder for empty templates folder
+            tpl = ""
+        inline_images = [
+            s.strip() for s in self.email_images_entry.get().split(",")
+            if s.strip()
+        ]
+        d = {
+            "subject": self.email_subject_entry.get(),
+            "body_html_file": tpl,
+            "to": self.email_to_entry.get(),
+            "signature_file": self.email_signature_combo.get(),
+            "inline_images": inline_images,
+            "cc_pm": self.email_cc_pm_var.get(),
+        }
+        if self.email_pick_template_var.get():
+            d["pick_template"] = True
+        ff = self.email_font_family_combo.get().strip()
+        if ff and ff != EMAIL_FONT_DEFAULT_LABEL:
+            d["font_family"] = ff
+        try:
+            fs = int(self.email_font_size_combo.get().strip() or 0)
+        except ValueError:
+            fs = 0
+        if fs > 0:
+            d["font_size"] = fs
+        return d
+
+    def _apply_email_dict(self, d: Optional[dict]) -> None:
+        """Populate the email widgets from a serialized email dict (or clear
+        them + collapse the section when None)."""
+        self.send_email_var.set(d is not None)
+        if d is not None:
+            self.email_subject_entry.delete(0, "end")
+            self.email_subject_entry.insert(0, d.get("subject", ""))
+            self.email_body_combo.set(d.get("body_html_file", "") or "")
+            self.email_to_entry.delete(0, "end")
+            self.email_to_entry.insert(0, d.get("to", ""))
+            self.email_signature_combo.set(d.get("signature_file", "") or "")
+            self.email_images_entry.delete(0, "end")
+            self.email_images_entry.insert(
+                0, ", ".join(d.get("inline_images") or []))
+            self.email_cc_pm_var.set(bool(d.get("cc_pm")))
+            self.email_pick_template_var.set(bool(d.get("pick_template")))
+            ff = (d.get("font_family") or "").strip()
+            self.email_font_family_combo.set(ff if ff else EMAIL_FONT_DEFAULT_LABEL)
+            fs = d.get("font_size") or 0
+            self.email_font_size_combo.set(str(fs) if fs > 0 else "")
+        else:
+            self.email_subject_entry.delete(0, "end")
+            self.email_body_combo.set("")
+            self.email_to_entry.delete(0, "end")
+            self.email_signature_combo.set("")
+            self.email_images_entry.delete(0, "end")
+            self.email_cc_pm_var.set(False)
+            self.email_pick_template_var.set(False)
+            self.email_font_family_combo.set(EMAIL_FONT_DEFAULT_LABEL)
+            self.email_font_size_combo.set("")
+        self._on_send_email_toggled()
+
+    def _read_text_dict(self) -> Optional[dict]:
+        """Current text widgets -> a serialized text dict, or None when the
+        Text part isn't added."""
+        if not self.send_text_var.get():
+            return None
+        return {
+            "body": self.text_body_box.get("1.0", "end-1c"),
+            "body_file": getattr(self, "_text_body_file", "") or "",
+            "schedule": True,  # texts are always scheduled
+            "window_start_hour": self._label_to_hour(
+                self.text_window_start_combo.get()),
+            "window_end_hour": self._label_to_hour(
+                self.text_window_end_combo.get()),
+            "inbox_label": self.text_inbox_entry.get().strip(),
+            "commit": bool(self.text_commit_var.get()),
+        }
+
+    def _apply_text_dict(self, d: Optional[dict]) -> None:
+        """Populate the text widgets from a serialized text dict (or clear +
+        collapse the section when None)."""
+        self.send_text_var.set(d is not None)
+        self._text_body_file = (d.get("body_file") if d else "") or ""
+        self.text_body_box.delete("1.0", "end")
+        if d is not None:
+            self.text_body_box.insert("1.0", d.get("body", "") or "")
+            self.text_schedule_var.set(True)
+            try:
+                ws = int(d.get("window_start_hour", 10) or 10)
+            except (TypeError, ValueError):
+                ws = 10
+            try:
+                we = int(d.get("window_end_hour", 16) or 16)
+            except (TypeError, ValueError):
+                we = 16
+            self.text_window_start_combo.set(self._hour_to_label(ws))
+            self.text_window_end_combo.set(self._hour_to_label(we))
+            self.text_inbox_entry.delete(0, "end")
+            self.text_inbox_entry.insert(0, d.get("inbox_label", "") or "")
+            self.text_commit_var.set(bool(d.get("commit")))
+        else:
+            self.text_schedule_var.set(True)
+            self.text_window_start_combo.set("10 AM")
+            self.text_window_end_combo.set("4 PM")
+            self.text_inbox_entry.delete(0, "end")
+            self.text_commit_var.set(False)
+        self._on_send_text_toggled()
+
+    def _read_notes(self) -> list:
+        return [ne.serialize() for ne in self.note_editors]
+
+    def _apply_notes(self, notes: Optional[list]) -> None:
+        """Rebuild the note editors from a list of serialized note dicts."""
+        for ne in list(self.note_editors):
+            try:
+                ne.frame.destroy()
+            except Exception:
+                pass
+        self.note_editors = []
+        for nd in (notes or []):
+            try:
+                self._add_note_editor(_note_from_dict(nd))
+            except Exception:
+                pass
+        self._refresh_notes_visibility()
+
+    def _read_conditions(self) -> list:
+        return [r.serialize() for r in self.filter_rows]
+
+    def _apply_conditions(self, conds: Optional[list]) -> None:
+        for r in list(self.filter_rows):
+            try:
+                r.frame.destroy()
+            except Exception:
+                pass
+        self.filter_rows = []
+        for c in (conds or []):
+            self._add_filter_row(c)
+
+    # ----- branch snapshot / restore -----
+
+    def _save_active_branch(self) -> None:
+        """Snapshot the shared widgets into the active branch's dict."""
+        if self._active_branch is None:
+            return
+        b = self.branches[self._active_branch]
+        b["conditions"] = self._read_conditions()
+        b["email"] = self._read_email_dict()
+        b["text"] = self._read_text_dict()
+        b["notes"] = self._read_notes()
+
+    def _load_branch(self, idx: int) -> None:
+        """Make branch `idx` the active one and load it into the widgets."""
+        b = self.branches[idx]
+        self._active_branch = idx
+        self._apply_conditions(b.get("conditions"))
+        self._apply_email_dict(b.get("email"))
+        self._apply_text_dict(b.get("text"))
+        self._apply_notes(b.get("notes"))
+        self._sync_filter_modes()
+        self._render_branch_area()
+
+    def _switch_branch(self, idx: int) -> None:
+        if idx == self._active_branch:
+            return
+        self._save_active_branch()
+        self._load_branch(idx)
+
+    # ----- branch create / delete / enable -----
+
+    def _enable_branching(self) -> None:
+        """Turn a plain action into a branched one: the current email/text/
+        notes (and any single-action conditions) become the first branch."""
+        title = self._prompt_branch(copy_titles=None)
+        if title is None:
+            return
+        seed = {
+            "title": title[0] or "branch 1",
+            "conditions": (self._read_conditions()
+                           if self.filter_single_var.get() else []),
+            "email": self._read_email_dict(),
+            "text": self._read_text_dict(),
+            "notes": self._read_notes(),
+        }
+        # Leaving batch/single behind — branches gate per-branch instead.
+        self.batch_mode_var.set(False)
+        self.filter_single_var.set(False)
+        self.branches = [seed]
+        self._load_branch(0)
+
+    def _add_branch(self) -> None:
+        self._save_active_branch()
+        res = self._prompt_branch(copy_titles=[b["title"] for b in self.branches])
+        if res is None:
+            return
+        title, copy_idx = res
+        if copy_idx is not None:
+            import copy
+            nb = copy.deepcopy(self.branches[copy_idx])
+            nb["title"] = title or f"branch {len(self.branches) + 1}"
+        else:
+            nb = {"title": title or f"branch {len(self.branches) + 1}",
+                  "conditions": [], "email": None, "text": None, "notes": []}
+        self.branches.append(nb)
+        self._load_branch(len(self.branches) - 1)
+
+    def _delete_active_branch(self) -> None:
+        if self._active_branch is not None:
+            self._delete_branch_at(self._active_branch)
+
+    def _delete_branch_at(self, idx: int) -> None:
+        """Delete branch `idx` (which may or may not be the active tab)."""
+        if not (0 <= idx < len(self.branches)):
+            return
+        title = self.branches[idx].get("title") or f"branch {idx + 1}"
+        last = len(self.branches) <= 1
+        msg = (f"Delete branch “{title}”?"
+               + ("\n\nThis is the only branch — the action goes back to a "
+                  "plain (non-branched) action with empty email/text/notes."
+                  if last else ""))
+        if not ask_yes_no_topmost(
+            self.frame.winfo_toplevel(), "Delete branch?", msg,
+            yes_label="Delete branch", no_label="Keep",
+        ):
+            return
+        active = self._active_branch
+        # Deleting a NON-active branch: preserve the active tab's on-screen
+        # edits by snapshotting them before the list mutates.
+        if idx != active:
+            self._save_active_branch()
+        del self.branches[idx]
+        if not self.branches:
+            # Exit branch mode → plain action with cleared channels.
+            self._active_branch = None
+            self._apply_conditions([])
+            self._apply_email_dict(None)
+            self._apply_text_dict(None)
+            self._apply_notes([])
+            self._sync_filter_modes()
+            self._render_branch_area()
+            return
+        if idx == active:
+            # The shown branch went away — load a surviving neighbor.
+            self._active_branch = None
+            self._load_branch(min(idx, len(self.branches) - 1))
+        else:
+            # Active tab survives; its index shifts down if it sat after idx.
+            if active > idx:
+                self._active_branch = active - 1
+            self._render_branch_area()
+
+    # ----- right-click tab menu: rename / duplicate / color -----
+
+    def _branch_tab_menu(self, idx: int, event) -> None:
+        if not (0 <= idx < len(self.branches)):
+            return
+        menu = tk.Menu(self._branch_area, tearoff=0)
+        menu.add_command(label="✎  Rename…",
+                         command=lambda: self._rename_branch(idx))
+        menu.add_command(label="⧉  Duplicate",
+                         command=lambda: self._copy_branch(idx))
+        menu.add_command(label="🎨  Set color…",
+                         command=lambda: self._set_branch_color(idx))
+        if (self.branches[idx].get("color") or "").strip():
+            menu.add_command(label="⌫  Clear color",
+                             command=lambda: self._set_branch_color(idx, clear=True))
+        menu.add_separator()
+        menu.add_command(label="🗑  Delete branch",
+                         command=lambda: self._delete_branch_at(idx))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _rename_branch(self, idx: int) -> None:
+        if not (0 <= idx < len(self.branches)):
+            return
+        cur = self.branches[idx].get("title") or ""
+        res = self._prompt_branch(copy_titles=None, prefill=cur,
+                                  ok_label="Rename")
+        if res is None:
+            return
+        # Keep the active tab's live edits in sync before the re-render.
+        self._save_active_branch()
+        self.branches[idx]["title"] = res[0] or cur or f"branch {idx + 1}"
+        self._render_branch_area()
+
+    def _copy_branch(self, idx: int) -> None:
+        if not (0 <= idx < len(self.branches)):
+            return
+        self._save_active_branch()
+        import copy
+        nb = copy.deepcopy(self.branches[idx])
+        base = nb.get("title") or f"branch {idx + 1}"
+        nb["title"] = f"{base} copy"
+        self.branches.insert(idx + 1, nb)
+        # Show the new duplicate.
+        self._active_branch = None
+        self._load_branch(idx + 1)
+
+    def _set_branch_color(self, idx: int, clear: bool = False) -> None:
+        if not (0 <= idx < len(self.branches)):
+            return
+        self._save_active_branch()
+        if clear:
+            self.branches[idx]["color"] = ""
+            self._render_branch_area()
+            return
+        from tkinter import colorchooser
+        cur = (self.branches[idx].get("color") or "").strip() or "#2f6fed"
+        res = colorchooser.askcolor(
+            color=cur, title="Branch tab color",
+            parent=self.frame.winfo_toplevel())
+        if res and res[1]:
+            self.branches[idx]["color"] = res[1]
+            self._render_branch_area()
+
+    def _prompt_branch(self, copy_titles: Optional[list], prefill: str = "",
+                       ok_label: str = "Add branch"):
+        """Modal asking for a branch title (+ optional 'copy from' when
+        `copy_titles` is a non-empty list of existing branch names). Returns
+        (title, copy_idx_or_None), or None if cancelled. When `copy_titles` is
+        None the dialog omits the copy row (used for the first branch + rename).
+        `prefill` seeds the name entry; `ok_label` names the confirm button."""
+        parent = self.frame.winfo_toplevel()
+        dialog = ctk.CTkToplevel(parent)
+        dialog.title("Branch name")
+        dialog.transient(parent)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        result = {"value": None}
+
+        ctk.CTkLabel(
+            dialog, text="Branch name", font=ctk.CTkFont(weight="bold"),
+        ).pack(padx=16, pady=(14, 2), anchor="w")
+        name_entry = ctk.CTkEntry(dialog, width=280,
+                                  placeholder_text="e.g. C769 welcome")
+        if prefill:
+            name_entry.insert(0, prefill)
+        name_entry.pack(padx=16, pady=(0, 8), anchor="w")
+
+        copy_var = None
+        copy_labels = []
+        _BLANK = "(blank branch)"
+        if copy_titles:
+            copy_labels = [_BLANK] + [
+                (t or f"branch {i + 1}") for i, t in enumerate(copy_titles)
+            ]
+            ctk.CTkLabel(
+                dialog, text="Copy content from",
+            ).pack(padx=16, pady=(2, 2), anchor="w")
+            copy_var = ctk.StringVar(value=_BLANK)
+            ctk.CTkOptionMenu(
+                dialog, values=copy_labels, variable=copy_var, width=280,
+            ).pack(padx=16, pady=(0, 8), anchor="w")
+
+        def _ok() -> None:
+            title = name_entry.get().strip()
+            copy_idx = None
+            if copy_var is not None:
+                sel = copy_var.get()
+                if sel != _BLANK and sel in copy_labels:
+                    copy_idx = copy_labels.index(sel) - 1
+            result["value"] = (title, copy_idx)
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        def _cancel() -> None:
+            try: dialog.grab_release()
+            except Exception: pass
+            try: dialog.destroy()
+            except Exception: pass
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(4, 14))
+        ctk.CTkButton(btn_row, text=ok_label, width=110,
+                      command=_ok).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Cancel", width=90, command=_cancel,
+                      **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
+        dialog.bind("<Return>", lambda _e: _ok())
+        dialog.bind("<Escape>", lambda _e: _cancel())
+        name_entry.focus_set()
+        for delay in (0, 60, 160):
+            dialog.after(delay, lambda: (dialog.focus_force(),
+                                         name_entry.focus_set()))
+        parent.wait_window(dialog)
+        res = result["value"]
+        if res is None:
+            return None
+        # First-branch flow (copy_titles=None) only wants the title back, but
+        # callers all unpack (title, idx); normalize to that shape.
+        return res
+
+    # ----- branch strip rendering -----
+
+    def _render_branch_area(self) -> None:
+        """(Re)build the branch area below the Hotkey field. Non-branch: a lone
+        '+ branch' button (only when enable_branching is on). Branch mode: the
+        tab strip [ b1 | b2 | + branch ] + a delete-branch affordance."""
+        for w in self._branch_area.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        if self._active_branch is None:
+            if self._branching_enabled:
+                self._branch_area.grid()
+                ctk.CTkButton(
+                    self._branch_area, text="+ branch", width=110, height=30,
+                    fg_color=_BRANCH_ACTIVE, hover_color=_BRANCH_ACTIVE_HOVER,
+                    command=self._enable_branching,
+                ).grid(row=0, column=0, sticky="w")
+                ctk.CTkLabel(
+                    self._branch_area,
+                    text="Split this action into per-condition branches "
+                         "(e.g. one “welcome” that sends each student their "
+                         "own course's email/text).",
+                    font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+                    wraplength=440, justify="left", anchor="w",
+                ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+            else:
+                self._branch_area.grid_remove()
+            return
+        # Branch mode: tab strip.
+        self._branch_area.grid()
+        strip = ctk.CTkFrame(self._branch_area, fg_color="transparent")
+        strip.grid(row=0, column=0, sticky="w")
+        for i, b in enumerate(self.branches):
+            active = (i == self._active_branch)
+            color = (b.get("color") or "").strip()
+            if color:
+                # Custom color: use it as the tab background; mark the active
+                # tab with a contrasting border (the blue/gray scheme can't
+                # signal active once a bespoke color owns the fill).
+                fg, hover = color, _hover_color_for(color)
+                txt = _text_color_for_bg(color)
+                border_w = 3 if active else 0
+            else:
+                fg = _BRANCH_ACTIVE if active else _BRANCH_INACTIVE
+                hover = _BRANCH_ACTIVE_HOVER if active else _BRANCH_INACTIVE_HOVER
+                txt = "white" if active else ("gray10", "gray90")
+                border_w = 0
+            btn = ctk.CTkButton(
+                strip, text=(b.get("title") or f"branch {i + 1}"),
+                height=30, width=0,
+                fg_color=fg, hover_color=hover, text_color=txt,
+                border_width=border_w, border_color=("#1a1a1a", "#f0f0f0"),
+                font=ctk.CTkFont(weight="bold" if active else "normal"),
+                command=lambda i=i: self._switch_branch(i),
+            )
+            btn.pack(side="left", padx=(0, 4))
+            # Right-click a tab → rename / duplicate / color / delete.
+            btn.bind("<Button-3>",
+                     lambda e, i=i: self._branch_tab_menu(i, e))
+        ctk.CTkButton(
+            strip, text="+ branch", height=30, width=90,
+            fg_color=("gray70", "gray30"), hover_color=("gray62", "gray38"),
+            text_color=("gray10", "gray90"), command=self._add_branch,
+        ).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(
+            self._branch_area,
+            text="Tip: right-click a branch tab to rename, duplicate, or color it.",
+            font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"),
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+        ctk.CTkButton(
+            self._branch_area, text="✕ Delete this branch", height=26, width=150,
+            fg_color=("gray80", "gray30"), hover_color=("#e74c3c", "#c0392b"),
+            text_color=("gray10", "gray90"), command=self._delete_active_branch,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+    def apply_branching_visibility(self, enabled: bool) -> None:
+        """Called when the enable_branching setting changes — toggles the lone
+        '+ branch' create button. An already-branched action keeps its tabs
+        regardless (only creating NEW branches is gated)."""
+        self._branching_enabled = bool(enabled)
+        self._render_branch_area()
+
     def load(self, scenario: ScenarioConfig) -> None:
         self.name_entry.delete(0, "end")
         self.name_entry.insert(0, scenario.name)
@@ -11562,14 +12170,51 @@ class ScenarioEditor:
         for ne, note in zip(self.note_editors, scenario.notes):
             ne.load(note)
         self._refresh_notes_visibility()
+        # Action branching. When the scenario defines branches, enter branch
+        # mode: the top-level channels loaded above are ignored (a branched
+        # action's channels live in its branches) and branch 0 is shown. The
+        # widgets get overwritten by _load_branch, which is fine. Otherwise stay
+        # in plain mode and (un)show the "+ branch" create button.
+        branches = list(getattr(scenario, "branches", None) or [])
+        if branches:
+            self.batch_mode_var.set(False)
+            self.filter_single_var.set(False)
+            self.branches = [_branch_cfg_to_dict(bc) for bc in branches]
+            self._active_branch = None  # cleared so _load_branch won't snapshot
+            self._load_branch(0)
+        else:
+            self.branches = []
+            self._active_branch = None
+            self._render_branch_area()
+
+    @staticmethod
+    def _clean_branch(b: dict) -> dict:
+        """A branch dict trimmed for YAML — title always, other keys only when
+        non-empty (mirrors how the top-level channels stay out of the file when
+        unused)."""
+        out = {"title": b.get("title", "") or ""}
+        if b.get("conditions"):
+            out["conditions"] = b["conditions"]
+        if b.get("email"):
+            out["email"] = b["email"]
+        if b.get("text"):
+            out["text"] = b["text"]
+        if b.get("notes"):
+            out["notes"] = b["notes"]
+        if (b.get("color") or "").strip():
+            out["color"] = b["color"].strip()
+        return out
 
     def serialize(self) -> dict:
+        branch_mode = self._active_branch is not None
         out: dict = {
             "hotkey": self.hotkey_entry.get().strip(),
             "close_tab_after": self.close_tab_after,
             "find_first": self.find_first_var.get(),
-            "notes": [ne.serialize() for ne in self.note_editors],
         }
+        # A branched action's channels live in its branches, not at top level.
+        if not branch_mode:
+            out["notes"] = [ne.serialize() for ne in self.note_editors]
         # Panel action only makes sense for non-batch scenarios; the
         # toggle is force-disabled in batch mode, so this is already False
         # there. Only written when True to keep the YAML uncluttered.
@@ -11582,45 +12227,7 @@ class ScenarioEditor:
             out["marks_step"] = self._marks_step
         if getattr(self, "_aliases", None):
             out["aliases"] = list(self._aliases)
-        if self.send_email_var.get():
-            tpl = self.email_body_combo.get().strip()
-            if "(none" in tpl:  # placeholder for empty templates folder
-                tpl = ""
-            inline_csv = self.email_images_entry.get().strip()
-            inline_images = [
-                s.strip() for s in inline_csv.split(",") if s.strip()
-            ]
-            out["email"] = {
-                "subject": self.email_subject_entry.get(),
-                "body_html_file": tpl,
-                "to": self.email_to_entry.get(),
-                "signature_file": self.email_signature_combo.get(),
-                "inline_images": inline_images,
-                "cc_pm": self.email_cc_pm_var.get(),
-            }
-            if self.email_pick_template_var.get():
-                out["email"]["pick_template"] = True
-            # Only write font fields when the user has set them away
-            # from the "Outlook default" sentinel — keeps the YAML
-            # uncluttered for scenarios that don't override the font.
-            ff = self.email_font_family_combo.get().strip()
-            if ff and ff != EMAIL_FONT_DEFAULT_LABEL:
-                out["email"]["font_family"] = ff
-            try:
-                fs = int(self.email_font_size_combo.get().strip() or 0)
-            except ValueError:
-                fs = 0
-            if fs > 0:
-                out["email"]["font_size"] = fs
-        if self.batch_mode_var.get():
-            out["batch"] = {
-                "filters": [r.serialize() for r in self.filter_rows],
-                "preview": self._batch_preview,
-            }
-        elif self.filter_single_var.get():
-            ff = [r.serialize() for r in self.filter_rows]
-            if ff:
-                out["fire_filters"] = ff
+        # Scenario variables apply to every branch, so they stay top-level.
         if self.use_vars_var.get():
             prompts_out = [r.serialize() for r in self.prompt_rows]
             # Drop rows with empty `var` — they're not addressable from
@@ -11628,19 +12235,27 @@ class ScenarioEditor:
             prompts_out = [p for p in prompts_out if p.get("var")]
             if prompts_out:
                 out["prompts"] = prompts_out
-        # Text (Mongoose) section.
-        if self.send_text_var.get():
-            out["text"] = {
-                "body": self.text_body_box.get("1.0", "end-1c"),
-                "body_file": getattr(self, "_text_body_file", "") or "",
-                "schedule": True,  # texts are always scheduled
-                "window_start_hour": self._label_to_hour(
-                    self.text_window_start_combo.get()),
-                "window_end_hour": self._label_to_hour(
-                    self.text_window_end_combo.get()),
-                "inbox_label": self.text_inbox_entry.get().strip(),
-                "commit": bool(self.text_commit_var.get()),
+        # Branch mode: snapshot the on-screen branch, emit `branches:`, and skip
+        # the top-level email/text/notes/batch/fire_filters entirely.
+        if branch_mode:
+            self._save_active_branch()
+            out["branches"] = [self._clean_branch(b) for b in self.branches]
+            return out
+        em = self._read_email_dict()
+        if em is not None:
+            out["email"] = em
+        if self.batch_mode_var.get():
+            out["batch"] = {
+                "filters": self._read_conditions(),
+                "preview": self._batch_preview,
             }
+        elif self.filter_single_var.get():
+            ff = self._read_conditions()
+            if ff:
+                out["fire_filters"] = ff
+        tx = self._read_text_dict()
+        if tx is not None:
+            out["text"] = tx
         return out
 
 
@@ -17780,6 +18395,8 @@ class App:
             get_groups=lambda: [g.name for g in self.groups],
             get_scenario_group=(lambda n=name: self._group_of_scenario(n)),
             on_group_change=self._set_scenario_group,
+            branching_enabled=bool(
+                getattr(getattr(self, "settings", None), "enable_branching", False)),
             get_view_columns=self._viewer_shown_columns,
             get_sp_options=self._success_path_filter_options,
         )
@@ -19407,6 +20024,19 @@ class App:
                 self._set_idle()
             return
 
+        # Branched action fired from the MAIN WINDOW (no Find-first) → treat as a
+        # BATCH: partition the whole caseload by branch and run each branch as
+        # its own sub-batch ("C769 welcome, then C964 welcome, …"). A branched
+        # action with Find-first falls through to the single-student path below,
+        # which pops the find dialog and routes the one picked student.
+        if getattr(scenario, "branches", None) and not scenario.find_first:
+            self._set_busy(f"Branched batch: {scenario.name}…")
+            try:
+                self._fire_branched_batch(scenario, override)
+            finally:
+                self._set_idle()
+            return
+
         self._set_busy(f"Running {scenario.name}…")
         try:
             self._fire_per_student(scenario, override)
@@ -19456,26 +20086,32 @@ class App:
                 prenav_label or prenav_query)
             return
 
-        # Pre-flight: a text-bearing action needs Mongoose signed in — check
-        # before any navigation/prompts so a lapsed session fails fast.
-        if scenario.text is not None and not self._ensure_mongoose_logged_in():
-            return
-        # Pre-flight: a note-filing action needs Salesforce signed in. Check
-        # up front (before any text/email is sent) so an SSO logout aborts the
-        # run rather than surfacing only at note-filing time — after the
-        # texts/emails have already gone out.
-        if scenario.notes and not self._ensure_salesforce_logged_in():
-            return
-
-        # Pre-flight: if any note has Submit unchecked, confirm before
-        # we ask the user to do anything else (FERPA: don't surprise
-        # them with notes that need manual submission AFTER they've
-        # answered prompts / picked a student).
-        if not self._confirm_submit_off_or_abort(scenario, batch=False):
-            self._append_log(
-                f"{scenario.name!r}: aborted at submit-unchecked warning."
-            )
-            return
+        # Action branching: the concrete channels depend on which branch the
+        # student matches, so ALL pre-flights (Mongoose/Salesforce login +
+        # submit-off confirm) are deferred until AFTER routing (below) where
+        # they run against the resolved branch — no Mongoose prompt when the
+        # matched branch has no text, etc. Plain actions pre-flight up front.
+        branched = bool(getattr(scenario, "branches", None))
+        if not branched:
+            # Pre-flight: a text-bearing action needs Mongoose signed in — check
+            # before any navigation/prompts so a lapsed session fails fast.
+            if scenario.text is not None and not self._ensure_mongoose_logged_in():
+                return
+            # Pre-flight: a note-filing action needs Salesforce signed in. Check
+            # up front (before any text/email is sent) so an SSO logout aborts
+            # the run rather than surfacing only at note-filing time — after the
+            # texts/emails have already gone out.
+            if scenario.notes and not self._ensure_salesforce_logged_in():
+                return
+            # Pre-flight: if any note has Submit unchecked, confirm before we ask
+            # the user to do anything else (FERPA: don't surprise them with notes
+            # that need manual submission AFTER they've answered prompts / picked
+            # a student).
+            if not self._confirm_submit_off_or_abort(scenario, batch=False):
+                self._append_log(
+                    f"{scenario.name!r}: aborted at submit-unchecked warning."
+                )
+                return
 
         # Step 1: find + pick (if enabled). Combined dialog lets the
         # user retype if the first query was wrong or surfaces too
@@ -19484,7 +20120,10 @@ class App:
         # Text-only actions resolve the student from the caseload CSV, so they
         # DON'T need the Salesforce record opened — skip the navigation (faster
         # and avoids the intermittent "record didn't open" click flake).
-        text_only = self._is_text_only(scenario)
+        # Branched: don't assume text-only up front (the matched branch may need
+        # the record). Resolve the branch below, then the effective scenario
+        # drives navigation/filing.
+        text_only = False if branched else self._is_text_only(scenario)
         chosen_name = ""
         deferred_nav = None  # (query, student_id) navigated AFTER input is in
         if prenav_query:
@@ -19519,6 +20158,51 @@ class App:
                 return
             else:
                 chosen_name = chosen
+
+        # Action branching: now that we know the student, route them to their
+        # branch and swap in that branch's channels as the effective scenario.
+        # Everything below (prompts, note edits, email, text, filing) then runs
+        # against the resolved branch unchanged.
+        if branched:
+            # Identify the student's caseload row to route on: from the panel
+            # row (prenav id), a Find-first pick (name), or — for a fire against
+            # the already-open record — the active student's context.
+            row = self._row_for_student(prenav_student_id, chosen_name)
+            if row is None and not prenav_student_id and not chosen_name:
+                try:
+                    ctx = self._get_student_context_blocking()
+                except Exception:
+                    ctx = None
+                if ctx and ctx.get("student_id"):
+                    row = self._row_for_student(ctx.get("student_id", ""), "")
+            if row is None:
+                # Don't guess — routing an unknown student to the catch-all could
+                # file the wrong content. Require an identifiable student.
+                self._append_log(
+                    f"{scenario.name!r}: couldn't identify which student to "
+                    "route on — not fired. Fire it from a caseload row "
+                    "(right-click), use Find first, or open the student's "
+                    "record first.", error=True)
+                return
+            branch, _bidx = self._match_branch(scenario, row)
+            who = chosen_name or self._row_name_and_query(row)[0] or "this student"
+            if branch is None:
+                self._append_log(
+                    f"{scenario.name!r}: {who} matched no branch (and there's no "
+                    "catch-all branch) — not fired.")
+                return
+            self._append_log(f"  ↳ branch: {who} → {branch.title!r}")
+            scenario = self._effective_branch_scenario(scenario, branch)
+            # Pre-flights now run against the RESOLVED branch's channels (deferred
+            # from the top), so they match exactly what will fire.
+            if scenario.text is not None and not self._ensure_mongoose_logged_in():
+                return
+            if scenario.notes and not self._ensure_salesforce_logged_in():
+                return
+            if not self._confirm_submit_off_or_abort(scenario, batch=False):
+                self._append_log(
+                    f"{scenario.name!r}: aborted at submit-unchecked warning.")
+                return
 
         # Single-action filtering: gate THIS student by the action's filters
         # before doing any work. (Selection fires are pre-gated in
@@ -20896,6 +21580,150 @@ class App:
             prefetched_inputs=note_inputs,
         )
 
+    # ==================================================================
+    # Action branching — batch / multi-select fires. Partition the student
+    # set by branch (first match wins) and run each branch as its own
+    # sub-batch, so one "welcome" action sends every student their course's
+    # email/text/note. Single-student routing lives in _fire_per_student.
+    # ==================================================================
+
+    def _partition_rows_by_branch(self, scenario, rows):
+        """Assign each row to the FIRST branch whose conditions it matches and
+        return [(BranchConfig, [rows]), …] in branch order, dropping empty
+        groups. Rows matching no branch are excluded (like a batch filter that
+        doesn't select them)."""
+        assigned: dict = {}
+        for r in rows:
+            b, i = self._match_branch(scenario, r)
+            if b is not None:
+                assigned[id(r)] = i
+        groups = []
+        for i, b in enumerate(getattr(scenario, "branches", None) or []):
+            grp = [r for r in rows if assigned.get(id(r)) == i]
+            if grp:
+                groups.append((b, grp))
+        return groups
+
+    def _branched_preflight(self, scenario, *, batch: bool) -> bool:
+        """Shared up-front checks for a branched batch/selection fire: log into
+        Mongoose/Salesforce for anything ANY branch needs, and confirm once if
+        any branch note has Submit unchecked. Returns False to abort."""
+        from dataclasses import replace
+        branches = getattr(scenario, "branches", None) or []
+        if (any(b.text is not None for b in branches)
+                and not self._ensure_mongoose_logged_in()):
+            return False
+        if (any(b.notes for b in branches)
+                and not self._ensure_salesforce_logged_in()):
+            return False
+        all_notes = [n for b in branches for n in (b.notes or [])]
+        probe = replace(scenario, notes=all_notes, branches=[])
+        if not self._confirm_submit_off_or_abort(probe, batch=batch):
+            self._append_log(
+                f"{scenario.name!r}: aborted at submit-unchecked warning.")
+            return False
+        return True
+
+    def _run_branch_group(self, eff, rows, source: str) -> bool:
+        """Fire one branch's effective scenario `eff` over its `rows` group,
+        batch-style (prompts → review → text send → per-student loop). Mirrors
+        the _fire_batch tail. Caller owns busy state + the shared pre-flights.
+        Returns False if the user cancelled (caller aborts the remaining
+        branches)."""
+        override = self.course_var.get().strip()
+        prompt_vars = self._collect_prompt_vars(eff)
+        if prompt_vars is None:
+            return False
+
+        # Text-only branch: no navigation/notes — render + review + send texts.
+        if self._is_text_only(eff):
+            tgroups, tskipped = self._build_text_review_groups(
+                eff, rows, prompt_vars)
+            if tgroups is None:
+                return False
+            if tgroups:
+                return self._review_and_send_texts(eff, tgroups, tskipped)
+            self._append_log("  (no textable students in this branch.)")
+            return True
+
+        has_email = eff.email is not None
+        body_overrides: dict = {}
+        if has_email:
+            summary = f"branch • {len(rows)} student(s)"
+            eff, confirmed, body_overrides = self._review_emails(
+                eff, rows, prompt_vars, summary)
+            if confirmed is None:
+                return False
+        else:
+            confirmed = prompt_batch_review(
+                self.root, eff.name, rows, ["Name", "Student ID"])
+            if confirmed is None:
+                self._append_log("  branch cancelled.")
+                return False
+        if not confirmed:
+            return True
+
+        note_inputs = None
+        if eff.notes:
+            note_inputs = self._collect_note_inputs(eff, len(confirmed), source)
+            if note_inputs is None:
+                return False
+        if eff.text is not None:
+            tgroups, tskipped = self._build_text_review_groups(
+                eff, confirmed, prompt_vars)
+            if tgroups is None:
+                return False
+            if tgroups and not self._review_and_send_texts(
+                    eff, tgroups, tskipped):
+                self._append_log("  cancelled at text review.")
+                return False
+
+        self._execute_scenario_over_rows(
+            eff, override, confirmed, prompt_vars,
+            has_email=has_email, source=source, body_overrides=body_overrides,
+            prefetched_inputs=note_inputs)
+        return True
+
+    def _fire_branched_batch(self, scenario, override: str) -> None:
+        """Main-window fire of a branched action: partition the whole caseload
+        by branch and run each branch as its own sub-batch."""
+        if not self._branched_preflight(scenario, batch=True):
+            return
+        self._warn_if_caseload_stale("this batch")
+        if self._caseload_rows is not None:
+            rows = self._caseload_rows
+            age = caseload_csv.csv_age_human(CASELOAD_CSV_PATH)
+            self._append_log(
+                f"Branched batch {scenario.name!r}: using cached caseload "
+                f"({len(rows)} rows, {age}).")
+        else:
+            self._append_log(
+                f"Branched batch {scenario.name!r}: no CSV cache; loading "
+                "caseload from DOM (5–30s)…")
+            rows = self._read_all_caseload_rows_blocking()
+            if not rows:
+                self._append_log("Batch aborted: couldn't load caseload rows.")
+                return
+        groups = self._partition_rows_by_branch(scenario, rows)
+        if not groups:
+            self._append_log(
+                f"{scenario.name!r}: no caseload students match any branch — "
+                "nothing to do.")
+            return
+        self._append_log(
+            "Branched batch — "
+            + "; ".join(f"{b.title!r}: {len(rs)}" for b, rs in groups))
+        for b, rs in groups:
+            self._append_log(f"— Branch {b.title!r}: {len(rs)} student(s) —")
+            eff = self._effective_branch_scenario(scenario, b)
+            if not self._run_branch_group(eff, rs, "batch"):
+                self._append_log(
+                    f"{scenario.name!r}: branched batch stopped at branch "
+                    f"{b.title!r}.")
+                return
+        self._append_log(
+            f"{scenario.name!r}: branched batch complete.", success=True)
+
     def _fire_batch_text(self, scenario: ScenarioConfig) -> None:
         """Batch texting: filter the caseload, render each student's text with
         their own variables, review them all (email-style), then send/schedule
@@ -21257,6 +22085,48 @@ class App:
                 skipped.append(r)
         return keep, skipped, False
 
+    def _match_branch(self, scenario, row):
+        """Route a student to a branch: return (BranchConfig, index) of the FIRST
+        branch (top-to-bottom) whose conditions `row` matches. A branch with no
+        conditions matches everyone (a catch-all 'else' — put it last). Returns
+        (None, -1) if nothing matches, or if `row` is None — an unidentified
+        student is never routed (not even to a catch-all); the caller aborts.
+        Reuses the same column-resolve + task-facet rewrite + filter engine as
+        single-action filtering."""
+        if row is None:
+            return None, -1
+        headers = list(row.keys())
+        for i, b in enumerate(getattr(scenario, "branches", None) or []):
+            conds = list(b.conditions or [])
+            if not conds:
+                return b, i  # catch-all
+            filters = [_resolve_filter_columns(f, headers) for f in conds]
+            missing = [f.get("column", "") for f in filters
+                       if f.get("column") and f.get("column") not in headers]
+            if missing:
+                self._append_log(
+                    f"{scenario.name!r} branch {b.title!r}: filter column(s) not "
+                    f"in the caseload export "
+                    f"({', '.join(repr(c) for c in missing)}) — skipping this "
+                    "branch.", error=True)
+                continue
+            eval_filters = [_rewrite_task_filter(f) for f in filters]
+            if caseload_filter.apply_filters(eval_filters, [row]):
+                return b, i
+        return None, -1
+
+    def _effective_branch_scenario(self, scenario, branch):
+        """A copy of `scenario` whose channels ARE the matched branch's — so the
+        existing per-student fire machinery (email/text/note steps) runs against
+        the branch unchanged. Clears `branches`/`fire_filters`/`batch` on the
+        copy so no further gating or re-routing happens."""
+        from dataclasses import replace
+        return replace(
+            scenario,
+            email=branch.email, text=branch.text,
+            notes=list(branch.notes or []),
+            branches=[], fire_filters=[], batch=None)
+
     def _collect_note_inputs(
         self, scenario: ScenarioConfig, total: int, source: str = "batch",
     ) -> "Optional[tuple[str, dict]]":
@@ -21543,6 +22413,53 @@ class App:
         # Texting actions: offer a Mongoose refresh up front if the export is
         # stale (once for the whole selection).
         if not self._mongoose_fresh_gate(scenario):
+            return
+
+        # Branched action: route each selected student to their branch. A single
+        # selected student goes through the per-student path (nice fire-time edit
+        # dialog); multiple students are partitioned by branch and each branch
+        # runs as its own sub-batch.
+        if getattr(scenario, "branches", None):
+            if len(rows) == 1:
+                name, query = self._row_name_and_query(rows[0])
+                course_hint = str(rows[0].get("CourseCode", "")
+                                  or rows[0].get("Course Code", "")).strip()
+                sid = str(rows[0].get("StudentID", "")
+                          or rows[0].get("Student ID", "")).strip()
+                self._set_busy(f"Running {scenario.name}…")
+                try:
+                    self._fire_per_student(
+                        scenario, self.course_var.get().strip(),
+                        prenav_query=query, prenav_label=name,
+                        course_hint=course_hint, prenav_student_id=sid,
+                        gate_filters=False)
+                finally:
+                    self._set_idle()
+                return
+            groups = self._partition_rows_by_branch(scenario, rows)
+            if not groups:
+                self._append_log(
+                    f"{scenario.name!r}: none of the {len(rows)} selected "
+                    "students match any branch — nothing to do.")
+                return
+            if not self._branched_preflight(scenario, batch=True):
+                return
+            self._append_log(
+                f"--- Firing {scenario.name!r} on {len(rows)} selected "
+                "(branched) --- "
+                + "; ".join(f"{b.title!r}: {len(rs)}" for b, rs in groups))
+            self._set_busy(f"Running {scenario.name}…")
+            try:
+                for b, rs in groups:
+                    self._append_log(
+                        f"— Branch {b.title!r}: {len(rs)} student(s) —")
+                    eff = self._effective_branch_scenario(scenario, b)
+                    if not self._run_branch_group(eff, rs, "selection"):
+                        self._append_log(
+                            f"{scenario.name!r}: stopped at branch {b.title!r}.")
+                        break
+            finally:
+                self._set_idle()
             return
 
         # Single-action filtering: gate the selection by the action's own
@@ -24286,7 +25203,10 @@ class App:
             except Exception:
                 pass
             # Action branching (advanced) — gates the "+ branch" editor UI.
-            self.settings.enable_branching = bool(branching_var.get())
+            new_branching = bool(branching_var.get())
+            branching_changed = (
+                new_branching != getattr(self.settings, "enable_branching", False))
+            self.settings.enable_branching = new_branching
             # Data-at-rest unlock frequency. Switching to "every launch" drops
             # any DPAPI-remembered key so it actually prompts next time.
             new_unlock = _ENC_LABELS.get(enc_var.get().strip(), "per_restart")
@@ -24300,6 +25220,14 @@ class App:
             save_settings(self.settings)
             if changed:
                 self._apply_advanced_mode()
+            # Toggle the "+ branch" create button on every open editor when the
+            # branching setting flipped (existing branched actions are unaffected).
+            if branching_changed:
+                for ed in getattr(self, "scenario_editors", {}).values():
+                    try:
+                        ed.apply_branching_visibility(new_branching)
+                    except Exception:
+                        pass
             try: win.grab_release()
             except Exception: pass
             try: win.destroy()
