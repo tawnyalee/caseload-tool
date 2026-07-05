@@ -73,6 +73,13 @@ from src.student_lookup import (
     scrape_student_email_from_page,
 )
 
+# Mongoose contact-id/opt-in exports go stale fast (a student can opt in/out any
+# time), so we treat an export older than this as stale: it triggers the loud
+# load-time warning, the startup auto-refresh, and the pre-fire "update first?"
+# popup. Texting keys opt-in off Mongoose membership, so stale data silently
+# skips newly-enrolled students — hence the aggressive freshness policy.
+MONGOOSE_STALE_HOURS = 24
+
 
 @dataclass
 class NoteLogEntry:
@@ -7851,6 +7858,63 @@ def ask_yes_no_topmost(
     return result["value"]
 
 
+def prompt_mongoose_stale(parent, age_str: str) -> str:
+    """Pre-fire warning that the Mongoose text-ID export is stale. Returns
+    'update' (refresh it first), 'continue' (fire with the existing data), or
+    'cancel' (abort the fire / window close / Esc)."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Mongoose text IDs are stale")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    result = {"value": "cancel"}
+
+    ctk.CTkLabel(
+        dialog,
+        text=f"⚠  The Mongoose text-ID export is {age_str}.",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        justify="left", wraplength=460,
+    ).pack(padx=18, pady=(16, 4), anchor="w")
+    ctk.CTkLabel(
+        dialog,
+        text=("Opt-in can change several times a day. If you fire now without "
+              "updating:\n"
+              "  •  students already in the export text normally;\n"
+              "  •  students enrolled since the last update fall back to their "
+              "Salesforce opt-in (flagged “unverified” in the review);\n"
+              "  •  a student who opted out since the last export could still be "
+              "texted.\n\n"
+              "Updating re-exports each course segment from Mongoose "
+              "(~a few seconds per course)."),
+        justify="left", wraplength=460, text_color=("gray25", "gray75"),
+    ).pack(padx=18, pady=(0, 12), anchor="w")
+
+    def _close(v: str) -> None:
+        result["value"] = v
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(fill="x", padx=18, pady=(0, 16))
+    upd = ctk.CTkButton(btn_row, text="🔄 Update text IDs first", width=180,
+                        command=lambda: _close("update"))
+    upd.pack(side="left", padx=4)
+    ctk.CTkButton(btn_row, text="Continue without updating", width=180,
+                  command=lambda: _close("continue"),
+                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
+    ctk.CTkButton(btn_row, text="Cancel", width=90,
+                  command=lambda: _close("cancel"),
+                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=4)
+    dialog.bind("<Escape>", lambda _e: _close("cancel"))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: _close("cancel"))
+    dialog.lift()
+    dialog.focus_force()
+    upd.focus_set()
+    dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
+    parent.wait_window(dialog)
+    return result["value"]
 def prompt_override_selection(parent, labels, action_name):
     """Modal listing students who DON'T meet an action's filter conditions, each
     with a checkbox to 'fire on anyway'. `labels` is the ordered display list.
@@ -15668,6 +15732,8 @@ class SplashScreen:
         self._job = None
         self._frames = []
         self._delays = []
+        self._status_lbl = None
+        self._progress = None
         try:
             from PIL import Image, ImageTk, ImageSequence
             if not Path(gif_path).exists():
@@ -15736,6 +15802,21 @@ class SplashScreen:
             self._lbl = tk.Label(inner, bd=0, highlightthickness=0, bg=WHITE)
             self._lbl.pack(padx=20)
             _dismiss(self._lbl)
+            # Startup progress: a status line + a determinate bar, driven by
+            # App._splash_step through the boot sequence (login → caseload →
+            # Essential Actions → task pass/fail → Mongoose text IDs).
+            self._status_lbl = tk.Label(
+                inner, text="Starting…", bg=WHITE, fg=BLUE,
+                font=("Segoe UI", 10), wraplength=380)
+            self._status_lbl.pack(pady=(10, 2))
+            _dismiss(self._status_lbl)
+            try:
+                from tkinter import ttk as _ttk
+                self._progress = _ttk.Progressbar(
+                    inner, mode="determinate", length=300, maximum=100)
+                self._progress.pack(pady=(0, 8))
+            except Exception:
+                self._progress = None
             # Version + links + author below.
             _v = tk.Label(inner, text=f"Version {__version__}", bg=WHITE,
                           fg="#666666", font=("Segoe UI", 10))
@@ -15773,6 +15854,21 @@ class SplashScreen:
                 pass
         except Exception:
             self.close()
+
+    def set_status(self, msg=None, frac=None):
+        """Update the startup status line (+ optional 0..1 progress fraction).
+        Best-effort and safe to call after close() (no-op then)."""
+        if not self.win:
+            return
+        try:
+            if msg is not None and self._status_lbl is not None:
+                self._status_lbl.configure(text=msg)
+            if frac is not None and self._progress is not None:
+                self._progress.configure(
+                    value=max(0, min(100, int(round(frac * 100)))))
+            self.win.update_idletasks()
+        except Exception:
+            pass
 
     def _animate(self):
         if not self.win:
@@ -18900,6 +18996,10 @@ class App:
                 f"{scenario.name!r}: not fired — sample placeholder email "
                 "address not replaced.")
             return
+        # Texting actions: if the Mongoose export is stale, offer to refresh it
+        # before firing (or continue / cancel). Runs once, up front.
+        if not self._mongoose_fresh_gate(scenario):
+            return
         override = self.course_var.get().strip()
         self._append_log(f"--- Firing {scenario.name!r} ---")
 
@@ -19400,6 +19500,47 @@ class App:
                 out.append(n)
         return out[:50]
 
+    def _mongoose_export_age_hours(self) -> Optional[float]:
+        """Age in hours of the NEWEST mongoose_*.csv export, or None if there are
+        no exports at all."""
+        try:
+            from src import mongoose_contacts as mc
+            exports = mc.find_exports_in_dir(CASELOAD_CSV_PATH.parent)
+        except Exception:
+            return None
+        if not exports:
+            return None
+        try:
+            import time
+            newest = max(p.stat().st_mtime for p in exports)
+            return max(0.0, (time.time() - newest) / 3600.0)
+        except Exception:
+            return None
+
+    def _mongoose_is_stale(self, threshold_hours: float = MONGOOSE_STALE_HOURS
+                           ) -> bool:
+        """True when the Mongoose exports are missing or older than the
+        threshold — the trigger for the warning / auto-refresh / pre-fire popup.
+        Only meaningful once texting is in use; a missing export for a caseload
+        with no texting is not 'stale' in a way that matters, but callers gate on
+        whether the action actually texts."""
+        age = self._mongoose_export_age_hours()
+        return age is None or age > threshold_hours
+
+    def _mongoose_age_human(self) -> str:
+        """Human age of the newest export ('3 days', '5 hours', 'no export')."""
+        age = self._mongoose_export_age_hours()
+        if age is None:
+            return "no export found"
+        if age < 1:
+            mins = int(age * 60)
+            return f"{mins} minute{'s' if mins != 1 else ''} old"
+        if age < 48:
+            h = int(round(age))
+            return f"{h} hour{'s' if h != 1 else ''} old"
+        d = int(round(age / 24))
+        return f"{d} day{'s' if d != 1 else ''} old"
+
     def _refresh_contact_ids(self, rows, *, silent: bool = False) -> None:
         """Refresh self._contact_ids: load the persisted StudentID -> Contact id
         map, then fold in any Mongoose segment export(s) sitting in the config
@@ -19521,6 +19662,17 @@ class App:
                         f"  ↳ {len(unmatched)} opted-in student(s) not matched "
                         f"to a Contact id (texts use their caseload phone): "
                         f"{shown}{more}.")
+            # Loud staleness warning: Mongoose opt-in can change any time, so an
+            # export more than a day old may silently skip newly-enrolled
+            # students at text time. (The startup auto-refresh + pre-fire popup
+            # act on the same signal.)
+            if self._mongoose_is_stale():
+                self._append_log(
+                    f"⚠ Mongoose text-ID export is {self._mongoose_age_human()} "
+                    "— it can change several times a day. New students may be "
+                    "skipped when texting until it's refreshed (🔄 Sync "
+                    "Contact IDs, or fire a text to be prompted).",
+                    error=True)
 
     def _distinct_courses(self, rows) -> list:
         """Distinct normalized course codes (e.g. 'C769') across caseload rows,
@@ -19592,6 +19744,87 @@ class App:
                 finish()
 
         self.worker.submit_export_segments(courses, on_done)
+
+    def _export_segments_blocking(self, on_step=None) -> bool:
+        """Run the Mongoose per-course segment export and BLOCK the main thread
+        (nested mainloop) until it finishes, then return True on success. Used by
+        the pre-fire "update first" popup and the startup auto-refresh — both
+        need the fresh data before proceeding. `on_step(msg)` is an optional
+        progress callback (for the splash)."""
+        if not self.worker.ready_event.is_set():
+            self._append_log("Can't update text IDs — browser not ready.",
+                             error=True)
+            return False
+        courses = self._distinct_courses(self._caseload_rows or [])
+        if not courses:
+            self._append_log("No caseload course codes to export text IDs for.",
+                             error=True)
+            return False
+        if on_step:
+            on_step(f"Updating Mongoose text IDs ({', '.join(courses)})…")
+        done_var = tk.BooleanVar(value=False)
+        holder: dict = {"res": None}
+
+        def on_done(res):
+            def setm():
+                holder["res"] = res
+                done_var.set(True)
+            try:
+                self.root.after(0, setm)
+            except Exception:
+                holder["res"] = res
+                done_var.set(True)
+
+        self._lock_browser_for_run()
+        try:
+            self.worker.submit_export_segments(courses, on_done)
+            self.root.wait_variable(done_var)
+        finally:
+            self._unlock_browser_after_run()
+        res = holder["res"] or {}
+        if res.get("error"):
+            self._append_log(f"Text-ID update failed: {res['error']}", error=True)
+            return False
+        exp = res.get("exported") or []
+        self._append_log(
+            f"Text IDs updated: exported {len(exp)} segment(s)"
+            + (f": {', '.join(exp)}" if exp else "") + ".")
+        for e in (res.get("errors") or []):
+            self._append_log(f"  segment: {e}", error=True)
+        missing = res.get("missing") or []
+        if missing:
+            names = ", ".join(m["segment_name"] for m in missing)
+            self._append_log(
+                f"  ↳ {len(missing)} department(s) still need a segment "
+                f"({names}) — create them in Mongoose.", error=True)
+        return bool(exp)
+
+    def _action_texts(self, scenario) -> bool:
+        """Whether firing `scenario` will send any text (directly, or via any
+        branch) — gates the stale-Mongoose pre-fire popup."""
+        if getattr(scenario, "branches", None):
+            return any(b.text is not None for b in scenario.branches)
+        return scenario.text is not None
+
+    def _mongoose_fresh_gate(self, scenario) -> bool:
+        """Pre-fire gate for texting actions: if the action texts AND the
+        Mongoose export is stale, prompt to update first / continue / cancel.
+        Returns True to proceed with the fire, False to abort. Non-texting
+        actions and fresh exports pass straight through."""
+        if not self._action_texts(scenario) or not self._mongoose_is_stale():
+            return True
+        choice = prompt_mongoose_stale(self.root, self._mongoose_age_human())
+        if choice == "cancel":
+            self._append_log(
+                f"{scenario.name!r}: cancelled — Mongoose text IDs not updated.")
+            return False
+        if choice == "update":
+            if self._export_segments_blocking():
+                self._refresh_contact_ids(self._caseload_rows or [])
+            else:
+                self._append_log(
+                    "Continuing with the existing (stale) text IDs.", error=True)
+        return True
 
     def _text_term_for(self, student_id: str, mobile: str) -> str:
         """Recipient search term for Mongoose: the student's Contact id if we
@@ -19673,24 +19906,35 @@ class App:
             pass
         return (text or "").strip().upper()
 
-    def _texting_opted_in_row(self, row: dict) -> bool:
-        """Authoritative texting opt-in for a caseload row. PREFERS Mongoose
-        membership — only genuinely opted-in contacts sync to Mongoose, so the
-        Salesforce TextingPreference field (which can say 'Opted In' for a
-        student whose 'SMS opt-in Academic' box is actually unchecked) is NOT
-        trusted when we have Mongoose data for the student's course. Falls back
-        to TextingPreference only for courses with no Mongoose export loaded, so
-        a missing segment doesn't silently skip everyone."""
+    def _texting_optin_status(self, row: dict) -> str:
+        """How this student qualifies for texting:
+          'mongoose' — verified opted-in in the Mongoose export (trusted);
+          'sf'       — NOT in the export, but the Salesforce TextingPreference
+                       says opted in (a new enrollee not yet synced to Mongoose,
+                       OR a course with no export). SF's field can be stale, so
+                       these are flagged 'unverified' in the text review;
+          ''         — not opted in.
+        Mongoose membership is preferred because SF's field can say 'Opted In'
+        for a student whose 'SMS opt-in Academic' box is actually unchecked."""
         course = self._norm_course(row.get("CourseCode") or "")
         if course and course in self._mongoose_courses:
             sid = (row.get("StudentID") or "").strip()
             if sid in self._mongoose_sids:
-                return True
-            # Blank-mobile-proof fallback: match by SF Contact id.
+                return "mongoose"
             cid = (self._contact_ids.get(sid) or "").strip()
-            return bool(cid) and cid in self._mongoose_optin_cids
-        # No Mongoose data for this course → fall back to the SF field.
-        return self._texting_opted_in(row)
+            if cid and cid in self._mongoose_optin_cids:
+                return "mongoose"
+            # In the export's course but not in the (possibly stale) export —
+            # likely enrolled since the last refresh. Fall back to SF opt-in.
+            return "sf" if self._texting_opted_in(row) else ""
+        # No Mongoose data for this course → SF field is all we have.
+        return "sf" if self._texting_opted_in(row) else ""
+
+    def _texting_opted_in_row(self, row: dict) -> bool:
+        """Authoritative texting opt-in for a caseload row: opted in via Mongoose
+        OR (for students not yet in the export) via the Salesforce field. See
+        _texting_optin_status for the trust model."""
+        return bool(self._texting_optin_status(row))
 
     def _send_text_blocking(self, payload: dict) -> Optional[dict]:
         """Queue a SEND_TEXT and block the main thread until the worker returns
@@ -19941,10 +20185,17 @@ class App:
             variables.update(prompt_vars)
         who = (variables.get("full_name") or variables.get("student_id")
                or "this student")
-        if row is not None and not self._texting_opted_in_row(row):
-            self._append_log(
-                f"Text: {who} is not opted in to texting — skipped.", error=True)
-            return False
+        if row is not None:
+            optin = self._texting_optin_status(row)
+            if not optin:
+                self._append_log(
+                    f"Text: {who} is not opted in to texting — skipped.",
+                    error=True)
+                return False
+            if optin == "sf":
+                self._append_log(
+                    f"  ↳ {who}: using Salesforce opt-in (not yet in the "
+                    "Mongoose export — refresh to verify).")
         mobile_raw = (row.get("MobilePhone") if row else "") or ""
         mobile = tm.normalize_phone(mobile_raw)
         # Prefer the Salesforce Contact id (unique, works when the mobile is
@@ -20353,9 +20604,11 @@ class App:
         for row in matched:
             rv = self._text_vars_from_row(row)
             name = rv["full_name"] or row.get("Name", "")
-            if not self._texting_opted_in_row(row):
+            optin = self._texting_optin_status(row)
+            if not optin:
                 skipped_names.append(name)
                 continue
+            sf_fallback = (optin == "sf")  # SF opt-in, not verified in Mongoose
             course = rv["course_code"]
             inbox_label = tcfg.inbox_label or (
                 f"{course} Inbox" if course else "")
@@ -20380,15 +20633,17 @@ class App:
             g = groups.get(key)
             if g is None:
                 g = {"inbox_label": inbox_label, "course": course, "slot": slot,
-                     "members": [], "defaulted": 0, "tzs": set()}
+                     "members": [], "defaulted": 0, "tzs": set(), "sf": 0}
                 groups[key] = g
                 order.append(key)
             g["members"].append({
                 "name": name, "mobile": mobile, "term": term,
-                "via_id": tm.looks_like_sfid(term)})
+                "via_id": tm.looks_like_sfid(term), "sf_optin": sf_fallback})
             g["tzs"].add(tz)
             if raw_tz not in tm.TZ_ABBR_TO_IANA:
                 g["defaulted"] += 1
+            if sf_fallback:
+                g["sf"] += 1
         if skipped_names:
             self._append_log(
                 f"Batch text: {len(skipped_names)} student(s) not opted in "
@@ -20433,6 +20688,10 @@ class App:
                 issues.append(f"{n_untextable} without a mobile or Contact id")
             if n_via_id:
                 issues.append(f"{n_via_id} via Contact id (blank mobile)")
+            if g.get("sf"):
+                issues.append(
+                    f"{g['sf']} via Salesforce opt-in (not yet in Mongoose — "
+                    "unverified; refresh the export to confirm)")
             if tm.over_length(body):
                 issues.append(f"{tm.over_length(body)} over limit")
             if "{{" in body and "}}" in body:
@@ -20885,6 +21144,11 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
+            return
+
+        # Texting actions: offer a Mongoose refresh up front if the export is
+        # stale (once for the whole selection).
+        if not self._mongoose_fresh_gate(scenario):
             return
 
         # Single-action filtering: gate the selection by the action's own
@@ -22232,10 +22496,12 @@ class App:
         _set_busy) for the duration so the user can't fire a batch
         against a stale cache while we're refreshing."""
         if not self.worker.ready_event.is_set():
+            self._splash_step("Launching browser + signing in…", 0.08)
             self.root.after(500, self._poll_worker_then_auto_download)
             return
         self._set_busy("Auto-refreshing caseload + Essential Actions…")
         self._append_log("Auto-refreshing caseload CSV...")
+        self._splash_step("Downloading caseload…", 0.25)
 
         def on_ea_done(res) -> None:
             def apply() -> None:
@@ -22256,11 +22522,13 @@ class App:
                         f"(read {res.get('read_secs')}s + nav back to "
                         f"caseload {round(res.get('secs', 0) - res.get('read_secs', 0), 1)}s)")
                 self._set_idle()
+                self._splash_step("Reading task pass/fail…", 0.65)
                 # Kick the background live task pass/fail pass (startup), then
-                # minimize the browser once it's done — after the scrape, since
-                # the scroll needs the window un-minimized to render.
+                # finalize (auto-refresh stale Mongoose text IDs, minimize) once
+                # it's done — after the scrape, since the scroll needs the window
+                # un-minimized to render.
                 self._maybe_bulk_scrape_task_status(
-                    "startup", on_complete=self._minimize_browser)
+                    "startup", on_complete=self._startup_finalize)
             try:
                 self.root.after(0, apply)
             except Exception:
@@ -22273,6 +22541,7 @@ class App:
                     self._reload_caseload_cache(silent=False)
                     # Scrape the Essential Actions dashboard in the same pass.
                     self._append_log("Scraping Essential Actions dashboard…")
+                    self._splash_step("Reading Essential Actions…", 0.45)
                     self.worker.submit_read_ea_dashboard(on_ea_done)
                 else:
                     self._append_log(
@@ -25762,6 +26031,74 @@ class App:
             except Exception:
                 pass
             self._splash = None
+
+    def _splash_step(self, msg: str, frac: Optional[float] = None) -> None:
+        """Report a startup step to the splash's status line + progress bar
+        (best-effort; no-op once the splash is closed)."""
+        try:
+            sp = getattr(self, "_splash", None)
+            if sp is not None:
+                sp.set_status(msg, frac)
+        except Exception:
+            pass
+
+    def _mongoose_login_check_blocking(self) -> bool:
+        """Non-intrusive Mongoose sign-in check, blocking until the worker
+        answers. True if signed in. Used to gate the startup auto-refresh so a
+        logged-out session doesn't stall startup on a login page."""
+        done_var = tk.BooleanVar(value=False)
+        holder = {"ok": False}
+
+        def on_done(res):
+            def setm():
+                holder["ok"] = bool(res and res.get("ok"))
+                done_var.set(True)
+            try:
+                self.root.after(0, setm)
+            except Exception:
+                holder["ok"] = bool(res and res.get("ok"))
+                done_var.set(True)
+
+        try:
+            self.worker.submit_mongoose_login_check(on_done, surface=False)
+        except Exception:
+            return False
+        self.root.wait_variable(done_var)
+        return holder["ok"]
+
+    def _maybe_startup_mongoose_refresh(self) -> None:
+        """Auto-refresh the Mongoose text-ID export at startup when it EXISTS but
+        is stale (first-time creation stays manual / prompted at fire), there are
+        courses to export, and Mongoose is signed in."""
+        if self._mongoose_export_age_hours() is None:
+            return  # no export yet — don't force creation during startup
+        if not self._mongoose_is_stale():
+            return
+        if not self._distinct_courses(self._caseload_rows or []):
+            return
+        if not self._mongoose_login_check_blocking():
+            self._append_log(
+                "⚠ Mongoose text IDs are stale, but Mongoose isn't signed in — "
+                "sign in (🐭 Mongoose) then 🔄 Sync Contact IDs to refresh.",
+                error=True)
+            return
+        self._append_log(
+            f"Auto-updating stale Mongoose text IDs "
+            f"({self._mongoose_age_human()})…")
+        self._splash_step("Updating Mongoose text IDs…", 0.88)
+        if self._export_segments_blocking(on_step=self._splash_step):
+            self._refresh_contact_ids(self._caseload_rows or [])
+
+    def _startup_finalize(self) -> None:
+        """End of startup (after the task pass/fail scrape): auto-refresh stale
+        Mongoose text IDs while the browser is still up, then minimize + take
+        down the splash."""
+        try:
+            self._maybe_startup_mongoose_refresh()
+        except Exception as e:
+            self._append_log(f"Mongoose auto-update skipped: {e}", error=True)
+        self._splash_step("Ready", 1.0)
+        self._minimize_browser()
 
     def _minimize_browser(self) -> None:
         """Minimize the launcher's browser once the startup caseload load is
