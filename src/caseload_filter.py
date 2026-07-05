@@ -40,6 +40,11 @@ _OP_ALIASES = {
     "is not empty": "not_empty",
     "is": "equals",
     "is not": "not_equals",
+    # Multi-value membership — same engine path as equals/not_equals (which
+    # already match ANY / exclude ALL of a comma-separated or list value); these
+    # are just clearer UI labels for "match one of several".
+    "is any of": "equals",
+    "is none of": "not_equals",
     "does not contain": "not_contains",
     "is before": "before",
     "is after": "after",

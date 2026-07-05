@@ -73,6 +73,13 @@ from src.student_lookup import (
     scrape_student_email_from_page,
 )
 
+# Success-path step statuses that can be targeted in a filter. Matches the
+# STATUS_* values compute_steps returns. 'off-path' is an internal sentinel set
+# on students NOT on that course's path (so positive 'is any of' membership
+# excludes them) — it's never offered as a pickable value.
+SP_FILTER_STATUSES = ("done", "skipped", "due", "blocked")
+SP_OFF_PATH = "off-path"
+
 # Mongoose contact-id/opt-in exports go stale fast (a student can opt in/out any
 # time), so we treat an export older than this as stale: it triggers the loud
 # load-time warning, the startup auto-refresh, and the pre-fire "update first?"
@@ -7915,6 +7922,87 @@ def prompt_mongoose_stale(parent, age_str: str) -> str:
     dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
     parent.wait_window(dialog)
     return result["value"]
+
+
+def prompt_column_picker(parent, sections, *, near=None):
+    """Searchable, grouped column picker. `sections` is an ordered list of
+    (header, items) where items is a list of (label, key) pairs. Returns the
+    chosen `key` (str), or None if cancelled. A live search box filters across
+    every section by label; empty sections hide while filtering."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Choose a column")
+    dialog.transient(parent)
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.geometry("460x520")
+    result = {"key": None}
+
+    search_var = tk.StringVar()
+    ctk.CTkEntry(
+        dialog, textvariable=search_var, placeholder_text="Search columns…",
+    ).pack(fill="x", padx=12, pady=(12, 6))
+
+    listwrap = ctk.CTkScrollableFrame(dialog)
+    listwrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    listwrap.grid_columnconfigure(0, weight=1)
+
+    def _choose(key: str) -> None:
+        result["key"] = key
+        try: dialog.grab_release()
+        except Exception: pass
+        try: dialog.destroy()
+        except Exception: pass
+
+    def _render() -> None:
+        for w in listwrap.winfo_children():
+            w.destroy()
+        q = search_var.get().strip().lower()
+        r = 0
+        for header, items in sections:
+            shown = [(lab, key) for (lab, key) in items
+                     if not q or q in lab.lower()]
+            if not shown:
+                continue
+            ctk.CTkLabel(
+                listwrap, text=header,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=("gray35", "gray70"), anchor="w",
+            ).grid(row=r, column=0, sticky="ew", padx=6, pady=(8, 2))
+            r += 1
+            for lab, key in shown:
+                ctk.CTkButton(
+                    listwrap, text=lab, anchor="w", height=28,
+                    fg_color="transparent", text_color=("gray10", "gray90"),
+                    hover_color=("gray85", "gray28"),
+                    command=lambda k=key: _choose(k),
+                ).grid(row=r, column=0, sticky="ew", padx=6, pady=1)
+                r += 1
+        if r == 0:
+            ctk.CTkLabel(listwrap, text="No columns match.",
+                         text_color=("gray45", "gray60")).grid(
+                row=0, column=0, sticky="w", padx=8, pady=8)
+
+    search_var.trace_add("write", lambda *_a: _render())
+    _render()
+    ctk.CTkButton(dialog, text="Cancel", command=lambda: _choose(None),
+                  **SECONDARY_BTN_KWARGS).pack(pady=(0, 10))
+    dialog.bind("<Escape>", lambda _e: _choose(None))
+    if near is not None:
+        try:
+            dialog.update_idletasks()
+            sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+            w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+            x = max(0, min(int(near[0]) - 20, sw - w - 8))
+            y = max(0, min(int(near[1]) - 10, sh - h - 8))
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+    dialog.lift()
+    dialog.focus_force()
+    parent.wait_window(dialog)
+    return result["key"]
+
+
 def prompt_override_selection(parent, labels, action_name):
     """Modal listing students who DON'T meet an action's filter conditions, each
     with a checkbox to 'fire on anyway'. `labels` is the ordered display list.
@@ -9341,6 +9429,8 @@ FILTER_OPS = (
     "is not empty",
     "is",
     "is not",
+    "is any of",
+    "is none of",
     "contains",
     "does not contain",
     "is before",
@@ -9375,6 +9465,56 @@ _OP_SHORT_TO_LONG = {
 }
 
 
+# Sentinel row in the curated column dropdown that opens the full searchable
+# picker instead of selecting a column.
+_COL_SEARCH_SENTINEL = "🔎  Search all columns…"
+
+
+# --- Shared column-selection helpers ---------------------------------------
+# Used by BOTH the action editor and the caseload viewer so column selection
+# looks and behaves identically everywhere. Each takes plain data (already
+# display-name columns; sp_opts = _success_path_filter_options() dicts).
+
+def _column_picker_sections(all_cols, view_cols, sp_opts):
+    """Ordered sections for prompt_column_picker: ★ current-view, Success path
+    (by course), then All caseload columns."""
+    sections = []
+    vc = [c for c in (view_cols or []) if c in all_cols]
+    if vc:
+        sections.append(("★ In current view", [(c, c) for c in vc]))
+    if sp_opts:
+        by_course: dict = {}
+        for o in sp_opts:
+            by_course.setdefault(o["course"], []).append(
+                (o["label"], o["column"]))
+        for course in sorted(by_course):
+            sections.append((f"Success path · {course}", by_course[course]))
+    sections.append(("All caseload columns", [(c, c) for c in all_cols]))
+    return sections
+
+
+def _curated_column_pairs(all_cols, view_cols, sp_opts):
+    """Short curated (display_label, key) list for the column dropdown:
+    success-path steps first, then the current-view columns (fallback: all
+    columns when no view columns are known yet)."""
+    pairs = []
+    for o in (sp_opts or []):
+        pairs.append((f"Success · {o['course']} · {o['label']}", o["column"]))
+    vc = [c for c in (view_cols or []) if c in all_cols]
+    for c in (vc or all_cols):
+        pairs.append((c, c))
+    return pairs
+
+
+def _sp_label_for_key(key, sp_opts):
+    """Friendly label for a success-path filter key (sp:<course>:<step>)."""
+    for o in (sp_opts or []):
+        if o.get("column") == key:
+            return f"Success · {o['course']} · {o['label']}"
+    parts = str(key).split(":", 2)
+    return f"Success · {parts[1]} · {parts[2]}" if len(parts) == 3 else key
+
+
 class FilterRow:
     """One filter inside a batch scenario's Filters section. Layout:
     `<column ▾>  <op ▾>  <value ▾>  ✕`, plus a small hint label
@@ -9382,7 +9522,10 @@ class FilterRow:
     formats (date shorthand, within-presets, numeric, etc.)."""
 
     def __init__(self, parent, columns: list[str], on_delete: Callable,
-                 value_provider: Optional[Callable[[str], list]] = None):
+                 value_provider: Optional[Callable[[str], list]] = None,
+                 open_picker: Optional[Callable] = None,
+                 label_for_key: Optional[Callable[[str], str]] = None,
+                 curated_provider: Optional[Callable[[], list]] = None):
         self.frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.frame.grid_columnconfigure(2, weight=1)
         # Optional callback: column display-name → a small list of suggested
@@ -9390,13 +9533,37 @@ class FilterRow:
         # When it returns values, the value field becomes a dropdown of them
         # (still free-text editable); [] keeps the field plain text.
         self._value_provider = value_provider
+        # open_picker(near) opens the searchable column picker and returns the
+        # chosen column KEY (or None). label_for_key(key) → the friendly display
+        # for a non-caseload key (e.g. a success-path step). Together they let a
+        # picked success-path step show a friendly label while serializing to its
+        # sp:<course>:<step> key.
+        self._open_picker = open_picker
+        self._label_for_key = label_for_key
+        self._display_to_key: dict = {}  # friendly display -> real column key
+        # curated_provider() -> ordered [(display_label, key)] for a SHORT
+        # dropdown (success-path steps first, then current-view columns). The
+        # full column list stays behind the sentinel / 🔎 picker. None keeps the
+        # legacy flat all-columns dropdown.
+        self._curated_provider = curated_provider
+        self._last_col = ""  # last real (non-sentinel) selection, for restore
+        # Column cell: the curated dropdown (its first row opens the grouped,
+        # searchable picker — current-view columns, success-path steps, all
+        # columns).
+        col_wrap = ctk.CTkFrame(self.frame, fg_color="transparent")
+        col_wrap.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         self.column_combo = ctk.CTkComboBox(
-            self.frame,
+            col_wrap,
             values=columns if columns else ["(refresh columns)"],
-            width=220,
+            width=224,
             command=self._on_column_change,
         )
-        self.column_combo.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
+        self.column_combo.pack(side="left")
+        # No separate 🔎 button — the curated dropdown's first row
+        # ("🔎  Search all columns…") opens the same searchable picker, so a
+        # standalone button would be redundant.
+        if curated_provider is not None:
+            self._apply_curated(keep_current=False)
         self.op_combo = ctk.CTkComboBox(
             self.frame, values=list(FILTER_OPS), width=140,
             state="readonly", command=self._on_op_change,
@@ -9444,19 +9611,112 @@ class FilterRow:
         # Initialize hint + value-combo suggestions for the default op.
         self._on_op_change("is")
 
-    def _on_column_change(self, _col: str) -> None:
-        """Column changed → re-derive the value-field suggestions for the
-        current op (the suggestion list depends on which column is chosen)."""
+    def _apply_curated(self, keep_current: bool = True) -> None:
+        """Populate the column dropdown with the curated SHORT list: a 'search
+        all' sentinel, then success-path steps, then the current-view columns.
+        sp labels are mapped to their sp: keys so a dropdown pick serializes
+        correctly. keep_current=False (a fresh row) defaults the selection to
+        the first common column rather than a success-path step."""
+        if self._curated_provider is None:
+            return
+        current = self.column_combo.get() if keep_current else ""
+        try:
+            pairs = self._curated_provider() or []
+        except Exception:
+            pairs = []
+        sp_labels, common_labels = [], []
+        for label, key in pairs:
+            if str(key).startswith("sp:"):
+                self._display_to_key[label] = key
+                sp_labels.append(label)
+            else:
+                common_labels.append(label)
+        values = [_COL_SEARCH_SENTINEL] + sp_labels + common_labels
+        self.column_combo.configure(values=values)
+        if keep_current and current and current in values:
+            self.column_combo.set(current)
+            self._last_col = current
+        elif not keep_current:
+            default = (common_labels[0] if common_labels
+                       else (sp_labels[0] if sp_labels else ""))
+            self.column_combo.set(default)
+            self._last_col = default
+
+    def _on_column_change(self, col: str) -> None:
+        """Column changed via the dropdown. The 'search all' sentinel bounces to
+        the full picker; a success-path label keeps its sp mapping and defaults
+        the op to membership; any other pick is a plain caseload column (its own
+        key)."""
+        if col == _COL_SEARCH_SENTINEL:
+            prev = self._last_col
+            self._browse_column()
+            if self.column_combo.get() == _COL_SEARCH_SENTINEL:
+                # Cancelled — restore the prior real selection.
+                self.column_combo.set(prev)
+            return
+        self._last_col = col
+        if self._display_to_key.get(col, "").startswith("sp:"):
+            # A success-path step: match on status → default to 'is any of'.
+            self.op_combo.set("is any of")
+        else:
+            # A hand-typed/selected dropdown value is its own key (caseload col).
+            self._display_to_key.pop(col, None)
         try:
             self._on_op_change(self.op_combo.get())
         except Exception:
             pass
+
+    def _browse_column(self) -> None:
+        """Open the searchable column picker; apply the chosen column."""
+        if self._open_picker is None:
+            return
+        try:
+            x = self.frame.winfo_rootx()
+            y = self.frame.winfo_rooty()
+        except Exception:
+            x = y = None
+        key = self._open_picker((x, y) if x is not None else None)
+        if key:
+            self.set_column(key)
+
+    def set_column(self, key: str) -> None:
+        """Set the column to `key`. Success-path keys (sp:…) show a friendly
+        label and default the op to 'is any of' with the status values; caseload
+        keys show their display name."""
+        key = (key or "").strip()
+        is_sp = key.startswith("sp:")
+        if is_sp:
+            display = (self._label_for_key(key) if self._label_for_key
+                       else key) or key
+            self._display_to_key[display] = key
+            # Ensure the label is selectable in the (read-through) combo.
+            vals = list(self.column_combo.cget("values"))
+            if display not in vals:
+                self.column_combo.configure(values=[display] + vals)
+        else:
+            display = caseload_csv.display_for_column(key)
+            self._display_to_key.pop(display, None)
+        self.column_combo.set(display)
+        self._last_col = display
+        if is_sp:
+            self.op_combo.set("is any of")
+        self._on_op_change(self.op_combo.get())
+
+    def _current_column_key(self) -> str:
+        """The real column key for the shown selection (sp:… key for a
+        success-path step, else the display name the engine resolves)."""
+        disp = self.column_combo.get().strip()
+        return self._display_to_key.get(disp, disp)
 
     def _column_value_suggestions(self, op: str) -> list:
         """Value suggestions for the current column + `op`, via the provider.
         For date/number ops these are `{Other Column}` comparison refs; for
         text ops, a small fixed vocabulary. [] when nothing sensible applies
         (field stays free-text)."""
+        # Success-path columns take the fixed status vocabulary as their value
+        # suggestions (done/skipped/due/blocked).
+        if self._current_column_key().startswith("sp:"):
+            return list(SP_FILTER_STATUSES)
         if not self._value_provider:
             return []
         try:
@@ -9472,6 +9732,7 @@ class FilterRow:
                     "is on or before", "is on or after")
         numeric_ops = ("more than", "less than", "at least", "at most")
         text_ops = ("is", "is not", "contains", "does not contain")
+        multi_ops = ("is any of", "is none of")
 
         # Calendar button is date-only. Default to hidden; date branch
         # below re-shows it. Wrapped in try so a partially-initialized
@@ -9525,6 +9786,21 @@ class FilterRow:
             self.value_combo.set("")
             self.value_combo.configure(state="disabled", values=[""])
             self.hint_label.configure(text="(no value needed for this op)")
+        elif op in multi_ops:
+            suggestions = self._column_value_suggestions(op)
+            self.value_combo.configure(
+                state="normal", values=suggestions or [""])
+            verb = ("matches ANY" if op == "is any of" else "excludes ALL")
+            if self._current_column_key().startswith("sp:"):
+                self.hint_label.configure(
+                    text="Success-path status — done = completed · due/blocked "
+                         "= not yet done · skipped = intentionally skipped. So "
+                         "'is any of [done]' = completed; "
+                         "'is any of [due, blocked]' = not yet done.")
+            else:
+                self.hint_label.configure(
+                    text=f"Comma-separate several values — {verb} of them "
+                         "(e.g. 'due, blocked'). Case-insensitive.")
         elif op in text_ops:
             suggestions = self._column_value_suggestions(op)
             self.value_combo.configure(
@@ -9568,6 +9844,11 @@ class FilterRow:
     def set_columns(self, columns: list[str]) -> None:
         """Replace the column dropdown's option list. Preserves the
         currently-selected value if it's still in the new list."""
+        if self._curated_provider is not None:
+            # Curated mode ignores the passed flat list — rebuild from the live
+            # success-path + current-view sources (which the refresh updated).
+            self._apply_curated(keep_current=True)
+            return
         current = self.column_combo.get()
         new_values = columns if columns else ["(refresh columns)"]
         self.column_combo.configure(values=new_values)
@@ -9575,13 +9856,18 @@ class FilterRow:
             self.column_combo.set(current)
 
     def load(self, filt: dict) -> None:
-        # Translate stored column (could be raw CSV header or display
-        # name from prior saves) to display name for the dropdown.
-        # `resolve_column` at runtime maps either form back, so this
-        # is purely a UI-side display nicety.
-        self.column_combo.set(
-            caseload_csv.display_for_column(filt.get("column", "")),
-        )
+        stored_col = filt.get("column", "") or ""
+        if str(stored_col).startswith("sp:"):
+            # Success-path step — show a friendly label, map back to the key.
+            self.set_column(stored_col)
+        else:
+            # Translate stored column (raw CSV header or display name from prior
+            # saves) to display name. `resolve_column` reverses either form at
+            # runtime, so this is purely a UI-side display nicety.
+            self._display_to_key.pop(self.column_combo.get().strip(), None)
+            disp = caseload_csv.display_for_column(stored_col)
+            self.column_combo.set(disp)
+            self._last_col = disp
         op = filt.get("op", "")
         long_op = _OP_SHORT_TO_LONG.get(op, op)
         self.op_combo.set(long_op)
@@ -9607,7 +9893,7 @@ class FilterRow:
 
     def serialize(self) -> dict:
         return {
-            "column": self.column_combo.get().strip(),
+            "column": self._current_column_key(),
             "op": self.op_combo.get(),
             "value": self.value_combo.get(),
         }
@@ -10055,6 +10341,8 @@ class ScenarioEditor:
         get_groups: Optional[Callable[[], list[str]]] = None,
         get_scenario_group: Optional[Callable[[], str]] = None,
         on_group_change: Optional[Callable[[str, str], None]] = None,
+        get_view_columns: Optional[Callable[[], list[str]]] = None,
+        get_sp_options: Optional[Callable[[], list]] = None,
     ):
         self.scenario_name = scenario.name
         self.close_tab_after = scenario.close_tab_after
@@ -10073,6 +10361,11 @@ class ScenarioEditor:
         self._get_columns = get_columns or (lambda: [])
         self._refresh_columns = refresh_columns or (lambda: [])
         self._get_value_suggestions = get_value_suggestions
+        # Filter picker data sources: the viewer's currently-shown columns (for
+        # the "In current view" section) and the success-path steps (grouped by
+        # course). Both best-effort — empty falls back gracefully.
+        self._get_view_columns = get_view_columns or (lambda: [])
+        self._get_sp_options = get_sp_options or (lambda: [])
         self.frame = ctk.CTkScrollableFrame(parent)
         self.frame.grid_columnconfigure(0, weight=1)
 
@@ -10434,11 +10727,34 @@ class ScenarioEditor:
             **SECONDARY_BTN_KWARGS,
         ).pack(side="left", padx=(8, 0))
 
+    def _sp_label_for_key(self, key: str) -> str:
+        """Friendly label for a success-path filter key (sp:<course>:<step>)."""
+        return _sp_label_for_key(key, self._get_sp_options() or [])
+
+    def _open_column_picker(self, near=None):
+        """Grouped, searchable column picker → chosen column key (or None)."""
+        return prompt_column_picker(
+            self.frame.winfo_toplevel(),
+            _column_picker_sections(self._get_columns() or [],
+                                    self._get_view_columns() or [],
+                                    self._get_sp_options() or []),
+            near=near)
+
+    def _curated_columns(self) -> list:
+        """Short curated (label, key) list for the dropdown — see
+        _curated_column_pairs."""
+        return _curated_column_pairs(self._get_columns() or [],
+                                     self._get_view_columns() or [],
+                                     self._get_sp_options() or [])
+
     def _add_filter_row(self, prefilled: Optional[dict] = None) -> FilterRow:
         cols = self._get_columns() or []
         row = FilterRow(
             self.filters_container, cols, on_delete=self._delete_filter_row,
             value_provider=self._get_value_suggestions,
+            open_picker=self._open_column_picker,
+            label_for_key=self._sp_label_for_key,
+            curated_provider=self._curated_columns,
         )
         row.frame.pack(fill="x", padx=4, pady=2)
         if prefilled:
@@ -14022,11 +14338,50 @@ class CaseloadPanel:
                 self._add_filter_row()
         self._apply_bar_mode()  # refresh the ▸/▾ arrow (respects narrow mode)
 
+    def _sp_options(self) -> list:
+        """Success-path steps offered in this viewer's column picker."""
+        try:
+            return self.app._success_path_filter_options() or []
+        except Exception:
+            return []
+
+    def _viewer_all_columns(self) -> list:
+        """All caseload columns for the picker — display names, minus the
+        injected sp:* keys (those are offered via the Success-path section)."""
+        return [c for c in self._panel_columns()
+                if not str(c).startswith("sp:")]
+
+    def _sp_label_for_key(self, key: str) -> str:
+        return _sp_label_for_key(key, self._sp_options())
+
+    def _open_column_picker(self, near=None):
+        """Same grouped, searchable picker as the action editor."""
+        try:
+            view_cols = self.app._viewer_shown_columns() or []
+        except Exception:
+            view_cols = []
+        return prompt_column_picker(
+            self.filters_container.winfo_toplevel(),
+            _column_picker_sections(self._viewer_all_columns(), view_cols,
+                                    self._sp_options()),
+            near=near)
+
+    def _curated_columns(self) -> list:
+        try:
+            view_cols = self.app._viewer_shown_columns() or []
+        except Exception:
+            view_cols = []
+        return _curated_column_pairs(self._viewer_all_columns(), view_cols,
+                                     self._sp_options())
+
     def _add_filter_row(self, prefilled: Optional[dict] = None) -> "FilterRow":
         row = FilterRow(
             self.filters_container, self._panel_columns(),
             on_delete=self._delete_filter_row,
             value_provider=self.app._filter_value_suggestions,
+            open_picker=self._open_column_picker,
+            label_for_key=self._sp_label_for_key,
+            curated_provider=self._curated_columns,
         )
         row.frame.pack(fill="x", padx=4, pady=2)
         if prefilled:
@@ -14102,7 +14457,8 @@ class CaseloadPanel:
         rows = self.app._caseload_rows or []
         if not rows:
             return []
-        return [h for h in rows[0].keys() if not _is_task_facet_col(h)]
+        return [h for h in rows[0].keys()
+                if not _is_task_facet_col(h) and not str(h).startswith("sp:")]
 
     def _capture_current_view(self, name: str) -> dict:
         """Snapshot the current columns (order + shown/hidden) and filters."""
@@ -17418,6 +17774,8 @@ class App:
             get_groups=lambda: [g.name for g in self.groups],
             get_scenario_group=(lambda n=name: self._group_of_scenario(n)),
             on_group_change=self._set_scenario_group,
+            get_view_columns=self._viewer_shown_columns,
+            get_sp_options=self._success_path_filter_options,
         )
         editor.frame.grid(row=0, column=0, sticky="nsew")
         editor.frame.grid_remove()
@@ -22772,6 +23130,24 @@ class App:
         scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         scroll.grid_columnconfigure(0, weight=1)
         cols = self._get_caseload_columns()
+        # Same curated column dropdown as the viewer / action filters. But the
+        # success-path STEP columns (sp:*) are intentionally NOT offered here:
+        # gate / skip-when are evaluated by compute_steps BEFORE those columns
+        # are populated for the row, so a step-status condition wouldn't work —
+        # offering it would be a silent footgun.
+        def _view_cols():
+            try:
+                return self._viewer_shown_columns() or []
+            except Exception:
+                return []
+
+        def open_picker(near=None):
+            return prompt_column_picker(
+                d, _column_picker_sections(cols, _view_cols(), []), near=near)
+
+        def curated():
+            return _curated_column_pairs(cols, _view_cols(), [])
+
         rows: list = []
 
         def regrid():
@@ -22789,7 +23165,10 @@ class App:
 
         def add_row(filt=None):
             fr = FilterRow(scroll, cols, on_delete=del_row,
-                           value_provider=self._filter_value_suggestions)
+                           value_provider=self._filter_value_suggestions,
+                           open_picker=open_picker,
+                           label_for_key=lambda k: k,
+                           curated_provider=curated)
             fr.frame.grid(row=len(rows), column=0, sticky="ew", padx=2, pady=2)
             if filt:
                 try:
@@ -22823,7 +23202,7 @@ class App:
             out = []
             for fr in rows:
                 col = fr.column_combo.get().strip()
-                if not col or col == "(refresh columns)":
+                if not col or col in ("(refresh columns)", _COL_SEARCH_SENTINEL):
                     continue
                 out.append(fr.serialize())
             result["val"] = out
@@ -24696,14 +25075,109 @@ class App:
         header 'MyCourseContact'). Empty list when no CSV has been
         loaded yet. The runtime filter engine reverses this via
         `caseload_csv.resolve_column`, so the dropdown can save the
-        display name and still match the CSV at fire time."""
+        display name and still match the CSV at fire time. Excludes the
+        injected sp:<course>:<step> keys — those are offered through the
+        picker's dedicated Success-path section, not the raw column list."""
         if not self._caseload_rows:
             return []
         return [
             caseload_csv.display_for_column(h)
             for h in self._caseload_rows[0].keys()
-            if not _is_task_facet_col(h)
+            if not _is_task_facet_col(h) and not str(h).startswith("sp:")
         ]
+
+    def _viewer_shown_columns(self) -> list:
+        """The caseload viewer's currently-shown columns as display names — the
+        'In current view' section of the filter picker. Best-effort; [] if the
+        panel isn't up yet."""
+        try:
+            panel = getattr(self, "caseload_panel", None)
+            tree = getattr(panel, "tree", None) if panel else None
+            if tree is None:
+                return []
+            dc = tree["displaycolumns"]
+            if not dc or dc in ("#all", ("#all",)):
+                cols = list(tree["columns"])
+            else:
+                cols = list(dc)
+            return [caseload_csv.display_for_column(c) for c in cols
+                    if not _is_task_facet_col(c) and not str(c).startswith("sp:")]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _sp_col(course: str, step_id: str) -> str:
+        """Synthetic filter-column key for a success-path step."""
+        return f"sp:{course}:{step_id}"
+
+    def _success_paths(self) -> dict:
+        """{course_code: SuccessPath} from scenarios.yaml (best-effort)."""
+        try:
+            from src.scenarios import load_success_paths
+            return load_success_paths() or {}
+        except Exception:
+            return {}
+
+    def _inject_success_path_columns(self, rows) -> None:
+        """Enrich each caseload row with sp:<course>:<step_id> keys carrying the
+        student's live success-path status (done/skipped/due/blocked). A student
+        on a DIFFERENT course than a step's path gets 'off-path' for that key, so
+        a positive 'is any of [due, blocked]' filter naturally excludes them
+        (that's why success-path filters use positive membership)."""
+        if not rows:
+            return
+        try:
+            from src import success_path as sp
+            paths = self._success_paths()
+            if not paths:
+                return
+            all_status = sp.all_step_status()
+            all_fields = sp.all_field_values()
+        except Exception:
+            return
+        # Normalize course keys once; remember the original (DB-logged) code too.
+        norm_paths: dict = {}
+        all_keys: list = []
+        for course, path in paths.items():
+            nc = self._norm_course(course)
+            norm_paths[nc] = (course, path)
+            for st in path.steps:
+                all_keys.append(self._sp_col(nc, st.id))
+        for row in rows:
+            for k in all_keys:
+                row[k] = SP_OFF_PATH
+            sid = (row.get("StudentID") or "").strip()
+            rc = self._norm_course(row.get("CourseCode") or "")
+            entry = norm_paths.get(rc)
+            if not sid or entry is None:
+                continue
+            orig_course, path = entry
+            events = (all_status.get((sid, rc))
+                      or all_status.get((sid, orig_course)) or {})
+            fields = (all_fields.get((sid, rc))
+                      or all_fields.get((sid, orig_course)) or {})
+            try:
+                computed = sp.compute_steps(path.steps, row, events, fields)
+            except Exception:
+                continue
+            for st in computed:
+                row[self._sp_col(rc, st["id"])] = st["status"]
+
+    def _success_path_filter_options(self) -> list:
+        """Success-path steps offered in the filter picker's Success-path
+        section: [{course, step_id, label, column}] grouped by course, in path
+        order."""
+        out: list = []
+        for course, path in self._success_paths().items():
+            nc = self._norm_course(course)
+            for st in path.steps:
+                out.append({
+                    "course": nc,
+                    "step_id": st.id,
+                    "label": st.description or st.id,
+                    "column": self._sp_col(nc, st.id),
+                })
+        return out
 
     def _refresh_caseload_columns_for_editor(self) -> list[str]:
         """↻ Refresh columns button in the filter editor: forces a
@@ -25336,6 +25810,9 @@ class App:
                 if not silent:
                     self._append_log(f"  ↳ grid-source skipped: {e}")
         self._caseload_rows = rows
+        # Enrich rows with success-path step status (sp:<course>:<step_id> keys)
+        # so actions can filter by "step not done / skipped / due" etc.
+        self._inject_success_path_columns(rows)
         # Remember whether the cache is grid-JSON-backed or plain CSV so
         # downstream logs (e.g. batch fire) label the source honestly.
         self._caseload_from_json = source.startswith("live grid JSON")
