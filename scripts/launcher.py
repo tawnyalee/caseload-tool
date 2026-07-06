@@ -21527,8 +21527,10 @@ class App:
             # Loud staleness warning: Mongoose opt-in can change any time, so an
             # export more than a day old may silently skip newly-enrolled
             # students at text time. (The startup auto-refresh + pre-fire popup
-            # act on the same signal.)
-            if self._mongoose_is_stale():
+            # act on the same signal.) Skipped when the API text path is on — it
+            # doesn't use the segment, so its freshness is irrelevant.
+            if (self._mongoose_is_stale()
+                    and not getattr(self.settings, "text_send_via_api", False)):
                 self._append_log(
                     f"⚠ Mongoose text-ID export is {self._mongoose_age_human()} "
                     "— it can change several times a day. New students may be "
@@ -21540,7 +21542,8 @@ class App:
             # verified-opt-in setup. Texting already works via the Salesforce
             # Contact id + opt-in field — this only flags the reliability upgrade
             # (the SF field can disagree with who's actually opted in in Mongoose).
-            if not getattr(self, "_texting_setup_hinted", False):
+            if (not getattr(self, "_texting_setup_hinted", False)
+                    and not getattr(self.settings, "text_send_via_api", False)):
                 try:
                     texts = any(getattr(s, "text", None) is not None
                                 for s in (self.scenarios or {}).values())
@@ -21695,7 +21698,10 @@ class App:
         """Pre-fire gate for texting actions: if the action texts AND the
         Mongoose export is stale, prompt to update first / continue / cancel.
         Returns True to proceed with the fire, False to abort. Non-texting
-        actions and fresh exports pass straight through."""
+        actions and fresh exports pass straight through. The API text path
+        doesn't use the segment at all, so skip this entirely when it's on."""
+        if getattr(self.settings, "text_send_via_api", False):
+            return True
         if not self._action_texts(scenario) or not self._mongoose_is_stale():
             return True
         choice = prompt_mongoose_stale(self.root, self._mongoose_age_human())
@@ -21800,7 +21806,14 @@ class App:
                        these are flagged 'unverified' in the text review;
           ''         — not opted in.
         Mongoose membership is preferred because SF's field can say 'Opted In'
-        for a student whose 'SMS opt-in Academic' box is actually unchecked."""
+        for a student whose 'SMS opt-in Academic' box is actually unchecked.
+
+        When the API text path is on, opt-in is resolved AUTHORITATIVELY at send
+        time from the search's optedIn flag, so we DON'T consult the (fallback)
+        segment here — a cheap SF-field pre-filter is enough; the API makes the
+        final call (and cleanly skips anyone not actually opted in)."""
+        if getattr(self.settings, "text_send_via_api", False):
+            return "sf" if self._texting_opted_in(row) else ""
         course = self._norm_course(row.get("CourseCode") or "")
         if course and course in self._mongoose_courses:
             sid = (row.get("StudentID") or "").strip()
@@ -28633,6 +28646,8 @@ class App:
         """Auto-refresh the Mongoose text-ID export at startup when it EXISTS but
         is stale (first-time creation stays manual / prompted at fire), there are
         courses to export, and Mongoose is signed in."""
+        if getattr(self.settings, "text_send_via_api", False):
+            return  # API path doesn't use the segment — no startup refresh
         if self._mongoose_export_age_hours() is None:
             return  # no export yet — don't force creation during startup
         if not self._mongoose_is_stale():
