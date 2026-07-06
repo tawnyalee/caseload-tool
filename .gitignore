@@ -20,7 +20,7 @@ dist-nuitka/
 # git can't re-include a file inside a wholly-excluded directory.)
 resources/*
 !resources/app.ico
-!resources/splash.gif
+!resources/splash.png
 
 # Nuitka intermediates
 *.build/

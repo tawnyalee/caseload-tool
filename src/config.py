@@ -87,9 +87,12 @@ def _resource(rel: str) -> Path:
     return base / rel
 
 
-# Startup splash (animated GIF) + app/window icon (.ico). Optional — drop the
-# files at these paths and they're used automatically; missing = no-op.
-SPLASH_GIF = _resource("resources/splash.gif")
+# Startup splash image + app/window icon (.ico). Optional — drop the files at
+# these paths and they're used automatically; missing = no-op. The splash may be
+# a static image (PNG) or an animated GIF — the loader plays through once and
+# holds the last frame (see SplashScreen). PNG is preferred for artwork with
+# smooth gradients (GIF's 256-colour palette bands watercolour + fades).
+SPLASH_GIF = _resource("resources/splash.png")
 APP_ICON = _resource("resources/app.ico")
 
 # Email templates. Renamed from the bare "templates" folder. Migrate the

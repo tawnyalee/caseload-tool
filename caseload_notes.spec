@@ -11,10 +11,10 @@ from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
-# Optional startup splash GIF + app icon. Included only if present, so the build
-# works whether or not the artist files have been dropped in yet.
+# Optional startup splash image + app icon. Included only if present, so the
+# build works whether or not the artist files have been dropped in yet.
 _res_datas = [
-    (p, "resources") for p in ("resources/splash.gif", "resources/app.ico")
+    (p, "resources") for p in ("resources/splash.png", "resources/app.ico")
     if os.path.exists(p)
 ]
 _app_icon = "resources/app.ico" if os.path.exists("resources/app.ico") else None
