@@ -71,6 +71,10 @@ _SNAP_COLS = [
     "followup_date", "extra_json",
 ]
 
+# Reverse of _CORE_HEADERS: snapshot column -> canonical CSV header. Used to
+# rebuild a caseload-style row (CSV-header keys) from a stored snapshot.
+_SNAP_TO_CSV = {snap_col: csv_header for csv_header, snap_col in _CORE_HEADERS.items()}
+
 # If a fresh export has fewer than this fraction of the prior collection's
 # rows, treat it as a truncated/filtered export and suppress departures.
 _PARTIAL_EXPORT_FRACTION = 0.5
@@ -489,6 +493,79 @@ def find_departures(*, db_path=HISTORY_DB) -> list[dict]:
         }
         return [_departure_dict(r) for r in prior_rows
                 if (r["student_id"], r["course_code"]) not in latest_keys]
+    finally:
+        conn.close()
+
+
+def _snapshot_to_viewer_row(r: sqlite3.Row) -> dict:
+    """Rebuild a caseload-style row (CSV-header keys, like app._caseload_rows)
+    from one snapshots row: the ~100 non-core columns in extra_json, overlaid
+    with the core fields under their canonical CSV headers."""
+    try:
+        extra = json.loads(r["extra_json"] or "{}")
+    except Exception:
+        extra = {}
+    row = dict(extra) if isinstance(extra, dict) else {}
+    for snap_col, csv_header in _SNAP_TO_CSV.items():
+        row[csv_header] = r[snap_col] or ""
+    return row
+
+
+def archived_students(current_keys=None, *, db_path=HISTORY_DB) -> list[dict]:
+    """Every student we've ever snapshotted who is no longer on the caseload —
+    as viewer-ready rows (CSV-header keys), each rebuilt from that student's
+    LAST-KNOWN snapshot. Enriched with the pass outcome (ArchivedOutcome /
+    'Passed <date>') when the passed-archive has it, else inferred from the last
+    task status. `current_keys` is a set of (student_id, course_code) to treat
+    as still-on-caseload and exclude; when None the latest snapshot collection
+    is used as 'current'. Newest departures first."""
+    conn = _connect(db_path)
+    try:
+        if current_keys is None:
+            latest = conn.execute(
+                "SELECT collected_at FROM collections "
+                "ORDER BY collected_at DESC LIMIT 1").fetchone()
+            current = set()
+            if latest is not None:
+                current = {
+                    (r["student_id"], r["course_code"]) for r in conn.execute(
+                        "SELECT student_id, course_code FROM snapshots "
+                        "WHERE collected_at = ?", (latest["collected_at"],))}
+        else:
+            current = {(str(a), str(b)) for (a, b) in current_keys}
+
+        # Last-known snapshot per (student, course).
+        rows = conn.execute(
+            "SELECT s.* FROM snapshots s JOIN ("
+            "  SELECT student_id, course_code, MAX(collected_at) AS mx "
+            "  FROM snapshots GROUP BY student_id, course_code) L "
+            "ON s.student_id = L.student_id AND s.course_code = L.course_code "
+            "AND s.collected_at = L.mx").fetchall()
+        outcomes = {
+            (r["student_id"], r["course_code"]): r for r in conn.execute(
+                "SELECT student_id, course_code, outcome, pass_date "
+                "FROM outcomes")}
+
+        result = []
+        for r in rows:
+            key = (r["student_id"], r["course_code"])
+            if key in current:
+                continue
+            row = _snapshot_to_viewer_row(r)
+            oc = outcomes.get(key)
+            passed = bool(oc and (oc["outcome"] or "").strip() == "passed")
+            row["ArchivedLastSeen"] = r["collected_date"] or ""
+            if passed:
+                row["ArchivedOutcome"] = (
+                    "Passed " + (oc["pass_date"] or "")).strip()
+            elif (r["latest_task_status"] or "").strip() == "Passed":
+                row["ArchivedOutcome"] = "Passed"
+            else:
+                row["ArchivedOutcome"] = "Left"
+            row["_archived"] = True
+            result.append(row)
+        result.sort(key=lambda d: d.get("ArchivedLastSeen", ""), reverse=True)
+        return result
     finally:
         conn.close()
 
