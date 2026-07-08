@@ -18141,6 +18141,7 @@ class App:
         # "click an action to add it" picking mode.
         self.action_queue = ActionQueue()
         self._queue_add_mode = False
+        self._queue_pending_review: list[str] = []   # deferred (added while busy)
 
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
@@ -18345,10 +18346,24 @@ class App:
         return None
 
     def _refresh_queue_add_affordance(self) -> None:
-        """Reflect queue state on the main action buttons (add-mode highlight and
-        an 'already queued' mark). Wired in stage 2; a safe no-op until then so
-        the QueuePanel can call it now."""
-        pass
+        """Reflect queue state on the main action buttons: in add-mode every
+        button gets a highlight border, and already-queued actions are disabled
+        (can't add the same action twice). Outside add-mode the borders clear.
+        Never fights the busy disable — only touches enabled state when idle."""
+        add_mode = getattr(self, "_queue_add_mode", False)
+        for name, btn in getattr(self, "scenario_buttons", {}).items():
+            try:
+                if add_mode:
+                    btn.configure(border_width=2,
+                                  border_color=("#1f6feb", "#4a9eff"))
+                else:
+                    btn.configure(border_width=0)
+                if not self._is_busy:
+                    queued = self.action_queue.has(name)
+                    btn.configure(
+                        state="disabled" if (add_mode and queued) else "normal")
+            except Exception:
+                pass
 
     def _rebuild_scenario_buttons(self) -> None:
         """Render the scenario button list. Layout depends on whether
@@ -20982,11 +20997,19 @@ class App:
         )
 
     def _fire(self, scenario: ScenarioConfig) -> None:
+        # "Add to queue" mode: clicking an action ADDS it (review now, run
+        # later) instead of firing it.
+        if getattr(self, "_queue_add_mode", False):
+            self._queue_add_action(scenario)
+            return
         if self._is_busy:
-            self._append_log(
-                f"Busy — wait for the current task to finish before "
-                f"firing {scenario.name!r}."
-            )
+            # Don't just refuse — offer to queue it for after the current run
+            # (the review happens once the browser frees up).
+            if ask_yes_no_topmost(
+                    self.root, "Add to queue?",
+                    f"A task is running.\n\nAdd {scenario.name!r} to the queue "
+                    "and review it after the current run finishes?"):
+                self._queue_defer_add(scenario.name)
             return
         if getattr(self, "_task_scrape_running", False):
             self._append_log(
@@ -21040,6 +21063,103 @@ class App:
             self._fire_per_student(scenario, override)
         finally:
             self._set_idle()
+
+    # ==================================================================
+    # Action queue — add flow (review at add time; run in a later stage).
+    # ==================================================================
+
+    def _queue_add_action(self, scenario: ScenarioConfig) -> None:
+        """Review a BATCH action now and add it to the queue (to run later).
+        Pops an explanatory dialog for actions that can't be queued (single-
+        student, and — for now — branched or text-only). Nothing is sent here;
+        the reviewed payload is stored on the queue item and committed when the
+        queue is run."""
+        from tkinter import messagebox
+        name = scenario.name
+        # Eligibility: standard batch actions only.
+        if scenario.batch is None:
+            messagebox.showinfo(
+                "Can't queue this action",
+                f"{name!r} runs on a single student, so it doesn't fit the "
+                "queue.\n\nThe queue is for batch actions that fire across the "
+                "caseload. Fire single-student actions directly.")
+            return
+        if getattr(scenario, "branches", None):
+            messagebox.showinfo(
+                "Can't queue this action yet",
+                f"{name!r} is a branched action. Queueing branched actions "
+                "isn't supported yet — fire it directly for now.")
+            return
+        if self._is_text_only(scenario):
+            messagebox.showinfo(
+                "Can't queue this action yet",
+                f"{name!r} is text-only. Queueing text-only actions isn't "
+                "supported yet — fire it directly for now.")
+            return
+        if self.action_queue.has(name):
+            messagebox.showinfo(
+                "Already queued",
+                f"{name!r} is already in the queue. An action can only be "
+                "queued once.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Can't queue — browser not ready yet.")
+            return
+        # Same front guards as a direct fire.
+        if not self._confirm_no_placeholder_email(scenario):
+            self._append_log(
+                f"{name!r}: not queued — sample placeholder email not replaced.")
+            return
+        if not self._mongoose_fresh_gate(scenario):
+            return
+        override = self.course_var.get().strip()
+        self._append_log(f"--- Reviewing {name!r} to add to the queue ---")
+        self._set_busy(f"Queue: reviewing {name}…")
+        try:
+            payload = self._collect_batch_review(scenario, override)
+        finally:
+            self._set_idle()
+        if payload is None:
+            self._append_log(f"{name!r}: not added to queue (review cancelled).")
+            return
+        self.action_queue.add(QueueItem(
+            action_name=name,
+            display_name=self._action_display_name(scenario),
+            color=self._color_for_scenario(name),
+            payload=payload,
+        ))
+        n = len(payload.get("confirmed") or [])
+        self._append_log(
+            f"✓ Queued {name!r} — {n} student(s) reviewed.", success=True)
+        try:
+            self.queue_panel.refresh()
+            self.log_tabview.set("Queue")
+        except Exception:
+            pass
+        self._refresh_queue_add_affordance()
+
+    def _queue_defer_add(self, name: str) -> None:
+        """Remember an action to review + queue once the current run finishes
+        (the 'already running → add to queue?' path — the browser is busy now,
+        so the review waits until it's free; see _drain_pending_review)."""
+        if self.action_queue.has(name) or name in self._queue_pending_review:
+            self._append_log(f"{name!r} is already queued or pending review.")
+            return
+        self._queue_pending_review.append(name)
+        self._append_log(
+            f"{name!r}: will be reviewed + queued after the current run.")
+
+    def _drain_pending_review(self) -> None:
+        """Review + queue actions deferred while busy, one at a time as the
+        browser frees up. Guarded so it never runs mid-task."""
+        if self._is_busy or not self._queue_pending_review:
+            return
+        name = self._queue_pending_review.pop(0)
+        sc = (self.scenarios or {}).get(name)
+        if sc is not None:
+            self._queue_add_action(sc)
+        if self._queue_pending_review and not self._is_busy:
+            self.root.after(300, self._drain_pending_review)
 
     def _collect_prompt_vars(
         self, scenario: ScenarioConfig,
@@ -22434,30 +22554,40 @@ class App:
         return self._send_text_payload(payload)
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
-        """Drive a batch scenario end-to-end: load caseload, filter,
-        review/confirm, then loop email→note per selected student.
-        The activity log is the progress display; cancellation is via
-        any modal Cancel button (which aborts the batch from that
-        point on)."""
-        from tkinter import messagebox
-
-        # Text-only batch: no Salesforce notes/navigation — render each
-        # student's text, review them all, then send/schedule each. Its own
-        # driver (the note/email path below doesn't apply).
+        """Drive a batch scenario end-to-end (immediate fire): collect the
+        review, then commit it. Split into _collect_batch_review (all pre-flight
+        + user review/input, no sending) and _commit_batch (text send +
+        per-student email→note loop) so the Action Queue can collect at ADD time
+        and commit at RUN time. The activity log is the progress display."""
+        # Text-only batch: no Salesforce notes/navigation — its own driver.
         if self._is_text_only(scenario):
             self._fire_batch_text(scenario)
             return
+        payload = self._collect_batch_review(scenario, override)
+        if payload is None:
+            return  # aborted / cancelled during review (already logged)
+        self._commit_batch(payload)
+
+    def _collect_batch_review(self, scenario: ScenarioConfig, override: str):
+        """COLLECT half of a standard (non-text-only, non-branched) batch: run
+        every pre-flight and ALL user review/input — filters, prompts, email
+        review, note inputs, and text REVIEW — and return a payload dict for
+        _commit_batch to run later, WITHOUT sending anything. Returns None if the
+        action was aborted or cancelled at any step (already logged). The Action
+        Queue stores this payload at add time; the immediate-fire path commits
+        it right away."""
+        from tkinter import messagebox
 
         # A combined action will send texts — confirm Mongoose is signed in
         # BEFORE the (expensive) email review, so a lapsed session doesn't
         # waste the review or half-run the action (texts→emails→notes).
         if scenario.text is not None and not self._ensure_mongoose_logged_in():
-            return
+            return None
         # …and confirm Salesforce is signed in BEFORE any texts/emails go out,
         # so an SSO logout aborts the whole batch up front instead of failing
         # at note-filing time with the sends already done.
         if scenario.notes and not self._ensure_salesforce_logged_in():
-            return
+            return None
 
         # Pre-flight: if any note has Submit unchecked, confirm before
         # we touch the caseload. Different message than single-fire
@@ -22467,7 +22597,7 @@ class App:
             self._append_log(
                 f"Batch {scenario.name!r}: aborted at submit-unchecked warning."
             )
-            return
+            return None
 
         # Pre-flight: CSV missing the student-email column. Warn ONCE
         # per session (skip latch is honored on subsequent fires) so
@@ -22479,7 +22609,7 @@ class App:
                 f"Batch {scenario.name!r}: aborted at "
                 "CSV-no-email warning."
             )
-            return
+            return None
 
         self._warn_if_caseload_stale("this batch")
 
@@ -22503,7 +22633,7 @@ class App:
             rows = self._read_all_caseload_rows_blocking()
             if not rows:
                 self._append_log("Batch aborted: couldn't load caseload rows.")
-                return
+                return None
 
         # Step 2: apply filters. Translate any display-name columns
         # (e.g. 'Last Assigned CI Contact') to the CSV / DOM column
@@ -22542,7 +22672,7 @@ class App:
                 "columns in the editor) to refresh the cache. Then "
                 "try again.",
             )
-            return
+            return None
 
         # Route any "Task N" filter to its date/count/status facet by op (the
         # original `filters` keep the visible "Task N" column for the safety
@@ -22555,7 +22685,7 @@ class App:
                 f"No students match the filters for {scenario.name!r}.",
             )
             self._append_log("Batch: no matches; nothing to do.")
-            return
+            return None
         self._append_log(f"Filters matched {len(matched)} students.")
 
         # Step 3: pick the display columns for the review dialog —
@@ -22573,7 +22703,7 @@ class App:
         # they must be collected before review).
         prompt_vars = self._collect_prompt_vars(scenario)
         if prompt_vars is None:
-            return  # user cancelled a prompt
+            return None  # user cancelled a prompt
 
         # Step 5: review-and-confirm — combined per-student email
         # preview when the scenario has an email step (FERPA-quality
@@ -22591,17 +22721,17 @@ class App:
                 scenario, matched, prompt_vars, filter_summary,
             )
             if confirmed is None:
-                return  # cancelled / nothing selected (already logged)
+                return None  # cancelled / nothing selected (already logged)
         elif scenario.batch.preview:
             confirmed = prompt_batch_review(
                 self.root, scenario.name, matched, display_columns,
             )
             if confirmed is None:
                 self._append_log("Batch cancelled.")
-                return
+                return None
             if not confirmed and scenario.text is None:
                 self._append_log("Batch: 0 students confirmed; nothing to do.")
-                return
+                return None
         else:
             confirmed = matched
 
@@ -22616,28 +22746,56 @@ class App:
             note_inputs = self._collect_note_inputs(
                 scenario, len(confirmed), "batch")
             if note_inputs is None:
-                return  # cancelled at an additional-text prompt
+                return None  # cancelled at an additional-text prompt
 
-        # Text channel (combined action): review (the last interactive step)
-        # then SEND — timezone-grouped + scheduled. Cancelling aborts the
-        # action. After this point everything runs without user input.
+        # Text channel (combined action): REVIEW only (the last interactive
+        # step) — timezone-grouped + scheduled. The reviewed selection is
+        # stored and SENT at commit time (so a queued action reviews at add
+        # time, sends at run time). Cancelling aborts the action.
+        text_groups = None
+        text_selected = None
         if scenario.text is not None:
-            tgroups, tskipped = self._build_text_review_groups(
+            text_groups, tskipped = self._build_text_review_groups(
                 scenario, matched, prompt_vars)
-            if tgroups is None:
-                return
-            if tgroups and not self._review_and_send_texts(
-                    scenario, tgroups, tskipped):
-                self._append_log(
-                    "Action cancelled at text review; notes/email not run.")
-                return
+            if text_groups is None:
+                return None
+            if text_groups:
+                text_selected = self._review_texts(
+                    scenario, text_groups, tskipped)
+                if text_selected is None:
+                    self._append_log(
+                        "Action cancelled at text review; nothing sent.")
+                    return None
 
-        # Step 7 (the per-student loop) — shared with the panel mini-batch.
-        # Pass the pre-collected note input so the loop doesn't prompt again.
+        return {
+            "scenario": scenario, "override": override,
+            "confirmed": confirmed, "prompt_vars": prompt_vars,
+            "has_email": has_email, "body_overrides": body_overrides,
+            "note_inputs": note_inputs,
+            "text_groups": text_groups, "text_selected": text_selected,
+        }
+
+    def _commit_batch(self, payload: dict) -> None:
+        """COMMIT half: send the reviewed texts (if any), then run the shared
+        per-student email→note loop. Consumes a payload from
+        _collect_batch_review. A stop/abort at the text send skips the
+        email/note phase (same contract as the old inline flow)."""
+        scenario = payload["scenario"]
+        text_groups = payload.get("text_groups")
+        if text_groups:
+            if not self._send_reviewed_texts(
+                    scenario, text_groups, payload["text_selected"]):
+                self._append_log(
+                    "Action cancelled/stopped at text send; "
+                    "notes/email not run.")
+                return
+        # The per-student loop — shared with the panel mini-batch. Pass the
+        # pre-collected note input so the loop doesn't prompt again.
         self._execute_scenario_over_rows(
-            scenario, override, confirmed, prompt_vars,
-            has_email=has_email, source="batch", body_overrides=body_overrides,
-            prefetched_inputs=note_inputs,
+            scenario, payload["override"], payload["confirmed"],
+            payload["prompt_vars"], has_email=payload["has_email"],
+            source="batch", body_overrides=payload["body_overrides"],
+            prefetched_inputs=payload["note_inputs"],
         )
 
     # ==================================================================
@@ -23124,11 +23282,12 @@ class App:
             })
         return review_groups, skipped_names
 
-    def _review_and_send_texts(self, scenario, review_groups, skipped_names):
-        """Show the batch-text reviewer, then send each selected group's text as
-        one multi-recipient scheduled compose. Returns False if the user
-        cancelled the review (so a combined action aborts), True otherwise."""
-        self._text_outcome = None  # set below; read by the per-action summary
+    def _review_texts(self, scenario, review_groups, skipped_names):
+        """Show the batch-text reviewer and return the per-group recipient
+        selection (a list of recipient-lists), or None if cancelled. Reviews
+        ONLY — the caller sends later via _send_reviewed_texts, so a queued
+        action can review at ADD time and send at RUN time."""
+        self._text_outcome = None
         scheduled = True  # texts are always scheduled
         filter_summary = ""
         if scenario.batch is not None:
@@ -23143,7 +23302,16 @@ class App:
             filter_summary, scheduled=scheduled)
         if selected is None:
             self._append_log("Batch text cancelled.")
-            return False
+            return None
+        return selected
+
+    def _send_reviewed_texts(self, scenario, review_groups, selected):
+        """Send each selected group's text as one multi-recipient scheduled
+        compose. `selected` is the per-group recipient selection returned by
+        _review_texts. Returns False if the user STOPPED mid-send (so a combined
+        action aborts before its email/note phase), True otherwise."""
+        self._text_outcome = None  # set below; read by the per-action summary
+        scheduled = True  # texts are always scheduled
         if not any(selected):
             self._append_log("Batch text: 0 recipients selected; skipping texts.")
             self._text_outcome = {"scheduled_recipients": 0, "groups": 0,
@@ -23227,6 +23395,15 @@ class App:
         # Returning False on STOP makes a combined action abort before its
         # email/note phase (same contract as a cancelled review).
         return not stopped
+
+    def _review_and_send_texts(self, scenario, review_groups, skipped_names):
+        """Review then immediately send — the non-queued fire path. Thin wrapper
+        over _review_texts + _send_reviewed_texts (the queue calls those two
+        separately so it can review at add time and send at run time)."""
+        selected = self._review_texts(scenario, review_groups, skipped_names)
+        if selected is None:
+            return False
+        return self._send_reviewed_texts(scenario, review_groups, selected)
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
@@ -27256,6 +27433,11 @@ class App:
                 btn.configure(state="normal")
             except Exception:
                 pass
+        # Re-apply the queue add-mode affordance (queued buttons stay disabled
+        # in add-mode) and review any actions the user deferred while busy.
+        self._refresh_queue_add_affordance()
+        if getattr(self, "_queue_pending_review", None):
+            self.root.after(300, self._drain_pending_review)
 
     def _tick_spinner(self) -> None:
         if not self._is_busy:
