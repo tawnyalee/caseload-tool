@@ -455,6 +455,12 @@ class BrowserWorker:
         mobile on an off-caseload record). on_done({ok, fields, related, …})."""
         self.q.put(("OC_PROBE", query, on_done))
 
+    def submit_open_contact_id(self, contact_id: str, name: str,
+                               on_done: Callable[[dict], None]) -> None:
+        """Open a specific Contact by its 003 id (deep-link) — used by the
+        off-caseload search picker. on_done({ok, contact_id, name} | {error})."""
+        self.q.put(("OPEN_CONTACT_ID", contact_id, name, on_done))
+
     def submit_find_student(self, query: str, new_tab: bool = False,
                             raise_after: Optional[bool] = None) -> None:
         """Navigate to a student record. When `new_tab` is True the
@@ -874,6 +880,15 @@ class BrowserWorker:
             res = {}
             try:
                 res = self._oc_probe(ctx, query)
+            finally:
+                on_done(res)
+        elif cmd[0] == "OPEN_CONTACT_ID":
+            _, cid, name, on_done = cmd
+            res = {}
+            try:
+                ok = self._navigate_to_contact(ctx, cid)
+                res = ({"ok": True, "contact_id": cid, "name": name} if ok
+                       else {"error": f"couldn't open {name or cid}"})
             finally:
                 on_done(res)
         elif cmd[0] == "FIND":
@@ -15370,15 +15385,24 @@ class CaseloadPanel:
         if q.lower().startswith("ocprobe"):
             self.app._oc_probe_run(q[len("ocprobe"):].lstrip(": ").strip())
             return "break"
+        rows = self.app._caseload_rows or []
+        ql = q.lower()
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
-            rows = self.app._caseload_rows or []
-            ql = q.lower()
             on_caseload = any(
                 str(r.get("StudentID", "") or r.get("Student ID", "")).strip() == q
                 or ql in str(r.get("StudentEmail", "") or "").lower()
                 for r in rows)
             if not on_caseload:
+                self.app._open_student_global(q)
+            return "break"
+        # A NAME with no match on the caseload → search all of Salesforce (a
+        # picker handles multiple hits). Gated on "nobody here matches" so a
+        # normal in-caseload filter+Enter never fires a search, and skipped in
+        # Archived mode (that grid is history, not the live caseload).
+        if q and len(q) >= 3 and not getattr(self, "_archived_mode", False):
+            name_here = any(ql in str(r.get("Name", "")).lower() for r in rows)
+            if not name_here:
                 self.app._open_student_global(q)
         return "break"
 
@@ -21176,6 +21200,69 @@ class App:
 
         self.worker.submit_api_note_test(cid, course, on_done)
 
+    def _open_contact_id(self, contact_id: str, name: str = "") -> None:
+        """Open a specific off-caseload student's Salesforce record by Contact id
+        (from the search picker). Notes then file via the off-caseload path."""
+        if self._is_busy:
+            self._append_log("Busy — finish the current task first.")
+            return
+        if not self.worker.ready_event.is_set():
+            self._append_log("Browser not ready yet — wait and try again.")
+            return
+        self._append_log(f"--- Opening {name or contact_id} (off-caseload) ---")
+
+        def on_done(res):
+            def show():
+                if res and res.get("ok"):
+                    self._append_log(
+                        f"Opened {res.get('name') or name} (off-caseload) — fire "
+                        "a Find-first-off note action to file a note.", success=True)
+                else:
+                    self._append_log(
+                        f"Couldn't open the record: "
+                        f"{(res or {}).get('error', 'unknown error')}", error=True)
+            try:
+                self.root.after(0, show)
+            except Exception:
+                show()
+
+        self.worker.submit_open_contact_id(contact_id, name, on_done)
+
+    def _pick_offcaseload_match(self, query: str, matches: list) -> None:
+        """A name can match several people in Salesforce — show a picker so the
+        user opens the right one (name · Contact id). Opened via _open_contact_id."""
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(f"Salesforce matches for {query!r}")
+        dlg.geometry("440x360")
+        try:
+            dlg.transient(self.root)
+            dlg.attributes("-topmost", True)
+            dlg.after(120, lambda: (dlg.lift(), dlg.focus_force()))
+        except Exception:
+            pass
+        ctk.CTkLabel(
+            dlg, text=f"{len(matches)} matches — pick one to open:",
+            font=ctk.CTkFont(size=13, weight="bold")).pack(
+            padx=12, pady=(12, 6), anchor="w")
+        body = ctk.CTkScrollableFrame(dlg)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
+        def pick(cid, name):
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._open_contact_id(cid, name)
+
+        for m in matches:
+            cid = m.get("contact_id", "")
+            name = m.get("name") or "(unknown)"
+            ctk.CTkButton(
+                body, text=f"{name}    ·    {cid}", anchor="w",
+                command=lambda c=cid, n=name: pick(c, n)).pack(fill="x", pady=2)
+        ctk.CTkButton(dlg, text="Cancel", command=dlg.destroy,
+                      **SECONDARY_BTN_KWARGS).pack(pady=(4, 10))
+
     def _oc_probe_run(self, query: str) -> None:
         """PROBE (ocprobe:<name/ID>): open an off-caseload student via global
         search, then dump their record's field label/value pairs + related-list
@@ -21259,10 +21346,9 @@ class App:
                         "fire a Find-first-off note action to file a note.")
                 elif res and res.get("matches"):
                     ms = res["matches"]
-                    names = ", ".join(m.get("name") or "?" for m in ms[:6])
                     self._append_log(
-                        f"{len(ms)} matches for {query!r} — refine with the "
-                        f"Student ID or email. ({names})")
+                        f"{len(ms)} Salesforce matches for {query!r} — pick one.")
+                    self._pick_offcaseload_match(query, ms)
                 else:
                     self._append_log(
                         f"No Salesforce match for {query!r}: "
