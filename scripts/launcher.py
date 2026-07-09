@@ -21417,7 +21417,10 @@ class App:
                         "", "=== VISIBLE TEXT (DOM order — label then value) ===",
                         *snips,
                     ]
-                    path = os.path.join(os.getcwd(), "oc_probe.txt")
+                    tab = res.get("clicked_tab") or ""
+                    slug = re.sub(r"[^a-z0-9]+", "-", tab.lower()).strip("-")
+                    fname = f"oc_probe__{slug}.txt" if slug else "oc_probe.txt"
+                    path = os.path.join(os.getcwd(), fname)
                     try:
                         with open(path, "w", encoding="utf-8") as f:
                             f.write("\n".join(lines))
