@@ -22019,6 +22019,22 @@ class App:
         if not runnable:
             self._append_log("Queue: nothing checked to run.")
             return
+        # Re-send guard: Starting with checked ERROR rows RETRIES them, which
+        # re-sends emails/texts + re-files notes for ALL of that action's
+        # students (there's no per-student resume). Make it a deliberate choice.
+        retries = [it for it in runnable if it.status == QueueStatus.ERROR]
+        if retries:
+            names = ", ".join(repr(it.action_name) for it in retries[:6])
+            if not ask_yes_no_topmost(
+                    self.root, "Retry failed action(s)?",
+                    f"{len(retries)} action(s) will be RE-RUN: {names}.\n\n"
+                    "Retrying re-sends the emails/texts and re-files the notes "
+                    "for ALL of each action's students — including any that "
+                    "already succeeded (there's no per-student resume yet). "
+                    "Continue?",
+                    yes_label="Retry (re-send)", no_label="Cancel"):
+                self._append_log("Queue: retry cancelled.")
+                return
         # A fresh Start = retry: reset checked ERROR rows to PENDING so each
         # runs exactly ONCE this pass. (Without this the step machine, which
         # advances over runnable items, would re-pick an item the instant it
@@ -24417,10 +24433,20 @@ class App:
                         "Email/notes were NOT run.", error=True)
                     return False
                 if not res or res.get("error"):
-                    self._append_log(
-                        f"  text failed [{grp['label']}]: "
-                        f"{(res or {}).get('error')}", error=True)
-                    failed += 1
+                    err = (res or {}).get("error") or ""
+                    if "No recipients could be added" in err:
+                        # BENIGN: every recipient in this group is not in Mongoose
+                        # (same as not-opted-in) — a SKIP, not a failure. Counting
+                        # it as failed wrongly marks the whole action ERROR (which
+                        # is what fed the re-run loop). Don't count it either way.
+                        groups_sent -= 1
+                        self._append_log(
+                            f"  text: {grp['label']} — no addable recipients "
+                            "(not in Mongoose); skipped.")
+                    else:
+                        self._append_log(
+                            f"  text failed [{grp['label']}]: {err}", error=True)
+                        failed += 1
                 else:
                     sent += len(mobiles)
         finally:
