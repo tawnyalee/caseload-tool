@@ -37,10 +37,20 @@ class QueueStatus(str, Enum):
         return self in (QueueStatus.DONE, QueueStatus.ERROR)
 
     @property
-    def is_frozen(self) -> bool:
-        """Frozen items can't be checked/unchecked/removed (running, or already
-        run). Only PENDING rows stay editable."""
-        return self in (QueueStatus.RUNNING, QueueStatus.DONE, QueueStatus.ERROR)
+    def can_remove(self) -> bool:
+        """Any row except the one currently executing can be removed."""
+        return self is not QueueStatus.RUNNING
+
+    @property
+    def can_check(self) -> bool:
+        """Rows the user can (un)check: not-yet-run (PENDING) or failed (ERROR,
+        so it can be retried). RUNNING is locked; DONE can't be re-sent."""
+        return self in (QueueStatus.PENDING, QueueStatus.ERROR)
+
+    @property
+    def is_runnable(self) -> bool:
+        """Eligible to run (or retry) when checked — PENDING or ERROR."""
+        return self in (QueueStatus.PENDING, QueueStatus.ERROR)
 
 
 @dataclass

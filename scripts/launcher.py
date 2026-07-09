@@ -2376,6 +2376,28 @@ class BrowserWorker:
         if auth[:7].lower() == "bearer " and len(auth) > 40:
             self._mongoose_token = {"token": auth[7:], "ts": time.time()}
 
+    def _ensure_mongoose_token(self, page, timeout_ms: int = 6000) -> bool:
+        """Make sure a Mongoose API Bearer token has been harvested so the API
+        text path can run. The dashboard fires an authenticated sms-api call on
+        load (grabbed by _harvest_mongoose_token), so when we have no token yet
+        (e.g. the first send of a session) reload the tab and poll briefly.
+        Returns True once a token exists."""
+        if (self._mongoose_token or {}).get("token"):
+            return True
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=20_000)
+        except Exception:
+            pass
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            if (self._mongoose_token or {}).get("token"):
+                return True
+            try:
+                page.wait_for_timeout(300)
+            except Exception:
+                break
+        return bool((self._mongoose_token or {}).get("token"))
+
     def _probe_mongoose_api(self, ctx) -> dict:
         """Replay-test the harvested Bearer token: in-page fetch (from the
         Mongoose tab, so the API's CORS origin is satisfied) of the read-only
@@ -4743,6 +4765,12 @@ class BrowserWorker:
         # compose modal — no warm-up / bring-to-front needed. On any hard error
         # it falls through to the modal below, so texting never breaks. A clean
         # "nobody opted in" result (ok, 0 sent) is NOT a fallback.
+        if (self.text_api_enabled and payload.get("commit")
+                and not (self._mongoose_token or {}).get("token")):
+            # No token yet (e.g. first send of the session, browser minimized) —
+            # harvest one so we use the reliable API path, not the flaky modal.
+            self.on_status("  text: harvesting Mongoose API token…")
+            self._ensure_mongoose_token(page)
         if (self.text_api_enabled and payload.get("commit")
                 and (self._mongoose_token or {}).get("token")):
             api = self._send_text_via_api(ctx, self._dom_payload_to_api(payload))
@@ -16915,15 +16943,15 @@ class QueuePanel:
         frame = ctk.CTkFrame(self.listbox, fg_color=("gray92", "gray17"))
         frame.grid(row=row, column=0, sticky="ew", pady=3)
         frame.grid_columnconfigure(3, weight=1)
-        frozen = it.status.is_frozen
 
-        # checkbox (PENDING rows only; frozen rows show it disabled)
+        # checkbox — (un)checkable for PENDING/ERROR (ERROR = retry); RUNNING
+        # locked, DONE locked (can't re-send).
         var = ctk.BooleanVar(value=it.checked)
         chk = ctk.CTkCheckBox(
             frame, text="", width=24, variable=var,
             command=lambda n=it.action_name, v=var: self._toggle_check(n, v),
         )
-        if frozen:
+        if not it.status.can_check:
             chk.configure(state="disabled")
         chk.grid(row=0, column=0, padx=(8, 4), pady=6)
 
@@ -16940,17 +16968,22 @@ class QueuePanel:
                      font=ctk.CTkFont(size=15, weight="bold")).grid(
             row=0, column=2, padx=(0, 4))
 
-        # name
-        ctk.CTkLabel(frame, text=it.display_name, anchor="w").grid(
-            row=0, column=3, sticky="ew", padx=2)
+        # name (+ error detail on failed rows, so 'Start' = retry is obvious)
+        label = it.display_name
+        if it.status == QueueStatus.ERROR and it.error_detail:
+            label += f"   —  ✗ {it.error_detail} (re-check + Start to retry)"
+        name_lbl = ctk.CTkLabel(frame, text=label, anchor="w")
+        if it.status == QueueStatus.ERROR:
+            name_lbl.configure(text_color=("#c0392b", "#e0524f"))
+        name_lbl.grid(row=0, column=3, sticky="ew", padx=2)
 
-        # remove (PENDING rows only)
+        # remove — allowed for anything except the currently-running row.
         rm = ctk.CTkButton(
             frame, text="✕", width=28, height=24,
             command=lambda n=it.action_name: self._remove(n),
             **SECONDARY_BTN_KWARGS,
         )
-        if frozen:
+        if not it.status.can_remove:
             rm.configure(state="disabled")
         rm.grid(row=0, column=4, padx=(4, 8))
 
@@ -16991,17 +17024,17 @@ class QueuePanel:
                 state="normal" if running else "disabled")
         self._sync_controls()
 
-    # ---- interactions (model-only in stage 1) ---------------------------
+    # ---- interactions ---------------------------------------------------
     def _toggle_check(self, action_name: str, var) -> None:
         it = self.app.action_queue.get(action_name)
-        if it is None or it.status.is_frozen:
+        if it is None or not it.status.can_check:
             return
         it.checked = bool(var.get())
         self._sync_controls()
 
     def _remove(self, action_name: str) -> None:
         it = self.app.action_queue.get(action_name)
-        if it is None or it.status.is_frozen:
+        if it is None or not it.status.can_remove:
             return
         # (Stage 5 adds the "unsaved review will be discarded" warning.)
         self.app.action_queue.remove(action_name)
@@ -21695,10 +21728,11 @@ class App:
     # ==================================================================
 
     def _queue_run_set(self) -> list:
-        """Checked, still-PENDING items in queue order — the actions a run will
-        commit (DONE/ERROR rows are skipped, so a re-run only does what's left)."""
+        """Checked, runnable items in queue order — the actions a run will
+        commit. Runnable = PENDING or ERROR, so pressing Start after a partial
+        failure RETRIES the failed rows (DONE rows are skipped)."""
         return [it for it in self.action_queue.items
-                if it.checked and it.status == QueueStatus.PENDING]
+                if it.checked and it.status.is_runnable]
 
     def _queue_start(self) -> None:
         """Begin running the checked queue items in sequence. Each item's stored
@@ -21733,7 +21767,7 @@ class App:
             self._queue_enter_paused()
             return
         nxt = next((it for it in self.action_queue.items
-                    if it.checked and it.status == QueueStatus.PENDING), None)
+                    if it.checked and it.status.is_runnable), None)
         if nxt is None:
             self._queue_finish()
             return
@@ -21744,6 +21778,7 @@ class App:
     def _queue_run_item(self, it) -> None:
         """Commit one queue item (blocking) and mark its row from the verdict."""
         self._append_log(f"--- Queue: running {it.action_name!r} ---")
+        login_fail = False
         try:
             result = self._commit_batch(it.payload)
             it.results = result
@@ -21753,12 +21788,24 @@ class App:
                 it.status = QueueStatus.ERROR
                 it.error_detail = ((result or {}).get("detail")
                                    or "completed with errors")
+                login_fail = bool((result or {}).get("login_fail"))
         except Exception as e:
             it.status = QueueStatus.ERROR
             it.error_detail = str(e)
             self._append_log(
                 f"Queue: {it.action_name!r} errored — {e}", error=True)
         self.queue_panel.refresh()
+        # A systemic Mongoose login failure: don't plow through and fail the
+        # rest — PAUSE so the user can sign in and hit Start to retry the failed
+        # action(s). (A per-student "not textable" is NOT this — those are
+        # skipped at review and never reach here.)
+        if login_fail and not self._queue_cancelled:
+            self._queue_paused = True
+            self._append_log(
+                "Queue paused — Mongoose isn't logged in. Sign in "
+                "(🐭 Mongoose), then press ▶ Continue to retry the failed "
+                "action (it re-sends the text, then its email/note).",
+                error=True)
         self.root.after(50, self._queue_step)
 
     def _queue_finish(self, cancelled: bool = False) -> None:
@@ -23460,6 +23507,12 @@ class App:
         if text_groups:
             if not self._send_reviewed_texts(
                     scenario, text_groups, payload["text_selected"]):
+                # A Mongoose login failure is recoverable — flag it so a queue
+                # run pauses for sign-in + retry (rather than dropping the whole
+                # action). A user STOP is just a stop.
+                if getattr(self, "_text_login_fail", False):
+                    return {"ok": False, "login_fail": True,
+                            "detail": "Mongoose not logged in — sign in + retry"}
                 self._append_log(
                     "Action cancelled/stopped at text send; "
                     "notes/email not run.")
@@ -23996,6 +24049,7 @@ class App:
         _review_texts. Returns False if the user STOPPED mid-send (so a combined
         action aborts before its email/note phase), True otherwise."""
         self._text_outcome = None  # set below; read by the per-action summary
+        self._text_login_fail = False  # set on a Mongoose not-logged-in abort
         scheduled = True  # texts are always scheduled
         if not any(selected):
             self._append_log("Batch text: 0 recipients selected; skipping texts.")
@@ -24048,6 +24102,9 @@ class App:
                     # Setup failure, not a per-group hiccup: stop immediately
                     # (don't time out the remaining groups) and abort the whole
                     # action so a combined fire doesn't go on to send emails.
+                    # In a queue run this becomes a PAUSE + retry (see
+                    # _queue_run_item); a single fire just aborts.
+                    self._text_login_fail = True
                     self._append_log(
                         "Texts NOT sent — Mongoose isn't logged in. Restore the "
                         "browser window, sign in to Mongoose, then re-fire. "
