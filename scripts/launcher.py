@@ -8440,9 +8440,16 @@ def prompt_quick_note(parent, *, default_type: str = "Admin Note",
 
     body_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
     body_frame.pack(fill="both", expand=True, padx=12, pady=(10, 4))
+    # Course code: always pre-filled (from the caseload row / active ACI) but
+    # editable so the user can override it for this note.
+    course_row = ctk.CTkFrame(body_frame, fg_color="transparent")
+    course_row.pack(fill="x", pady=(0, 6))
+    ctk.CTkLabel(course_row, text="Course:").pack(side="left", padx=(0, 8))
+    course_entry = ctk.CTkEntry(course_row, width=120,
+                                placeholder_text="course code")
+    course_entry.pack(side="left")
     if course_code:
-        ctk.CTkLabel(body_frame, text=f"Course: {course_code}",
-                     text_color=("gray40", "gray65")).pack(anchor="w", pady=(0, 6))
+        course_entry.insert(0, course_code)
 
     fmt_var = ctk.StringVar(value="Single Interaction")
     fmt_row = ctk.CTkFrame(body_frame, fg_color="transparent")
@@ -8511,6 +8518,7 @@ def prompt_quick_note(parent, *, default_type: str = "Admin Note",
         result["value"] = {
             "interaction_format": fmt_var.get(),
             "interaction_type": type_var.get(),
+            "course_code": course_entry.get().strip(),
             "subject": subject_entry.get().strip(),
             "body": body, "activities": acts,
         }
@@ -15589,6 +15597,8 @@ class CaseloadPanel:
             except Exception:
                 show()
 
+        # Use the (possibly overridden) course code from the dialog.
+        course = data.get("course_code") or course
         self.app.worker.submit_quick_note(
             contact_id, data["interaction_type"], course,
             data["subject"], body_html, data["activities"], on_done)
@@ -30775,6 +30785,13 @@ class App:
         Aura API (no navigation), shown instantly with a 'Load all' affordance.
         If the API isn't available (no grid/creds, or a non-numeric query), go
         straight to the full all-author scrape."""
+        # Off-caseload student: the record is already open (deep-linked). The
+        # my-notes API is keyed to the user's caseload grid, so skip it and
+        # scrape the open record's Notes History directly (via its Contact id).
+        qv = getattr(panel, "_qv_row", None) or {}
+        if qv.get("_offcaseload"):
+            self._review_notes_scrape(query, label, panel)
+            return
         def on_fast(res):
             def render():
                 try:
@@ -30841,8 +30858,15 @@ class App:
                 pass
         # Deep-link by Contact id when we know it (grid map) so the all-authors
         # scrape doesn't depend on the Student ID column being in the caseload
-        # view — the search path stays the fallback for off-caseload lookups.
+        # view — the search path stays the fallback for on-caseload lookups.
         cid = self._contact_ids.get(str(query).strip(), "") if query else ""
+        if not cid:
+            # Off-caseload students aren't in the caseload/segment maps and a
+            # name query can't be row-filtered — use the open record's Contact
+            # id (from the quick-view profile) so the scrape deep-links to them.
+            qv = getattr(panel, "_qv_row", None) or {}
+            if qv.get("_offcaseload"):
+                cid = str(qv.get("Contact id") or "").strip()
         self.worker.submit_fetch_notes(query, on_done, contact_id=cid)
 
     def _reapply_notes_font(self, size=None) -> None:
