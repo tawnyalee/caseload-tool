@@ -23853,49 +23853,71 @@ class App:
         skip — so a combined fire can collect all user input before sending."""
         from src import text_message as tm
         tcfg = scenario.text
-        # Off-caseload student open on the record: no caseload row / Mongoose
-        # segment mapping, and the per-course shared inbox + opt-in can't be
-        # verified for someone outside our caseload. Texting off-caseload isn't
-        # wired yet — skip it cleanly (any email/note in the same action still
-        # files) rather than send to the wrong inbox/recipient.
-        if not chosen_name:
-            octx = self._offcaseload_open_context()
-            if octx is not None:
-                self._append_log(
-                    "Text: texting off-caseload students isn't supported yet "
-                    f"({octx.get('full_name') or 'this student'}) — email/note "
-                    "still file. (Planned for a later update.)")
-                return False
+        # Off-caseload student open on the record: no caseload row, but we
+        # scraped their profile. We CAN text them when their active ACI course
+        # is one we support in Mongoose — the API send switches to that course's
+        # department/inbox and returns a clear "no inbox matching course" error
+        # otherwise (self-gating). Mongoose finds the recipient by SF Contact id
+        # (campusStudentId), so the segment mapping isn't needed. Opt-out is
+        # gated authoritatively at send time by Mongoose, so we don't do the
+        # local segment-export opt-in check for these.
+        octx = self._offcaseload_open_context() if not chosen_name else None
+        is_offcaseload = octx is not None
         # Resolve the student WITHOUT needing the Salesforce record open: prefer
         # the cached caseload CSV row (by name) — texting only needs the mobile,
         # timezone, and course, all of which the CSV has. Fall back to scraping
         # the active page only if the name isn't in the cache.
-        row = self._caseload_row_by_name(chosen_name) if chosen_name else None
-        if row is not None:
-            variables = self._text_vars_from_row(row)
-        else:
-            ctx = self._get_student_context_blocking(name_hint=chosen_name)
-            if not ctx:
-                self._append_log("Text: couldn't read student context; not sent.",
-                                 error=True)
+        if is_offcaseload:
+            course = (octx.get("course_code") or "").strip()
+            if not course:
+                self._append_log(
+                    "Text: no active course for this off-caseload student — "
+                    "can't choose a Mongoose inbox; not sent.", error=True)
                 return False
-            row = self._caseload_row_by_id(ctx.get("student_id", ""))
             variables = {
-                "first_name": ctx.get("first_name", ""),
-                "last_name": ctx.get("last_name", ""),
-                "full_name": ctx.get("full_name", ""),
-                "preferred_name": ctx.get("preferred_name", ""),
-                "student_email": ctx.get("student_email", ""),
-                "student_id": (ctx.get("student_id") or "").strip(),
-                "course_code": ctx.get("course_code", ""),
-                "pm_name": ctx.get("pm_name", ""),
-                "pm_email": ctx.get("pm_email", ""),
+                "first_name": _capitalize_name(octx.get("first_name", "")),
+                "last_name": _capitalize_name(octx.get("last_name", "")),
+                "full_name": _capitalize_name(octx.get("full_name", "")),
+                "preferred_name": _capitalize_name(
+                    octx.get("preferred_name", "") or octx.get("first_name", "")),
+                "student_email": octx.get("student_email", ""),
+                "student_id": (octx.get("student_id") or "").strip(),
+                "course_code": course,
+                "pm_name": _capitalize_name(octx.get("pm_name", "")),
+                "pm_email": octx.get("pm_email", ""),
             }
+            # Synthetic row — only Timezone + MobilePhone are read downstream
+            # (schedule slot + the recipient display line).
+            row = {"Timezone": octx.get("timezone", ""),
+                   "MobilePhone": octx.get("mobile", "")}
+        else:
+            row = self._caseload_row_by_name(chosen_name) if chosen_name else None
+            if row is not None:
+                variables = self._text_vars_from_row(row)
+            else:
+                ctx = self._get_student_context_blocking(name_hint=chosen_name)
+                if not ctx:
+                    self._append_log(
+                        "Text: couldn't read student context; not sent.",
+                        error=True)
+                    return False
+                row = self._caseload_row_by_id(ctx.get("student_id", ""))
+                variables = {
+                    "first_name": ctx.get("first_name", ""),
+                    "last_name": ctx.get("last_name", ""),
+                    "full_name": ctx.get("full_name", ""),
+                    "preferred_name": ctx.get("preferred_name", ""),
+                    "student_email": ctx.get("student_email", ""),
+                    "student_id": (ctx.get("student_id") or "").strip(),
+                    "course_code": ctx.get("course_code", ""),
+                    "pm_name": ctx.get("pm_name", ""),
+                    "pm_email": ctx.get("pm_email", ""),
+                }
         if prompt_vars:
             variables.update(prompt_vars)
         who = (variables.get("full_name") or variables.get("student_id")
                or "this student")
-        if row is not None:
+        if row is not None and not is_offcaseload:
             optin = self._texting_optin_status(row)
             if not optin:
                 self._append_log(
@@ -23910,7 +23932,12 @@ class App:
         mobile = tm.normalize_phone(mobile_raw)
         # Prefer the Salesforce Contact id (unique, works when the mobile is
         # blank); fall back to the mobile. The term is what Mongoose searches.
-        term = self._text_term_for(variables.get("student_id", ""), mobile_raw)
+        # Off-caseload students aren't in the segment map, but we scraped their
+        # Contact id directly — use it (Mongoose matches it as campusStudentId).
+        if is_offcaseload:
+            term = (octx.get("contact_id") or "").strip() or mobile
+        else:
+            term = self._text_term_for(variables.get("student_id", ""), mobile_raw)
         if not term:
             self._append_log(
                 f"Text: no Mobile Phone and no Contact id for {who} "
@@ -26313,6 +26340,7 @@ class App:
             "last_name": last,
             "student_email": prof.get("wgu_email", ""),
             "student_id": prof.get("student_id", ""),
+            "contact_id": str(qv.get("Contact id") or "").strip(),
             "course_code": active[0]["course"] if active else "",
             "pm_name": prof.get("mentor", ""),
             "pm_email": prof.get("mentor_email", ""),
