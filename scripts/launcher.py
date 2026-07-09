@@ -25013,6 +25013,11 @@ class App:
         "EnrolledCU", "TermCompletedCU", "TermDaysLeft",
         "City", "State", "CampusCode", "ProgramName", "Programcode",
         "MobilePhone", "TextingPreference", "StudentEmail",
+        # PM (Program Mentor) email — the CC target for outreach emails. Both
+        # StudentEmail + MentorEmail are populated for every grid row, so with
+        # these layered the email context is fully grid-sourced (no per-student
+        # contact-card / mailto scrape needed).
+        "MentorEmail",
     )
 
     def _apply_grid_fields_to_rows(self) -> None:
