@@ -22941,9 +22941,16 @@ class App:
             who = (chosen_name or student_ctx.get("full_name", "")
                    or "this student")
 
+            # Off-caseload: loop in the ACI + PM by CC (on by default, settable).
+            # ACI email is derived from the scraped name; the PM email is scraped.
+            # Both appear in the review so the user can correct/remove before it
+            # sends.
+            extra_cc = self._offcaseload_cc(student_ctx)
+
             def _render(scn: ScenarioConfig) -> list[dict]:
                 return [self._build_email_preview_data(
-                    scn, {}, prompt_vars, user_info, ctx_override=student_ctx)]
+                    scn, {}, prompt_vars, user_info, ctx_override=student_ctx,
+                    extra_cc=extra_cc)]
 
             scenario, selected, edits = self._run_email_review(
                 scenario, _render, who)
@@ -22953,7 +22960,7 @@ class App:
             ctx_send = {**student_ctx, **prompt_vars}
             if not self._send_scenario_email(
                 scenario.email, ctx_send, auto_send=True,
-                body_html_override=edits.get(0),
+                body_html_override=edits.get(0), extra_cc=extra_cc,
             ):
                 self._append_log("Email send failed; note not filed.")
                 return
@@ -26172,6 +26179,44 @@ class App:
         )
         return scenario, confirmed, body_overrides
 
+    @staticmethod
+    def _derive_wgu_email(name: str) -> str:
+        """Best-effort WGU faculty email from a display name: first.last@wgu.edu
+        (the confirmed WGU pattern — e.g. the scraped PM 'Jim Morgan' →
+        jim.morgan@wgu.edu). Drops middle names / single-letter initials. Returns
+        "" if a first+last can't be resolved. Shown in the email review so the
+        user can correct it before anything sends."""
+        name = (name or "").strip()
+        if not name:
+            return ""
+        parts = [p for p in re.split(r"\s+", name) if p]
+        # Drop middle names and initials like "J." — keep real first/last tokens.
+        parts = [p for p in parts if len(p.rstrip(".")) > 1]
+        if len(parts) < 2:
+            return ""
+
+        def clean(s: str) -> str:
+            return re.sub(r"[^a-z\-]", "", s.lower())
+
+        first, last = clean(parts[0]), clean(parts[-1])
+        if not first or not last:
+            return ""
+        return f"{first}.{last}@wgu.edu"
+
+    @staticmethod
+    def _merge_cc(*addrs: str) -> str:
+        """Join CC address strings, splitting on ; or , deduping case-
+        insensitively and preserving order. Empty parts are dropped."""
+        seen: set = set()
+        out: list = []
+        for group in addrs:
+            for a in re.split(r"[;,]", group or ""):
+                a = a.strip()
+                if a and a.lower() not in seen:
+                    seen.add(a.lower())
+                    out.append(a)
+        return "; ".join(out)
+
     def _build_email_preview_data(
         self,
         scenario: ScenarioConfig,
@@ -26180,6 +26225,7 @@ class App:
         user_info: dict,
         *,
         ctx_override: Optional[dict] = None,
+        extra_cc: str = "",
     ) -> dict:
         """Render one student's email for the batch review modal.
         Returns the dict shape `prompt_batch_email_review` consumes.
@@ -26243,6 +26289,8 @@ class App:
                 to = ctx.get("student_email", "") or ""
             if email_cfg.cc_pm:
                 cc = ctx.get("pm_email", "") or ""
+            if extra_cc:
+                cc = self._merge_cc(cc, extra_cc)
         except Exception as e:
             render_error = f"{type(e).__name__}: {e}"
 
@@ -26268,7 +26316,7 @@ class App:
             "to": to,
             "cc": cc,
             "cc_is_self": cc_is_self,
-            "cc_configured": bool(email_cfg.cc_pm),
+            "cc_configured": bool(email_cfg.cc_pm) or bool(extra_cc),
             "subject": subject,
             "body_html": body_html,
             "render_error": render_error,
@@ -26352,6 +26400,24 @@ class App:
             "timezone": prof.get("timezone", ""),
             "_offcaseload": True,
         }
+
+    def _offcaseload_cc(self, student_ctx: Optional[dict]) -> str:
+        """CC string (ACI + PM) to loop in on an OFF-caseload student's email,
+        when the setting is on. The ACI email is derived from the scraped name
+        (only the name is captured); the PM email is scraped. Returns "" for
+        on-caseload students or when the setting is off."""
+        if not (student_ctx or {}).get("_offcaseload"):
+            return ""
+        if not getattr(self.settings, "cc_aci_offcaseload", True):
+            return ""
+        parts: list = []
+        aci_email = self._derive_wgu_email(student_ctx.get("aci_name", ""))
+        if aci_email:
+            parts.append(aci_email)
+        pm_email = (student_ctx.get("pm_email") or "").strip()
+        if pm_email:
+            parts.append(pm_email)
+        return self._merge_cc(*parts) if parts else ""
 
     def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
         """Ask the worker to read the active student's context (email,
@@ -26556,6 +26622,7 @@ class App:
         *,
         auto_send: bool = False,
         body_html_override: Optional[str] = None,
+        extra_cc: str = "",
     ) -> bool:
         """Render the template and either Display() the draft for
         review (default) or Send() it programmatically (`auto_send`).
@@ -26670,6 +26737,8 @@ class App:
         else:
             to = student_ctx.get("student_email", "")
         cc = student_ctx.get("pm_email", "") if email_cfg.cc_pm else ""
+        if extra_cc:
+            cc = self._merge_cc(cc, extra_cc)
         if not to:
             full_name = student_ctx.get('full_name') or 'this student'
             if auto_send:
@@ -27954,6 +28023,26 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
+        # Off-caseload emails: CC the ACI (assigned course instructor) + PM.
+        cc_aci_var = ctk.BooleanVar(
+            value=getattr(self.settings, "cc_aci_offcaseload", True))
+        ctk.CTkCheckBox(
+            dialog,
+            text="CC the ACI + PM on off-caseload student emails",
+            variable=cc_aci_var, font=ctk.CTkFont(size=13),
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+        ctk.CTkLabel(
+            dialog,
+            text=("When you email a student who's on another instructor's "
+                  "caseload, automatically CC their assigned course instructor "
+                  "(ACI) and Program Mentor so both are looped in. The ACI "
+                  "address is derived as first.last@wgu.edu from the scraped "
+                  "name and shown in the email review, so you can correct or "
+                  "remove it before it sends."),
+            wraplength=510, justify="left",
+            text_color=("gray35", "gray70"), anchor="w",
+        ).pack(fill="x", padx=44, pady=(0, 10))
+
         # Quick-note hotkey (the ＋ Note button in the caseload viewer).
         qn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         qn_row.pack(anchor="w", fill="x", padx=20, pady=(8, 0))
@@ -28209,6 +28298,8 @@ class App:
             # Hide/show the manual '⬇ Texting IDs' export button to match: the
             # segment export is only needed for the DOM texting fallback.
             self._update_texting_ids_btn()
+            # Off-caseload email CC (ACI + PM).
+            self.settings.cc_aci_offcaseload = bool(cc_aci_var.get())
             # Quick-note hotkey — re-register the global hotkeys if it changed.
             new_qn_hk = quicknote_hk_var.get().strip()
             qn_hk_changed = (new_qn_hk != getattr(

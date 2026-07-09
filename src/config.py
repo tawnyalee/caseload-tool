@@ -468,6 +468,10 @@ class Settings:
     # to (updated to the last type you filed, so your common type opens first).
     quick_note_hotkey: str = "Ctrl+Shift+N"
     quick_note_last_type: str = "Admin Note"
+    # Off-caseload triage: when emailing a student who's on another instructor's
+    # caseload, auto-CC their assigned course instructor (ACI) and Program Mentor
+    # so both are looped in. On by default; the CC is shown in the email review.
+    cc_aci_offcaseload: bool = True
 
 
 def load_settings() -> Settings:
