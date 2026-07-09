@@ -16199,6 +16199,7 @@ class CaseloadPanel:
     _VIEW_SAVE = "＋ Save current as…"
     _VIEW_MANAGE = "⚙ Manage views…"
     _VIEW_ARCHIVED = "🗄 Archived (past students)"
+    _VIEW_OFFCASELOAD = "🔎 Off-caseload (not yours)"
     _VIEW_LIVE = "◀ Live caseload"
 
     def _load_views(self) -> list:
@@ -16273,30 +16274,40 @@ class CaseloadPanel:
         views = self._load_views()
         names = [v["name"] for v in views]
         archived = getattr(self, "_archived_mode", False)
+        offcl = getattr(self, "_offcaseload_mode", False)
         values = []
-        if archived:
+        if archived or offcl:
             values.append(self._VIEW_LIVE)          # way back to the live caseload
         values += names + [self._VIEW_ARCHIVED, self._VIEW_SAVE]
         if names:
             values.append(self._VIEW_MANAGE)
         self.view_menu.configure(values=values)
-        if archived:
+        if offcl:
+            self.view_menu.set(self._VIEW_OFFCASELOAD)
+        elif archived:
             self.view_menu.set(self._VIEW_ARCHIVED)
         else:
             cur = self.app.settings.caseload_current_view or ""
             self.view_menu.set(cur if cur in names else (names[0] if names
                                                          else "★ Views"))
 
+    def _exit_special_modes(self, repopulate: bool = True) -> None:
+        """Leave Archived / Off-caseload mode (back to the live caseload)."""
+        if getattr(self, "_archived_mode", False):
+            self._exit_archived_mode(repopulate=repopulate)
+        elif getattr(self, "_offcaseload_mode", False):
+            self._exit_offcaseload_mode(repopulate=repopulate)
+
     def _on_view_select(self, choice: str) -> None:
         if choice == self._VIEW_ARCHIVED:
+            self._exit_special_modes(repopulate=False)
             self._enter_archived_mode()
             return
         if choice == self._VIEW_LIVE:
-            self._exit_archived_mode()
+            self._exit_special_modes()
             return
-        # Any other choice leaves Archived mode (back to the live caseload).
-        if getattr(self, "_archived_mode", False):
-            self._exit_archived_mode(repopulate=False)
+        # Any other choice leaves the special modes (back to the live caseload).
+        self._exit_special_modes(repopulate=False)
         if choice == self._VIEW_SAVE:
             self._save_view_dialog()
         elif choice == self._VIEW_MANAGE:
@@ -16391,6 +16402,53 @@ class CaseloadPanel:
                 text_color=getattr(self, "_caseload_label_fg",
                                    ("gray10", "gray90")))
             self.search_entry.configure(placeholder_text="Search caseload…")
+        except Exception:
+            pass
+
+    # ---- Off-caseload mode (students NOT assigned to us) -----------------
+    def _enter_offcaseload_mode(self, matches: list, query: str = "") -> None:
+        """Show off-caseload search matches as rows IN the viewer (instead of a
+        popup), so the user picks a student the familiar way. Rows carry name +
+        Contact id; opening one opens their Salesforce record. Stage 3 enriches
+        the row with the scraped profile + ACI. Visually distinct (red banner)
+        so it's obvious these aren't the user's students."""
+        rows = []
+        for m in (matches or []):
+            cid = str(m.get("contact_id") or "").strip()
+            if not cid:
+                continue
+            rows.append({
+                "Name": m.get("name") or "(unknown)",
+                "Contact id": cid,         # display + used to open the record
+                "_offcaseload": True,      # internal flag (kept out of columns)
+            })
+        self._offcaseload_rows = rows
+        self._offcaseload_mode = True
+        self._archived_mode = False        # mutually exclusive
+        self._show_offcaseload_banner()
+        self.populate()
+        self._refresh_view_menu()
+        self.app._append_log(
+            f"🔎 Off-caseload: {len(rows)} match(es)"
+            + (f" for {query!r}" if query else "")
+            + " — click one to open their record (NOT on your caseload).")
+
+    def _exit_offcaseload_mode(self, repopulate: bool = True) -> None:
+        self._offcaseload_mode = False
+        self._offcaseload_rows = None
+        self._hide_archived_banner()       # generic label/placeholder restore
+        if repopulate:
+            self.populate()
+            self._refresh_view_menu()
+
+    def _show_offcaseload_banner(self) -> None:
+        try:
+            if not hasattr(self, "_caseload_label_fg"):
+                self._caseload_label_fg = self.caseload_label.cget("text_color")
+            self.caseload_label.configure(
+                text="🔎 Off-caseload (not yours)",
+                text_color=("#b02020", "#ff6b6b"))
+            self.search_entry.configure(placeholder_text="Search off-caseload…")
         except Exception:
             pass
 
@@ -16812,6 +16870,8 @@ class CaseloadPanel:
         matching archived rows (merged, archived shown dimmed)."""
         if getattr(self, "_archived_mode", False):
             return self._archived_rows or []
+        if getattr(self, "_offcaseload_mode", False):
+            return self._offcaseload_rows or []
         if getattr(self, "_search_archived", False):
             return (self.app._caseload_rows or []) + (self._archived_rows or [])
         return self.app._caseload_rows or []
@@ -16937,9 +16997,15 @@ class CaseloadPanel:
 
     def _open_row(self, event, new_tab: bool) -> None:
         query, _label = self._row_query_label(event)
+        row = self._row_by_iid.get(self.tree.focus())
+        if row and row.get("_offcaseload"):
+            # Off-caseload search match — open directly by its Contact id.
+            cid = str(row.get("Contact id") or "").strip()
+            if cid:
+                self.app._open_contact_id(cid, str(row.get("Name") or ""))
+            return
         if not query:
             return
-        row = self._row_by_iid.get(self.tree.focus())
         if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
             # Off-caseload (archived) students aren't in the caseload row filter
             # — open via Salesforce global search (by Student ID).
@@ -16968,8 +17034,13 @@ class CaseloadPanel:
         Double-click stays open-only for a quick switch without notes."""
         iid = self.tree.focus()
         query, label = self._query_label_for_iid(iid)
+        row = self._row_by_iid.get(iid)
+        if row and row.get("_offcaseload"):
+            cid = str(row.get("Contact id") or "").strip()
+            if cid:
+                self.app._open_contact_id(cid, str(row.get("Name") or ""))
+            return "break"
         if query:
-            row = self._row_by_iid.get(iid)
             if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
                 # Off-caseload: open the Salesforce record (no caseload-scoped
                 # notes fetch — that relies on the live caseload).
@@ -21778,9 +21849,13 @@ class App:
                         "fire a Find-first-off note action to file a note.")
                 elif res and res.get("matches"):
                     ms = res["matches"]
-                    self._append_log(
-                        f"{len(ms)} Salesforce matches for {query!r} — pick one.")
-                    self._pick_offcaseload_match(query, ms)
+                    # Show the matches IN the caseload viewer (an "Off-caseload"
+                    # view), not a popup — mirrors normal student searching.
+                    panel = getattr(self, "caseload_panel", None)
+                    if panel is not None:
+                        panel._enter_offcaseload_mode(ms, query)
+                    else:
+                        self._pick_offcaseload_match(query, ms)
                 else:
                     self._append_log(
                         f"No Salesforce match for {query!r}: "
