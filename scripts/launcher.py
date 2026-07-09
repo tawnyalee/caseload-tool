@@ -22840,16 +22840,20 @@ class App:
         return (scenario.text is not None and not scenario.notes
                 and scenario.email is None)
 
-    @staticmethod
-    def _deeplink_ok(scenario) -> bool:
-        """Whether a note fire may DEEP-LINK to the Contact record instead of
-        the Caseload search. The deep link opens the STANDARD record layout,
-        which differs from the Caseload console note panel in two ways that
-        break it: (1) an email step scrapes student/PM context from the on-page
-        Caseload table (absent there), and (2) its Academic Activity checkboxes
-        aren't the `label[for]` elements our selectors match — so a gated note
-        ("Email from Student" etc., which needs an activity) can't be completed.
-        Such fires use the proven console/search path; plain notes deep-link."""
+    def _deeplink_ok(self, scenario) -> bool:
+        """Whether a fire may DEEP-LINK to the Contact record (fast, ~2.6s)
+        instead of the slower Caseload Fast-find. The deep link opens the
+        STANDARD record layout. Two things historically forced email / gated-note
+        actions onto Fast-find: (1) the email step scraped student/PM context
+        from the on-page Caseload table, and (2) a gated note's Academic-Activity
+        checkboxes aren't the form elements our selectors match. BOTH are moot on
+        the default path now — the email context comes from the caseload grid
+        (StudentEmail + MentorEmail) and notes file via the saveNoteCmpValues API
+        (no form; activities go in the payload). So with API note saving ON,
+        every action can deep-link. With it OFF, keep the old constraints
+        (form-based filing still needs the console layout + on-page scrape)."""
+        if getattr(self.settings, "note_save_via_api", True):
+            return True
         if scenario.email is not None:
             return False
         for n in (scenario.notes or []):
@@ -25013,11 +25017,10 @@ class App:
         "EnrolledCU", "TermCompletedCU", "TermDaysLeft",
         "City", "State", "CampusCode", "ProgramName", "Programcode",
         "MobilePhone", "TextingPreference", "StudentEmail",
-        # PM (Program Mentor) email — the CC target for outreach emails. Both
-        # StudentEmail + MentorEmail are populated for every grid row, so with
-        # these layered the email context is fully grid-sourced (no per-student
-        # contact-card / mailto scrape needed).
-        "MentorEmail",
+        # PM (Program Mentor) name + email — the CC target for outreach emails.
+        # Populated for every grid row, so with these layered the email context
+        # is fully grid-sourced (no per-student contact-card / mailto scrape).
+        "MentorEmail", "MentorName",
     )
 
     def _apply_grid_fields_to_rows(self) -> None:
