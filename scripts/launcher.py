@@ -53,11 +53,11 @@ from src.config import (
     set_templates_dir, templates_dir,
     DEFAULT_EMAIL_LINK_COLOR, email_link_color, set_email_link_color,
     VAULT_PATH, ENCRYPTED_DATA_FILES, SPLASH_GIF, APP_ICON,
+    INTERACTION_TYPES_SINGLE,ACADEMIC_ACTIVITY_LABELS
 )
 from src import crypto_store
 from src.version import __version__
 from src.note_form import NoteData
-from src.action_queue import ActionQueue, QueueItem, QueueStatus
 from src.scenarios import (
     SCENARIOS_YAML, BatchConfig, EmailConfig, Group, PathField, PathStep,
     ScenarioConfig, SuccessPath, load_groups, load_scenarios,
@@ -73,6 +73,8 @@ from src.student_lookup import (
     _parse_mailto,
     scrape_student_email_from_page,
 )
+#include the UI to build out the side panel for groups and actions
+from src.ui.scenario_panel import ScenarioNavigationPanel
 
 # Success-path step statuses that can be targeted in a filter. Matches the
 # STATUS_* values compute_steps returns. 'off-path' is an internal sentinel set
@@ -89,194 +91,16 @@ SP_OFF_PATH = "off-path"
 MONGOOSE_STALE_HOURS = 24
 
 
-@dataclass
-class NoteLogEntry:
-    """One filed note. Used both for the in-session tabs and the
-    persistent CSV that feeds downstream tools (e.g. the texting app).
-
-    `submitted` is False when any note in the scenario opted out of
-    auto-submit (the form was filled but the user is reviewing it).
-    `student_id`, `student_email`, `pm_name`, `pm_email` come from the
-    Caseload table row when available; the 'Email Student' link has
-    the PM as primary (so `pm_email`) and the student as CC.
-    """
-    timestamp: datetime
-    scenario: str
-    course_code: str
-    student: str
-    student_id: str = ""
-    student_email: str = ""
-    pm_name: str = ""
-    pm_email: str = ""
-    submitted: bool = True
-
-    @property
-    def tab_key(self) -> str:
-        return f"{self.course_code} {self.scenario}"
-
-    @property
-    def display(self) -> str:
-        flag = "" if self.submitted else "  (not submitted)"
-        id_suffix = f"  [{self.student_id}]" if self.student_id else ""
-        return f"{self.timestamp:%H:%M:%S}  {self.student}{id_suffix}{flag}"
 
 
-CSV_HEADER = [
-    "timestamp", "scenario", "course_code", "student",
-    "student_id", "student_email", "pm_name", "pm_email", "submitted",
-]
-
-# Old CSV column names that map to current ones. Used by the on-disk
-# migration so existing logs upgrade in place rather than losing data.
-CSV_COLUMN_RENAMES = {
-    "email": "pm_email",  # earlier schema labelled it just "email"
-}
-
-# Values matching the Caseload form's dropdown + checkbox labels.
-INTERACTION_TYPES_SINGLE = [
-    "Email to Student", "Live Call", "Email from Student", "Video Call",
-    "Course Chatter Response", "Voicemail to Student",
-    "Instant Message (IM) / Text", "Voicemail from Student",
-    "Webinar Attendance Noted", "Admin Note", "Mass Email", "Cohort Event",
-]
-INTERACTION_TYPES_MULTI = [
-    "Live Call and Email to Student", "Email Exchange with Student",
-    "Voicemail and Email to Student", "Voicemail/Email and Text to Student",
-    "Voicemail to Student and Text Message", "Live Call and Text Message",
-    "Email to Student and Text Message", "Video Call and Email to Student",
-    "Voicemail from Student and Email to Student",
-    "Voicemail Full/Email to Student",
-]
-# Single Interaction types that disable Academic Activities (one-way /
-# administrative / outbound interactions where no student engagement
-# needs to be characterized).
-ACTIVITY_DISABLE_TYPES_SINGLE = {
-    "Email to Student", "Voicemail to Student", "Admin Note", "Mass Email",
-}
-ACADEMIC_ACTIVITY_LABELS = [
-    "Course/Program Information Discussed",
-    "Course/Program Information Requested",
-    "Set Academic Goals",
-    "Student Learning Occurred",
-    "Personal obstacles/non-academic content covered",
-]
 INTERACTION_FORMATS = ["Single Interaction", "Multiple Interactions"]
 
-
-def types_for_format(fmt: str) -> list[str]:
-    return INTERACTION_TYPES_MULTI if fmt == "Multiple Interactions" else INTERACTION_TYPES_SINGLE
-
-
-def activities_disabled_for(fmt: str, typ: str) -> bool:
-    return fmt == "Single Interaction" and typ in ACTIVITY_DISABLE_TYPES_SINGLE
-
-
+#importing helper functions to make code more readable and modular
+from scripts.utils.string_helpers import types_for_format, _typo_variants, _note_body_to_html, _to_iso_date
+from scripts.utils.browser_helpers import activities_disabled_for, _wait_grid_settled, _wait_record_ready
 # ============================================================
 # Browser worker — owns Playwright in its own thread.
 # ============================================================
-
-
-def _typo_variants(query: str) -> list[str]:
-    """All adjacent-transposition variants of `query`. Most natural
-    one-typo cases (e.g. 'jsoh' for 'josh') are a single adjacent
-    swap, so trying each against Salesforce's row filter often
-    surfaces the right student even when fuzzy doesn't have enough
-    of the table in view."""
-    out: list[str] = []
-    seen = {query}
-    for i in range(len(query) - 1):
-        chars = list(query)
-        chars[i], chars[i + 1] = chars[i + 1], chars[i]
-        v = "".join(chars)
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-
-def _wait_grid_settled(page, max_ms: int = 1500) -> None:
-    """After typing into the caseload row-filter, wait until the grid has
-    settled — no visible loading spinner and the row count stable across two
-    polls — BOUNDED by max_ms. Replaces a blind sleep: returns as soon as
-    the filter has applied (often a few hundred ms), never later than the
-    old fixed wait."""
-    import time as _t
-    deadline = _t.monotonic() + max_ms / 1000.0
-    try:
-        page.wait_for_timeout(120)  # let a spinner appear before polling
-    except Exception:
-        return
-    last, stable = -1, 0
-    while _t.monotonic() < deadline:
-        try:
-            spinner = page.locator(
-                ".slds-spinner_container").filter(visible=True).count()
-        except Exception:
-            spinner = 0
-        try:
-            cnt = page.locator("table tr").count()
-        except Exception:
-            cnt = -1
-        if spinner == 0 and cnt >= 0 and cnt == last:
-            stable += 1
-            if stable >= 2:
-                return
-        else:
-            stable = 0
-        last = cnt
-        try:
-            page.wait_for_timeout(120)
-        except Exception:
-            return
-
-
-def _wait_record_ready(page, max_ms: int = 2000) -> None:
-    """After navigating to a record, return as soon as it's ready (the
-    active student name resolves) — BOUNDED by max_ms. Replaces a blind
-    post-navigation sleep."""
-    import time as _t
-    deadline = _t.monotonic() + max_ms / 1000.0
-    while _t.monotonic() < deadline:
-        try:
-            if get_active_student_name(page):
-                return
-        except Exception:
-            pass
-        try:
-            page.wait_for_timeout(150)
-        except Exception:
-            return
-
-
-def _note_body_to_html(text: str) -> str:
-    """Convert a plain-text note body into the simple paragraph HTML the
-    Salesforce note-save endpoint stores (each line a <p>; blank lines a
-    <p><br></p>) so an API-filed note reads the same as a form-typed one.
-    HTML-special characters are escaped."""
-    lines = (text or "").split("\n")
-    parts = [
-        ("<p>" + html.escape(ln) + "</p>") if ln.strip() else "<p><br></p>"
-        for ln in lines
-    ]
-    return "".join(parts) or "<p><br></p>"
-
-
-def _to_iso_date(s: str) -> str:
-    """Normalize a follow-up date string to ISO 'YYYY-MM-DD' for the Aura save
-    (the UI passes MM/DD/YYYY; already-ISO passes through). Unknown formats are
-    returned unchanged."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
-    if m:
-        y, mo, d = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)   # MM/DD/YYYY
-    if m:
-        mo, d, y = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
-    return s
 
 
 class BrowserWorker:
@@ -433,15 +257,6 @@ class BrowserWorker:
         (no UI form) for one contact. on_done({ok}|{error})."""
         self.q.put(("API_NOTE_TEST", contact_id, course, on_done))
 
-    def submit_quick_note(self, contact_id: str, note_type: str,
-                          course_code: str, subject: str, body_html: str,
-                          activities: list, on_done: Callable[[dict], None]
-                          ) -> None:
-        """File one ad-hoc "quick note" via the saveNoteCmpValues API replay
-        (no UI form) for a contact. on_done({ok}|{error})."""
-        self.q.put(("QUICK_NOTE", contact_id, note_type, course_code, subject,
-                    body_html, activities, on_done))
-
     def submit_close_record_tabs(
         self, on_done: Callable[[dict], None],
     ) -> None:
@@ -456,7 +271,7 @@ class BrowserWorker:
         / email / name and open its record — for off-caseload students.
         on_done({ok, name, contact_id} | {matches} | {error})."""
         self.q.put(("OPEN_CONTACT_GLOBAL", query, on_done))
-
+    
     def submit_oc_probe(self, query: str,
                         on_done: Callable[[dict], None]) -> None:
         """PROBE: global-search a student, open their record, and dump every
@@ -636,6 +451,15 @@ class BrowserWorker:
         that student's Followup Date cell to `date_str` (MM/DD/YYYY).
         on_done({ok, value, error})."""
         self.q.put(("SET_FOLLOWUP_DATE", query, date_str, on_done))
+    
+    def submit_quick_note(self, contact_id: str, note_type: str,
+                          course_code: str, subject: str, body_html: str,
+                          activities: list, on_done: Callable[[dict], None]
+    ) -> None:
+        """File one ad-hoc "quick note" via the saveNoteCmpValues API replay
+        (no UI form) for a contact. on_done({ok}|{error})."""
+        self.q.put(("QUICK_NOTE", contact_id, note_type, course_code, subject,
+                    body_html, activities, on_done))
 
     def submit_set_followup_note(
         self, query: str, note_text: str, on_done: Callable[[dict], None],
@@ -1450,24 +1274,9 @@ class BrowserWorker:
                 pass
         if not contacts:
             return {"error": f"no Salesforce Contact found for {query!r}"}
-        ql = query.strip().lower()
-        is_name = (bool(re.search(r"[A-Za-z]", query)) and "@" not in query
-                   and not re.fullmatch(r"\d{5,12}", query.strip()))
-        exact = [(c, n) for c, n in contacts if (n or "").strip().lower() == ql]
-        if is_name:
-            # A name is NOT a unique key (Salesforce also matches on surname, and
-            # two people can share a name), so we can't safely auto-open. ALWAYS
-            # return the full list for the user to pick from.
+        if len(contacts) > 1:
             return {"matches": [{"contact_id": c, "name": n}
                                 for c, n in contacts]}
-        if len(contacts) > 1:
-            # ID/email is unique enough to open; if several came back, prefer an
-            # exact name match, else show the picker.
-            if len(exact) == 1:
-                contacts = exact
-            else:
-                return {"matches": [{"contact_id": c, "name": n}
-                                    for c, n in contacts]}
         cid, name = contacts[0]
         if self._navigate_to_contact(ctx, cid):
             return {"ok": True, "contact_id": cid, "name": name or query}
@@ -1536,375 +1345,6 @@ class BrowserWorker:
             except Exception:
                 pass
         return False
-
-    # Shadow-piercing dump of ALL visible text on a record page (in DOM order,
-    # so a field's label is immediately followed by its value) + related-list
-    # titles — a blind first-pass map to locate ACI (assigned CI) / PM / term /
-    # task / mobile on an off-caseload student's record.
-    _OC_PROBE_JS = r"""
-    () => {
-      const snippets = [], related = [], seen = new Set();
-      const clean = s => (s||'').replace(/\s+/g,' ').trim();
-      const walk = (node) => {
-        if (!node) return;
-        if (node.nodeType === 1) {
-          const cls = (node.className && node.className.toString)
-                        ? node.className.toString() : '';
-          const sig = (node.tagName||'').toLowerCase() + ' ' + cls;
-          if (/related-list|forcerelatedlist|slds-card__header-title/.test(sig)) {
-            const t = node.querySelector
-                        ? (node.querySelector('span[title], h2, h3') || node) : node;
-            const txt = clean(t.innerText || t.textContent);
-            if (txt && txt.length < 80) {
-              const k = 'R:' + txt;
-              if (!seen.has(k)) { seen.add(k); related.push(txt); }
-            }
-          }
-          if (node.shadowRoot)
-            for (const c of node.shadowRoot.childNodes) walk(c);
-          for (const c of node.childNodes) walk(c);
-        } else if (node.nodeType === 3) {
-          const t = clean(node.textContent);
-          if (t && t.length < 200 && snippets[snippets.length - 1] !== t)
-            snippets.push(t);
-        }
-      };
-      try { walk(document.body); } catch(e) {}
-      return {snippets: snippets.slice(0, 1600), related};
-    }
-    """
-
-    # Click the first tab/link whose text contains one of `labels` (shadow-
-    # pierced) — used to reveal the "Course Mentor Student Assignments" tab.
-    _OC_CLICK_TAB_JS = r"""
-    (labels) => {
-      const clean = s => (s||'').replace(/\s+/g,' ').trim();
-      const cands = [];
-      const walk = (root) => {
-        let els; try { els = root.querySelectorAll('a,button,[role="tab"],li,span'); }
-          catch(e){ return; }
-        for (const el of els) cands.push(el);
-        let all; try { all = root.querySelectorAll('*'); } catch(e){ return; }
-        for (const el of all) if (el.shadowRoot) walk(el.shadowRoot);
-      };
-      walk(document);
-      for (const label of labels) {
-        const ll = label.toLowerCase();
-        for (const el of cands) {
-          const t = clean(el.innerText || el.textContent);
-          if (t && t.length < 70 && t.toLowerCase().includes(ll)) {
-            try { el.scrollIntoView(); el.click(); return t; } catch(e){}
-          }
-        }
-      }
-      return null;
-    }
-    """
-
-    # Dump every table/grid on the page (shadow-pierced): header row + data rows
-    # (cells joined by ' | '), flagging cells that carry a check/success icon
-    # with [✓] — to capture "Course Code | Course Mentor | (active ✓)".
-    _OC_TABLES_JS = r"""
-    () => {
-      const clean = s => (s||'').replace(/\s+/g,' ').trim();
-      const grids = [];
-      const collect = (root) => {
-        let gs; try { gs = root.querySelectorAll('table,[role="grid"],[role="table"]'); }
-          catch(e){ return; }
-        for (const g of gs) grids.push(g);
-        let all; try { all = root.querySelectorAll('*'); } catch(e){ return; }
-        for (const el of all) if (el.shadowRoot) collect(el.shadowRoot);
-      };
-      collect(document);
-      const out = [];
-      for (const g of grids) {
-        const headers = [];
-        g.querySelectorAll('th,[role="columnheader"]').forEach(h => {
-          const t = clean(h.innerText || h.textContent);
-          if (t && t.length < 40) headers.push(t);
-        });
-        const rows = [];
-        g.querySelectorAll('tr,[role="row"]').forEach(tr => {
-          const cells = [];
-          tr.querySelectorAll('td,[role="gridcell"],[role="cell"]').forEach(td => {
-            let t = clean(td.innerText || td.textContent);
-            const icon = td.querySelector('lightning-icon,[icon-name],svg,img[alt]');
-            if (icon) {
-              const meta = (icon.getAttribute && (icon.getAttribute('icon-name')
-                || icon.getAttribute('title') || icon.getAttribute('alt')
-                || icon.getAttribute('aria-label'))) || '';
-              if (/check|success|true|yes|selected/i.test(meta)) t = (t ? t + ' ' : '') + '[✓]';
-            }
-            cells.push(t);
-          });
-          if (cells.some(c => c)) rows.push(cells.join(' | '));
-        });
-        if (rows.length) out.push({headers: headers.join(' | '),
-                                   rows: rows.slice(0, 50)});
-      }
-      return out.slice(0, 12);
-    }
-    """
-
-    # Scroll a related-list panel (matched by a title containing `needle`) into
-    # view so Lightning lazy-renders its rows before we dump. Returns the title
-    # text if found. Also nudges any "View All" so more than the default 5 show.
-    _OC_REVEAL_JS = r"""
-    (needle) => {
-      const nl = needle.toLowerCase();
-      const matches = [];
-      const walk = (root) => {
-        let els; try { els = root.querySelectorAll('*'); } catch(e){ return; }
-        for (const el of els) {
-          const t = (el.innerText || el.textContent || '');
-          if (t && t.length < 200 && t.toLowerCase().includes(nl)) matches.push(el);
-          if (el.shadowRoot) walk(el.shadowRoot);
-        }
-      };
-      walk(document);
-      if (!matches.length) return null;
-      matches.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
-      const hit = matches[0];
-      try { hit.scrollIntoView({block: 'center'}); } catch(e) {}
-      return (hit.innerText || hit.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
-    }
-    """
-
-    def _oc_probe(self, ctx, query: str) -> dict:
-        """Open `query`'s record and dump the page. `query` may carry a click
-        path after '||' — e.g. 'Liberty || Processes and Interactions || Course
-        Mentor Student Assignments' clicks each tab in order (to reach nested
-        tabs like the Course Mentor / ACI list) before dumping."""
-        parts = [s.strip() for s in (query or "").split("||")]
-        squery = parts[0]
-        click_seq = [p for p in parts[1:] if p]
-        res = self._open_contact_by_global_search(ctx, squery)
-        if not res.get("ok"):
-            matches = res.get("matches")
-            if not matches:
-                return res
-            ql = squery.strip().lower()
-            pick = next((m for m in matches
-                         if (m.get("name") or "").strip().lower() == ql), matches[0])
-            if not self._navigate_to_contact(ctx, pick.get("contact_id")):
-                return {"error": "couldn't open a search match"}
-            res = {"ok": True, "contact_id": pick.get("contact_id"),
-                   "name": pick.get("name")}
-        target = self._active_page(ctx)
-        cid = res.get("contact_id")
-        clicked = []
-        nav_related = None
-        try:
-            target.wait_for_timeout(1500)  # let the record settle
-            if click_seq:
-                for label in click_seq:
-                    c = target.evaluate(self._OC_CLICK_TAB_JS, [label])
-                    clicked.append(c)
-                    if c:
-                        target.wait_for_timeout(1600)
-            elif cid:
-                # Deep-link straight to the Course Mentor Student Assignments
-                # related-list FULL view (the complete ACI-by-course list, with
-                # a checkmark on the active mentor). URL pattern from a real
-                # record: /lightning/r/Contact/<id>/related/
-                # CourseMentorStudentAssignments__r/view
-                from urllib.parse import urlsplit
-                p = urlsplit(target.url or CASELOAD_URL
-                             or "https://srm.lightning.force.com")
-                url = (f"{p.scheme}://{p.netloc}/lightning/r/Contact/{cid}/"
-                       "related/CourseMentorStudentAssignments__r/view")
-                target.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                target.wait_for_timeout(3000)
-                nav_related = url
-        except Exception:
-            pass
-        # The Course Mentor Student Assignments is a lazy related-list PANEL
-        # (shows 5, "View All"): scroll it into view so its rows render before
-        # we dump (scraping before that is why it kept coming back empty).
-        revealed = None
-        try:
-            for needle in ("Course Mentor Student Assignments", "Course Mentor"):
-                r = target.evaluate(self._OC_REVEAL_JS, needle)
-                if r:
-                    revealed = r
-                    target.wait_for_timeout(2500)  # let the list lazy-render
-                    break
-        except Exception:
-            pass
-        try:
-            data = target.evaluate(self._OC_PROBE_JS)
-            tables = target.evaluate(self._OC_TABLES_JS)
-        except Exception as e:
-            return {"error": f"probe scrape failed: {e}",
-                    "contact_id": res.get("contact_id"),
-                    "name": res.get("name")}
-        return {"ok": True, "contact_id": res.get("contact_id"),
-                "name": res.get("name"),
-                "url": (target.url if target else ""),
-                "clicked_tab": ", ".join(str(c) for c in clicked) or None,
-                "revealed": revealed,
-                "nav_related": nav_related,
-                "snippets": data.get("snippets", []),
-                "related": data.get("related", []),
-                "tables": tables}
-
-    # Off-caseload Contact profile: our field key -> label spelling(s) as they
-    # appear on the Contact "Student Profile" page. The page renders each field
-    # as a label snippet immediately followed by its value snippet (DOM order),
-    # so we find the label and take the next non-noise snippet. First spelling
-    # that resolves wins. Calibrated from real Liberty Frost dumps.
-    _OC_FIELD_SPELLINGS = [
-        ("student_id", ["Student ID"]),
-        ("mobile", ["Mobile"]),
-        ("wgu_email", ["WGU Email", "Email"]),
-        ("other_email", ["Other Email"]),
-        ("timezone", ["Timezone"]),
-        ("mentor", ["Mentor"]),            # PM (program mentor) NAME
-        ("mentor_email", ["Mentor Email"]),
-        ("status", ["Status"]),
-        ("college", ["College"]),
-        ("degree_program", ["WGU Degree Program"]),
-        ("program", ["Program Name"]),
-        ("term_number", ["Term Number"]),
-        ("term_end", ["Term End Date"]),
-        ("momentum", ["Momentum"]),
-        ("term_sap", ["Term CUs and SAP"]),
-        ("cum_sap", ["Cumulative SAP %"]),
-        ("last_activity", ["Last Academic Activity Date"]),
-    ]
-
-    # Other labels seen on the page — used to STOP a value scan (a following
-    # label means the field we're on had no value), so we never grab a distant
-    # unrelated snippet.
-    _OC_STOP_LABELS = frozenset({
-        "student id", "mobile", "wgu email", "email", "other email", "timezone",
-        "mentor", "mentor email", "status", "college", "wgu degree program",
-        "program name", "program summary", "term number", "term end date",
-        "momentum", "term cus and sap", "cumulative sap %",
-        "last academic activity date", "previous term completed cus",
-        "first name", "last name", "pidm", "gender", "birthday", "phone",
-        "home phone", "international phone", "other phone", "business phone",
-        "mobile phone", "do not call", "email opt out", "ferpa access",
-        "ferpa indicator", "ferpa designee", "campus code", "affiliation",
-        "affiliation code", "full or part time", "mailing address",
-        "view contact hierarchy", "student preferred name",
-        "sms opt-in academic", "sms opt-in academic", "is nse student",
-        "call recording opt-out", "currently experiencing evb",
-    })
-
-    @staticmethod
-    def _parse_oc_fields(snippets) -> dict:
-        """Parse the Contact page's DOM-order text snippets into a field dict
-        (label -> next non-noise value). See _OC_FIELD_SPELLINGS."""
-        snips = [str(s or "").strip() for s in (snippets or [])]
-        stop = BrowserWorker._OC_STOP_LABELS
-
-        def noise(v: str) -> bool:
-            return (not v or v == "Preview" or v.endswith("Help Info")
-                    or v.startswith("Edit:"))
-
-        out: dict = {}
-        for key, labels in BrowserWorker._OC_FIELD_SPELLINGS:
-            val = ""
-            for label in labels:
-                ll = label.lower()
-                for i, s in enumerate(snips):
-                    if s.lower() != ll:
-                        continue
-                    for j in range(i + 1, min(i + 5, len(snips))):
-                        v = snips[j]
-                        if v.lower() in stop:
-                            break          # hit the next field's label
-                        if noise(v):
-                            continue       # help-text / Preview / edit chrome
-                        val = v
-                        break
-                    if val:
-                        break
-                if val:
-                    break
-            out[key] = val
-        return out
-
-    @staticmethod
-    def _parse_oc_aci(tables) -> list:
-        """Parse the CourseMentorStudentAssignments related-list rows into ACI
-        records: {course, mentor, active}. Row shape (cells joined by ' | '):
-        '… | True IsActive | D502 | Tawnya Lee | <date> | <cos> | …'. The
-        active row (IsActive=True) is the current assigned course instructor."""
-        import re as _re
-        out: list = []
-        seen = set()
-        for t in (tables or []):
-            for rowstr in (t.get("rows") or []):
-                cells = [c.strip() for c in str(rowstr).split("|")]
-                idx = off = None
-                active = False
-                for k, c in enumerate(cells):
-                    if _re.match(r"(True|False)\s+IsActive$", c):
-                        idx, off, active = k, 1, c.startswith("True")
-                        break
-                    if c in ("True", "False") and k + 1 < len(cells) \
-                            and cells[k + 1] == "IsActive":
-                        idx, off, active = k, 2, (c == "True")
-                        break
-                if idx is None:
-                    continue
-                course = cells[idx + off] if idx + off < len(cells) else ""
-                mentor = cells[idx + off + 1] if idx + off + 1 < len(cells) else ""
-                if not course or not mentor:
-                    continue
-                key = (course, mentor, active)
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append({"course": course, "mentor": mentor,
-                            "active": active})
-        return out
-
-    def _scrape_offcaseload_profile(self, ctx, contact_id: str,
-                                    name: str = "") -> dict:
-        """Scrape an off-caseload student's mini-profile: Contact-page fields
-        (student + PM) then the active ACI(s) from the CourseMentorStudent-
-        Assignments related list. Assumes the record is already open on /view.
-        Leaves the browser back on /view (note panel ready) so a quick note can
-        follow. Returns the field dict with an added 'aci' list (possibly []).
-        """
-        target = self._active_page(ctx)
-        if target is None:
-            return {"aci": []}
-        fields: dict = {}
-        try:
-            target.wait_for_timeout(400)  # let the profile paint
-            data = target.evaluate(self._OC_PROBE_JS)
-            fields = self._parse_oc_fields(data.get("snippets", []))
-        except Exception:
-            fields = {}
-        aci: list = []
-        try:
-            from urllib.parse import urlsplit
-            p = urlsplit(target.url or CASELOAD_URL
-                         or "https://srm.lightning.force.com")
-            url = (f"{p.scheme}://{p.netloc}/lightning/r/Contact/{contact_id}/"
-                   "related/CourseMentorStudentAssignments__r/view")
-            self.on_status("  reading the assigned course instructor (ACI)…")
-            target.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            target.wait_for_timeout(2500)
-            for needle in ("Course Mentor Student Assignments", "Course Mentor"):
-                if target.evaluate(self._OC_REVEAL_JS, needle):
-                    target.wait_for_timeout(2000)   # lazy-render the rows
-                    break
-            tables = target.evaluate(self._OC_TABLES_JS)
-            aci = self._parse_oc_aci(tables)
-        except Exception:
-            aci = []
-        # Return to the Contact view so the note panel is ready for a quick note.
-        try:
-            self._navigate_to_contact(ctx, contact_id)
-        except Exception:
-            pass
-        fields["aci"] = aci
-        return fields
 
     def _handle_find(self, ctx, query: str, new_tab: bool = False,
                      raise_after: Optional[bool] = None) -> None:
@@ -2608,28 +2048,6 @@ class BrowserWorker:
             return
         if auth[:7].lower() == "bearer " and len(auth) > 40:
             self._mongoose_token = {"token": auth[7:], "ts": time.time()}
-
-    def _ensure_mongoose_token(self, page, timeout_ms: int = 6000) -> bool:
-        """Make sure a Mongoose API Bearer token has been harvested so the API
-        text path can run. The dashboard fires an authenticated sms-api call on
-        load (grabbed by _harvest_mongoose_token), so when we have no token yet
-        (e.g. the first send of a session) reload the tab and poll briefly.
-        Returns True once a token exists."""
-        if (self._mongoose_token or {}).get("token"):
-            return True
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=20_000)
-        except Exception:
-            pass
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            if (self._mongoose_token or {}).get("token"):
-                return True
-            try:
-                page.wait_for_timeout(300)
-            except Exception:
-                break
-        return bool((self._mongoose_token or {}).get("token"))
 
     def _probe_mongoose_api(self, ctx) -> dict:
         """Replay-test the harvested Bearer token: in-page fetch (from the
@@ -4998,12 +4416,6 @@ class BrowserWorker:
         # compose modal — no warm-up / bring-to-front needed. On any hard error
         # it falls through to the modal below, so texting never breaks. A clean
         # "nobody opted in" result (ok, 0 sent) is NOT a fallback.
-        if (self.text_api_enabled and payload.get("commit")
-                and not (self._mongoose_token or {}).get("token")):
-            # No token yet (e.g. first send of the session, browser minimized) —
-            # harvest one so we use the reliable API path, not the flaky modal.
-            self.on_status("  text: harvesting Mongoose API token…")
-            self._ensure_mongoose_token(page)
         if (self.text_api_enabled and payload.get("commit")
                 and (self._mongoose_token or {}).get("token")):
             api = self._send_text_via_api(ctx, self._dom_payload_to_api(payload))
@@ -8421,126 +7833,6 @@ def prompt_find_and_pick(
     return result["value"]
 
 
-def prompt_quick_note(parent, *, default_type: str = "Admin Note",
-                      student_name: str = "", course_code: str = ""):
-    """Quick-note dialog — mirrors the 'Note' action's core fields (interaction
-    format, type, academic activities, subject, body) so it feels familiar.
-    Files an ad-hoc note for the selected student. Returns a dict
-    {interaction_format, interaction_type, subject, body, activities} or None."""
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(f"Quick note — {student_name}" if student_name else "Quick note")
-    dialog.geometry("520x600")
-    try:
-        dialog.transient(parent)
-        dialog.attributes("-topmost", True)
-        dialog.after(120, lambda: (dialog.lift(), dialog.focus_force()))
-    except Exception:
-        pass
-    result = {"value": None}
-
-    body_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-    body_frame.pack(fill="both", expand=True, padx=12, pady=(10, 4))
-    # Course code: always pre-filled (from the caseload row / active ACI) but
-    # editable so the user can override it for this note.
-    course_row = ctk.CTkFrame(body_frame, fg_color="transparent")
-    course_row.pack(fill="x", pady=(0, 6))
-    ctk.CTkLabel(course_row, text="Course:").pack(side="left", padx=(0, 8))
-    course_entry = ctk.CTkEntry(course_row, width=120,
-                                placeholder_text="course code")
-    course_entry.pack(side="left")
-    if course_code:
-        course_entry.insert(0, course_code)
-
-    fmt_var = ctk.StringVar(value="Single Interaction")
-    fmt_row = ctk.CTkFrame(body_frame, fg_color="transparent")
-    fmt_row.pack(fill="x", pady=(0, 6))
-    ctk.CTkLabel(fmt_row, text="Format:").pack(side="left", padx=(0, 8))
-    for f in INTERACTION_FORMATS:
-        ctk.CTkRadioButton(fmt_row, text=f, variable=fmt_var, value=f,
-                           command=lambda: _refresh()).pack(side="left", padx=6)
-
-    ctk.CTkLabel(body_frame, text="Type:").pack(anchor="w")
-    type_var = ctk.StringVar(value=default_type)
-    type_menu = ctk.CTkComboBox(body_frame, variable=type_var, width=340,
-                                state="readonly",
-                                values=types_for_format(fmt_var.get()),
-                                command=lambda _v=None: _refresh())
-    type_menu.pack(anchor="w", pady=(0, 8))
-
-    ctk.CTkLabel(body_frame, text="Academic activities:").pack(anchor="w")
-    act_frame = ctk.CTkFrame(body_frame, fg_color="transparent")
-    act_frame.pack(fill="x", pady=(0, 8))
-    activity_vars: dict = {}
-    activity_cbs: list = []
-    for lbl in ACADEMIC_ACTIVITY_LABELS:
-        v = ctk.BooleanVar(value=False)
-        cb = ctk.CTkCheckBox(act_frame, text=lbl, variable=v)
-        cb.pack(anchor="w", pady=1)
-        activity_vars[lbl] = v
-        activity_cbs.append(cb)
-
-    ctk.CTkLabel(body_frame, text="Subject (optional):").pack(anchor="w")
-    subject_entry = ctk.CTkEntry(body_frame, width=440,
-                                 placeholder_text="(defaults to the note type)")
-    subject_entry.pack(anchor="w", pady=(0, 8))
-
-    ctk.CTkLabel(body_frame, text="Note:").pack(anchor="w")
-    body_box = ctk.CTkTextbox(body_frame, height=150, wrap="word")
-    body_box.pack(fill="x", pady=(0, 4))
-
-    def _refresh(*_a):
-        types = types_for_format(fmt_var.get())
-        type_menu.configure(values=types)
-        if type_var.get() not in types:
-            type_var.set(types[0])
-        disabled = activities_disabled_for(fmt_var.get(), type_var.get())
-        for cb in activity_cbs:
-            cb.configure(state="disabled" if disabled else "normal")
-        if disabled:
-            for v in activity_vars.values():
-                v.set(False)
-    _refresh()
-
-    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-    btn_row.pack(fill="x", padx=12, pady=(0, 12))
-
-    def _file():
-        body = body_box.get("1.0", "end").strip()
-        if not body:
-            from tkinter import messagebox
-            if not messagebox.askyesno(
-                    "Empty note", "The note body is empty. File it anyway?",
-                    parent=dialog):
-                return
-        acts = ([lbl for lbl, v in activity_vars.items() if v.get()]
-                if not activities_disabled_for(fmt_var.get(), type_var.get())
-                else [])
-        result["value"] = {
-            "interaction_format": fmt_var.get(),
-            "interaction_type": type_var.get(),
-            "course_code": course_entry.get().strip(),
-            "subject": subject_entry.get().strip(),
-            "body": body, "activities": acts,
-        }
-        try:
-            dialog.destroy()
-        except Exception:
-            pass
-
-    ctk.CTkButton(btn_row, text="File note", command=_file,
-                  fg_color=_ADD_BTN_BLUE,
-                  hover_color=_ADD_BTN_BLUE_HOVER).pack(side="left")
-    ctk.CTkButton(btn_row, text="Cancel", command=dialog.destroy,
-                  **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
-    dialog.bind("<Escape>", lambda _e: dialog.destroy())
-    body_box.bind("<Control-Return>", lambda _e: (_file(), "break"))
-    # Open near the pointer (up-left of it), clamped fully on-screen, so the
-    # popup lands where the ＋ Note button was clicked rather than screen-center.
-    _fit_dialog_to_content(dialog, min_w=520, min_h=600, near_mouse=True)
-    parent.wait_window(dialog)
-    return result["value"]
-
-
 def prompt_additional_text(parent, label: str, prefilled: str,
                            enter_submits: bool = True) -> Optional[str]:
     """Blocking modal: multi-line edit of a note body, pre-filled.
@@ -9995,12 +9287,6 @@ def prompt_batch_email_review(
         selected_vars.append(v)
 
     state = {"current": 0}
-    # Per-student CC / BCC as edited in the review ({idx: str}); the shown value
-    # is captured when leaving a row and at send. `_addr_ready` guards the very
-    # first _show so it doesn't capture the empty initial entries.
-    cc_edits: dict = {}
-    bcc_edits: dict = {}
-    _addr_ready = {"on": False}
 
     # ---- Top banner: filter summary + count. ----
     banner = ctk.CTkFrame(dialog, fg_color=("gray92", "gray18"))
@@ -10198,29 +9484,15 @@ def prompt_batch_email_review(
     to_label.grid(row=0, column=0, sticky="w")
     to_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
     to_value.grid(row=0, column=1, sticky="ew", padx=(2, 0))
-    # Cc / Bcc are EDITABLE (per-student) — the shown value is what sends.
     cc_label = ctk.CTkLabel(header_block, text="Cc:", width=64, anchor="w",
                              font=ctk.CTkFont(size=12, weight="bold"))
-    cc_label.grid(row=1, column=0, sticky="w")
-    cc_entry = ctk.CTkEntry(header_block, height=26,
-                            placeholder_text="add CC address(es), ; separated")
-    cc_entry.grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=1)
-    bcc_label = ctk.CTkLabel(header_block, text="Bcc:", width=64, anchor="w",
-                             font=ctk.CTkFont(size=12, weight="bold"))
-    bcc_label.grid(row=2, column=0, sticky="w")
-    bcc_entry = ctk.CTkEntry(header_block, height=26,
-                             placeholder_text="add BCC address(es), ; separated")
-    bcc_entry.grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=1)
-    cc_hint = ctk.CTkLabel(header_block, text="", anchor="w",
-                           font=ctk.CTkFont(size=10),
-                           text_color=("gray45", "gray60"))
-    cc_hint.grid(row=3, column=1, sticky="w", padx=(2, 0))
+    cc_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left")
     subj_label = ctk.CTkLabel(header_block, text="Subject:", width=64, anchor="w",
                                font=ctk.CTkFont(size=12, weight="bold"))
-    subj_label.grid(row=4, column=0, sticky="w")
+    subj_label.grid(row=2, column=0, sticky="w")
     subj_value = ctk.CTkLabel(header_block, text="", anchor="w", justify="left",
                                font=ctk.CTkFont(size=12, weight="bold"))
-    subj_value.grid(row=4, column=1, sticky="ew", padx=(2, 0))
+    subj_value.grid(row=2, column=1, sticky="ew", padx=(2, 0))
 
     # Separator + body text.
     sep = ctk.CTkFrame(preview_frame, height=1, fg_color=("gray70", "gray35"))
@@ -10263,19 +9535,9 @@ def prompt_batch_email_review(
         )
         send_btn.configure(state=("normal" if n_checked > 0 else "disabled"))
 
-    def _capture_addrs() -> None:
-        """Save the CC/BCC entry text for the currently-shown row."""
-        if not _addr_ready["on"]:
-            return
-        i = state["current"]
-        if 0 <= i < len(rendered):
-            cc_edits[i] = cc_entry.get().strip()
-            bcc_edits[i] = bcc_entry.get().strip()
-
     def _show(idx: int) -> None:
         if not (0 <= idx < len(rendered)):
             return
-        _capture_addrs()   # remember edits on the row we're leaving
         state["current"] = idx
         entry = rendered[idx]
         # Keep the list selection in sync with the previewed student.
@@ -10296,15 +9558,16 @@ def prompt_batch_email_review(
             text_color=(("gray45", "gray60") if not entry.get("to")
                         else ("gray10", "gray90")),
         )
-        # Cc / Bcc — editable. Pre-fill CC from the user's edit (if any) else the
-        # computed CC; BCC from the user's edit else blank.
-        cc_entry.delete(0, "end")
-        cc_entry.insert(0, cc_edits.get(idx, entry.get("cc", "") or ""))
-        bcc_entry.delete(0, "end")
-        bcc_entry.insert(0, bcc_edits.get(idx, entry.get("bcc", "") or ""))
-        cc_hint.configure(
-            text="(you, auto-CC'd as PM)" if entry.get("cc_is_self") else "")
-        _addr_ready["on"] = True
+        # Cc — hide row if no CC configured for this scenario at all.
+        if entry.get("cc") or entry.get("cc_configured"):
+            cc_label.grid(row=1, column=0, sticky="w")
+            cc_value.grid(row=1, column=1, sticky="ew", padx=(2, 0))
+            cc = entry.get("cc", "") or "(missing — will be looked up at send)"
+            hint = "  (you, auto-CC'd as PM)" if entry.get("cc_is_self") else ""
+            cc_value.configure(text=cc + hint)
+        else:
+            cc_label.grid_remove()
+            cc_value.grid_remove()
         # Subject (+ an edited marker when this body was hand-edited).
         edited_tag = "   ✏ edited" if state["current"] in edits else ""
         subj_value.configure(text=entry.get("subject", "") + edited_tag)
@@ -10453,7 +9716,6 @@ def prompt_batch_email_review(
     result_box = {"value": None}
 
     def _do_send() -> None:
-        _capture_addrs()   # capture the currently-shown row's CC/BCC
         selected = [i for i, v in enumerate(selected_vars) if v.get()]
         if not selected:
             return
@@ -10488,8 +9750,7 @@ def prompt_batch_email_review(
         _show(0)
 
     parent.wait_window(dialog)
-    return (result_box["value"], chosen_template_box["value"], edits,
-            cc_edits, bcc_edits)
+    return result_box["value"], chosen_template_box["value"], edits
 
 
 def _build_checkbox_images():
@@ -13577,15 +12838,6 @@ class CaseloadPanel:
         )
         self.view_menu.pack(side="left", padx=(0, 4))
         self._refresh_view_menu()  # populate with any saved views
-        # Toggle: also search ARCHIVED (past) students, merged into the list
-        # (dimmed). Lets a name search reach former students without leaving the
-        # live caseload. See _toggle_search_archived.
-        self.search_archived_btn = ctk.CTkButton(
-            self.bar_actions, text="🗄 +Archived", width=110,
-            command=self._toggle_search_archived, **SECONDARY_BTN_KWARGS,
-        )
-        self.search_archived_btn.pack(side="left", padx=(0, 4))
-        self._search_archived_fg = self.search_archived_btn.cget("fg_color")
         # Filters toggle — shows/hides the collapsible column-filter section.
         self.filters_toggle_btn = ctk.CTkButton(
             self.bar_actions, text="▸ Filters", width=80,
@@ -13692,8 +12944,6 @@ class CaseloadPanel:
         # Zebra striping for readability.
         self.tree.tag_configure("even", background=self._even_bg)
         self.tree.tag_configure("odd", background=self._odd_bg)
-        # Archived (past) students merged into a search show dimmed/tinted.
-        self.tree.tag_configure("archived", foreground="#9a7a2a")
         # Double-click → open/switch to that student (reuse current tab).
         # Middle-click → quick "open in new console subtab" (background).
         # Right-click → action menu (Open / Open in new tab / Fire ▸).
@@ -14022,23 +13272,16 @@ class CaseloadPanel:
             font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.qv_name.grid(row=0, column=1, sticky="ew")
-        # Quick note — file an ad-hoc note for the selected student (blue, next
-        # to Review notes). Also on the Ctrl+Shift+N hotkey. On/off caseload.
-        self.quick_note_btn = ctk.CTkButton(
-            hdr, text="＋ Note", width=80, command=self._quick_note,
-            fg_color=_ADD_BTN_BLUE, hover_color=_ADD_BTN_BLUE_HOVER,
-        )
-        self.quick_note_btn.grid(row=0, column=2, padx=(6, 0))
         self.review_btn = ctk.CTkButton(
             hdr, text="Review notes ⏎", width=110,
             command=self._review_focused, **SECONDARY_BTN_KWARGS,
         )
-        self.review_btn.grid(row=0, column=3, padx=(6, 0))
+        self.review_btn.grid(row=0, column=2, padx=(6, 0))
         self.qv_fields_btn = ctk.CTkButton(
             hdr, text="⚙", width=30,
             command=self._open_quickview_dialog, **SECONDARY_BTN_KWARGS,
         )
-        self.qv_fields_btn.grid(row=0, column=4, padx=(6, 0))
+        self.qv_fields_btn.grid(row=0, column=3, padx=(6, 0))
 
         # The info/notes body is (re)built per width mode by
         # _build_detail_body — wide pins the info on the left with a separate
@@ -15565,75 +14808,6 @@ class CaseloadPanel:
         if query:
             self.review_notes(query, label)
 
-    def _quick_note(self) -> None:
-        """File a quick ad-hoc note for the selected student (＋ Note button /
-        Ctrl+Shift+N). Uses the quick-view row, else the focused row; files via
-        the saveNoteCmpValues API. Works for on- and off-caseload students."""
-        row = getattr(self, "_qv_row", None) or self._row_by_iid.get(
-            self.tree.focus())
-        if not row:
-            self.app._append_log(
-                "Quick note: select a student in the viewer first.")
-            return
-        if getattr(self.app, "_is_busy", False):
-            self.app._append_log("Busy — finish the current task first.")
-            return
-        sid = str(row.get("StudentID") or row.get("Student ID") or "").strip()
-        name = str(row.get("Name") or "").strip() or sid
-        course = str(row.get("CourseCode") or row.get("Course Code") or "").strip()
-        contact_id = (str(row.get("contactID") or "").strip()
-                      or str(row.get("Contact id") or "").strip()
-                      or (self.app._contact_ids.get(sid, "") or "").strip())
-        if not contact_id and sid:
-            try:
-                contact_id = (self.app.worker.grid_student_contact_map().get(
-                    sid, "") or "").strip()
-            except Exception:
-                contact_id = ""
-        if not contact_id:
-            self.app._append_log(
-                f"Quick note: no Contact id known for {name}.")
-            return
-        if not self.app.worker.ready_event.is_set():
-            self.app._append_log("Quick note: browser not ready yet.")
-            return
-        default_type = getattr(
-            self.app.settings, "quick_note_last_type", "Admin Note")
-        data = prompt_quick_note(
-            self.app.root, default_type=default_type,
-            student_name=name, course_code=course)
-        if not data:
-            return
-        # Remember the type used so it opens first next time.
-        try:
-            self.app.settings.quick_note_last_type = data["interaction_type"]
-            save_settings(self.app.settings)
-        except Exception:
-            pass
-        body_html = _note_body_to_html(data["body"])
-        self.app._append_log(
-            f"Filing quick note ({data['interaction_type']}) for {name}…")
-
-        def on_done(res):
-            def show():
-                if res and res.get("ok"):
-                    self.app._append_log(
-                        f"✓ Quick note filed for {name}.", success=True)
-                else:
-                    self.app._append_log(
-                        f"Quick note failed: {(res or {}).get('error')}",
-                        error=True)
-            try:
-                self.app.root.after(0, show)
-            except Exception:
-                show()
-
-        # Use the (possibly overridden) course code from the dialog.
-        course = data.get("course_code") or course
-        self.app.worker.submit_quick_note(
-            contact_id, data["interaction_type"], course,
-            data["subject"], body_html, data["activities"], on_done)
-
     def review_notes(self, query: str, label: str) -> None:
         """Open the student (navigation) and load their notes into the
         viewer. Guarded against running mid-batch, and against repeat
@@ -15981,30 +15155,15 @@ class CaseloadPanel:
         if q.lower().startswith("gridschema"):
             self.app._grid_schema_dump()
             return "break"
-        # PROBE: "ocprobe: <name/ID>" — open an off-caseload student and dump
-        # their record's fields to oc_probe.txt (to locate ACI/PM/term/task/
-        # mobile for the cold-student-triage feature). Read-only.
-        if q.lower().startswith("ocprobe"):
-            self.app._oc_probe_run(q[len("ocprobe"):].lstrip(": ").strip())
-            return "break"
-        rows = self.app._caseload_rows or []
-        ql = q.lower()
         # Student ID (digits) or email → if not on the caseload, find anywhere.
         if q and (re.fullmatch(r"\d{5,12}", q) or "@" in q):
+            rows = self.app._caseload_rows or []
+            ql = q.lower()
             on_caseload = any(
                 str(r.get("StudentID", "") or r.get("Student ID", "")).strip() == q
                 or ql in str(r.get("StudentEmail", "") or "").lower()
                 for r in rows)
             if not on_caseload:
-                self.app._open_student_global(q)
-            return "break"
-        # A NAME with no match on the caseload → search all of Salesforce (a
-        # picker handles multiple hits). Gated on "nobody here matches" so a
-        # normal in-caseload filter+Enter never fires a search, and skipped in
-        # Archived mode (that grid is history, not the live caseload).
-        if q and len(q) >= 3 and not getattr(self, "_archived_mode", False):
-            name_here = any(ql in str(r.get("Name", "")).lower() for r in rows)
-            if not name_here:
                 self.app._open_student_global(q)
         return "break"
 
@@ -16410,9 +15569,6 @@ class CaseloadPanel:
 
     _VIEW_SAVE = "＋ Save current as…"
     _VIEW_MANAGE = "⚙ Manage views…"
-    _VIEW_ARCHIVED = "🗄 Archived (past students)"
-    _VIEW_OFFCASELOAD = "🔎 Off-caseload (not yours)"
-    _VIEW_LIVE = "◀ Live caseload"
 
     def _load_views(self) -> list:
         import json
@@ -16485,41 +15641,15 @@ class CaseloadPanel:
             return
         views = self._load_views()
         names = [v["name"] for v in views]
-        archived = getattr(self, "_archived_mode", False)
-        offcl = getattr(self, "_offcaseload_mode", False)
-        values = []
-        if archived or offcl:
-            values.append(self._VIEW_LIVE)          # way back to the live caseload
-        values += names + [self._VIEW_ARCHIVED, self._VIEW_SAVE]
+        values = names + [self._VIEW_SAVE]
         if names:
             values.append(self._VIEW_MANAGE)
         self.view_menu.configure(values=values)
-        if offcl:
-            self.view_menu.set(self._VIEW_OFFCASELOAD)
-        elif archived:
-            self.view_menu.set(self._VIEW_ARCHIVED)
-        else:
-            cur = self.app.settings.caseload_current_view or ""
-            self.view_menu.set(cur if cur in names else (names[0] if names
-                                                         else "★ Views"))
-
-    def _exit_special_modes(self, repopulate: bool = True) -> None:
-        """Leave Archived / Off-caseload mode (back to the live caseload)."""
-        if getattr(self, "_archived_mode", False):
-            self._exit_archived_mode(repopulate=repopulate)
-        elif getattr(self, "_offcaseload_mode", False):
-            self._exit_offcaseload_mode(repopulate=repopulate)
+        cur = self.app.settings.caseload_current_view or ""
+        self.view_menu.set(cur if cur in names else (names[0] if names
+                                                     else "★ Views"))
 
     def _on_view_select(self, choice: str) -> None:
-        if choice == self._VIEW_ARCHIVED:
-            self._exit_special_modes(repopulate=False)
-            self._enter_archived_mode()
-            return
-        if choice == self._VIEW_LIVE:
-            self._exit_special_modes()
-            return
-        # Any other choice leaves the special modes (back to the live caseload).
-        self._exit_special_modes(repopulate=False)
         if choice == self._VIEW_SAVE:
             self._save_view_dialog()
         elif choice == self._VIEW_MANAGE:
@@ -16530,266 +15660,6 @@ class CaseloadPanel:
                 self._apply_view(by_name[choice])
                 self.app._append_log(f"Applied view {choice!r}.")
         self._refresh_view_menu()
-
-    # ---- Archived mode (past / off-caseload students) --------------------
-    def _live_caseload_keys(self) -> set:
-        """(student_id, course_code) pairs currently on the caseload — passed to
-        history.archived_students so today's students are excluded."""
-        keys = set()
-        for r in (self.app._caseload_rows or []):
-            sid = str(r.get("StudentID") or r.get("Student ID") or "").strip()
-            cc = str(r.get("CourseCode") or r.get("Course Code") or "").strip()
-            if sid:
-                keys.add((sid, cc))
-        return keys
-
-    def _load_archived_rows(self) -> None:
-        """(Re)load past students from history into self._archived_rows,
-        excluding whoever's currently on the caseload."""
-        try:
-            from src import history
-            self._archived_rows = history.archived_students(
-                current_keys=self._live_caseload_keys())
-        except Exception as e:
-            self.app._append_log(
-                f"Couldn't load archived students: {e}", error=True)
-            self._archived_rows = []
-
-    def _toggle_search_archived(self) -> None:
-        """Toggle merging archived (past) students into the current list, so a
-        name search reaches former students. They render dimmed; double-click
-        opens their Salesforce record like any off-caseload student."""
-        on = not getattr(self, "_search_archived", False)
-        self._search_archived = on
-        if on:
-            self._load_archived_rows()
-            self.search_archived_btn.configure(
-                text="🗄 Archived ✓", fg_color=("#8a5a00", "#6b4a00"))
-            self.app._append_log(
-                f"Search now includes {len(self._archived_rows or [])} archived "
-                "student(s) (shown dimmed). Toggle 🗄 off to hide them.")
-        else:
-            self.search_archived_btn.configure(
-                text="🗄 +Archived", fg_color=self._search_archived_fg)
-        self.populate()
-
-    def _enter_archived_mode(self, query: Optional[str] = None) -> None:
-        """Switch the grid to past students (from the history snapshots). Opening
-        a row opens their real Salesforce record; notes file via the normal
-        off-caseload path. `query` pre-fills the search (used by the search-box
-        'include archived' button)."""
-        self._load_archived_rows()
-        self._archived_mode = True
-        self._show_archived_banner()
-        if query is not None:
-            self.search_var.set(query)   # trace → _on_search sets self._query
-        self.populate()
-        self._refresh_view_menu()
-        self.app._append_log(
-            f"🗄 Archived: showing {len(self._archived_rows or [])} past "
-            "student(s). Double-click one to open their Salesforce record.")
-
-    def _exit_archived_mode(self, repopulate: bool = True) -> None:
-        self._archived_mode = False
-        self._archived_rows = None
-        self._hide_archived_banner()
-        if repopulate:
-            self.populate()
-            self._refresh_view_menu()
-
-    def _show_archived_banner(self) -> None:
-        try:
-            if not hasattr(self, "_caseload_label_fg"):
-                self._caseload_label_fg = self.caseload_label.cget("text_color")
-            self.caseload_label.configure(
-                text="🗄 Archived", text_color=("#8a5a00", "#e0b050"))
-            self.search_entry.configure(placeholder_text="Search archived…")
-        except Exception:
-            pass
-
-    def _hide_archived_banner(self) -> None:
-        try:
-            self.caseload_label.configure(
-                text="Caseload",
-                text_color=getattr(self, "_caseload_label_fg",
-                                   ("gray10", "gray90")))
-            self.search_entry.configure(placeholder_text="Search caseload…")
-        except Exception:
-            pass
-
-    # ---- Off-caseload mode (students NOT assigned to us) -----------------
-    def _enter_offcaseload_mode(self, matches: list, query: str = "") -> None:
-        """Show off-caseload search matches as rows IN the viewer (instead of a
-        popup), so the user picks a student the familiar way. Rows carry name +
-        Contact id; opening one opens their Salesforce record. Stage 3 enriches
-        the row with the scraped profile + ACI. Visually distinct (red banner)
-        so it's obvious these aren't the user's students."""
-        rows = []
-        for m in (matches or []):
-            cid = str(m.get("contact_id") or "").strip()
-            if not cid:
-                continue
-            rows.append({
-                "Name": m.get("name") or "(unknown)",
-                "Contact id": cid,         # display + used to open the record
-                "_offcaseload": True,      # internal flag (kept out of columns)
-            })
-        self._offcaseload_rows = rows
-        self._offcaseload_mode = True
-        self._archived_mode = False        # mutually exclusive
-        self._show_offcaseload_banner()
-        self.populate()
-        self._refresh_view_menu()
-        self.app._append_log(
-            f"🔎 Off-caseload: {len(rows)} match(es)"
-            + (f" for {query!r}" if query else "")
-            + " — click one to open their record (NOT on your caseload).")
-
-    def _exit_offcaseload_mode(self, repopulate: bool = True) -> None:
-        self._offcaseload_mode = False
-        self._offcaseload_rows = None
-        self._hide_archived_banner()       # generic label/placeholder restore
-        if repopulate:
-            self.populate()
-            self._refresh_view_menu()
-
-    def _show_offcaseload_banner(self) -> None:
-        try:
-            if not hasattr(self, "_caseload_label_fg"):
-                self._caseload_label_fg = self.caseload_label.cget("text_color")
-            self.caseload_label.configure(
-                text="🔎 Off-caseload (not yours)",
-                text_color=("#b02020", "#ff6b6b"))
-            self.search_entry.configure(placeholder_text="Search off-caseload…")
-        except Exception:
-            pass
-
-    def show_offcaseload_quick_view(self, contact_id: str, name: str,
-                                    profile: dict) -> None:
-        """Render an off-caseload student's scraped mini-profile into the quick
-        view: student contact info + PM (Mentor) + the ACTIVE ACI (prominent).
-        Sets _qv_row so ＋ Note / Ctrl+Shift+N file for them. No Essential
-        Actions / task grid / Success Path — those are caseload-scoped."""
-        profile = profile or {}
-        all_aci = profile.get("aci") or []
-        active = [a for a in all_aci if a.get("active")]
-        active_course = active[0]["course"] if active else ""
-        # Back the quick note + off-caseload actions with the scraped context
-        # (there's no caseload row to look up). _qv_offcaseload_profile keeps the
-        # full profile for the email/note fire path (_offcaseload_open_context).
-        self._qv_row = {
-            "Name": name,
-            "Contact id": contact_id,
-            "StudentID": profile.get("student_id", ""),
-            "CourseCode": active_course,
-            "MobilePhone": profile.get("mobile", ""),
-            "Timezone": profile.get("timezone", ""),
-            "WGUEmail": profile.get("wgu_email", ""),
-            "Mentor": profile.get("mentor", ""),
-            "MentorEmail": profile.get("mentor_email", ""),
-            "_offcaseload": True,
-        }
-        self._qv_offcaseload_profile = dict(profile)
-        # This student isn't on the caseload — clear the caseload-only panels.
-        for w in self.qv_body.winfo_children():
-            w.destroy()
-        for w in self.qv_notehead.winfo_children():
-            w.destroy()
-        try:
-            for w in self.qv_ea_frame.winfo_children():
-                w.destroy()
-        except Exception:
-            pass
-        try:
-            self.qv_path_frame.grid_remove()
-        except Exception:
-            pass
-        self.qv_name.configure(text=f"🔎 {name or '(unknown)'}")
-
-        r = 0
-        ctk.CTkLabel(
-            self.qv_body, text="Off-caseload — not on your caseload",
-            anchor="w", font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("#b02020", "#ff6b6b"),
-        ).grid(row=r, column=0, columnspan=2, sticky="w", padx=(0, 6),
-               pady=(0, 4))
-        r += 1
-
-        wrap = 300 if not getattr(self, "_narrow", False) else 180
-
-        def line(rr: int, label: str, value: str, *, copy=False, tel=False):
-            value = str(value or "").strip()
-            if not value:
-                return rr
-            ctk.CTkLabel(
-                self.qv_body, text=f"{label}:", anchor="nw",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=("gray35", "gray70"), width=90,
-            ).grid(row=rr, column=0, sticky="nw", padx=(0, 6), pady=1)
-            vf = ctk.CTkFrame(self.qv_body, fg_color="transparent")
-            vf.grid(row=rr, column=1, sticky="ew", pady=1)
-            vf.grid_columnconfigure(2, weight=1)
-            kw = ({"text_color": ("#1f6feb", "#58a6ff"), "cursor": "hand2"}
-                  if tel else {})
-            v = ctk.CTkLabel(vf, text=value, anchor="w", justify="left",
-                             wraplength=wrap, font=ctk.CTkFont(size=12), **kw)
-            v.grid(row=0, column=0, sticky="w")
-            if tel:
-                v.bind("<Button-1>", lambda e, m=value: self._open_tel(m))
-            if copy:
-                self._copy_icon_btn(vf, value).grid(row=0, column=1, padx=(4, 0))
-            return rr + 1
-
-        r = line(r, "Student ID", profile.get("student_id", ""), copy=True)
-        r = line(r, "Mobile", profile.get("mobile", ""), copy=True, tel=True)
-        r = line(r, "WGU Email", profile.get("wgu_email", ""), copy=True)
-        r = line(r, "Other Email", profile.get("other_email", ""), copy=True)
-        r = line(r, "PM (Mentor)", profile.get("mentor", ""))
-        r = line(r, "PM email", profile.get("mentor_email", ""), copy=True)
-        # ACI — the assigned course instructor(s), prominent.
-        r = self._oc_aci_block(r, active)
-        r = line(r, "Program", profile.get("program", "")
-                 or profile.get("degree_program", ""))
-        r = line(r, "Term #", profile.get("term_number", ""))
-        r = line(r, "Term end", profile.get("term_end", ""))
-        r = line(r, "Momentum", profile.get("momentum", ""))
-        r = line(r, "Term SAP", profile.get("term_sap", ""))
-        r = line(r, "Cum SAP", profile.get("cum_sap", ""))
-        r = line(r, "Last activity", profile.get("last_activity", ""))
-        r = line(r, "Status", profile.get("status", ""))
-        r = line(r, "Timezone", profile.get("timezone", ""))
-        r = line(r, "College", profile.get("college", ""))
-        try:
-            self._ensure_detail_height()
-        except Exception:
-            pass
-
-    def _oc_aci_block(self, r: int, active: list) -> int:
-        """Render the active ACI (assigned course instructor) as a highlighted
-        course→mentor block. If none was found, show '(not found)'."""
-        ctk.CTkLabel(
-            self.qv_body, text="ACI:", anchor="nw",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("gray35", "gray70"), width=90,
-        ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
-        if not active:
-            ctk.CTkLabel(
-                self.qv_body, text="(not found)", anchor="w",
-                font=ctk.CTkFont(size=12), text_color=("gray45", "gray60"),
-            ).grid(row=r, column=1, sticky="w", pady=1)
-            return r + 1
-        box = ctk.CTkFrame(self.qv_body, fg_color=("#eaf5ea", "#22331f"),
-                           corner_radius=6)
-        box.grid(row=r, column=1, sticky="ew", pady=1)
-        box.grid_columnconfigure(0, weight=1)
-        for k, a in enumerate(active):
-            ctk.CTkLabel(
-                box, text=f"{a.get('course', '')} → {a.get('mentor', '')}",
-                anchor="w", font=ctk.CTkFont(size=12, weight="bold"),
-                text_color=("#2e7d32", "#7bd88f"),
-            ).grid(row=k, column=0, sticky="ew", padx=8,
-                   pady=(4 if k == 0 else 0, 4))
-        return r + 1
 
     def _save_view_dialog(self) -> None:
         from tkinter import simpledialog
@@ -16970,8 +15840,7 @@ class CaseloadPanel:
         # facet helpers (Task1Date/…); otherwise Apply would try to put them
         # in displaycolumns, which the tree doesn't define → ttk error → the
         # whole show/hide silently no-ops.
-        headers = [h for h in rows[0].keys()
-                   if not _is_task_facet_col(h) and not h.startswith("_")]
+        headers = [h for h in rows[0].keys() if not _is_task_facet_col(h)]
         # Capture any drag-resizes done since load so they aren't lost.
         self.persist_column_state()
         prefs = self._load_col_prefs()
@@ -17203,20 +16072,8 @@ class CaseloadPanel:
         glyph = TASK_CELL_GLYPHS.get(state, "")
         return f"{glyph} {raw}" if glyph else raw
 
-    def _source_rows(self) -> list:
-        """Rows feeding the grid: the live caseload; in Archived mode the past
-        students only; or, with '🗄 +Archived' search on, the live caseload plus
-        matching archived rows (merged, archived shown dimmed)."""
-        if getattr(self, "_archived_mode", False):
-            return self._archived_rows or []
-        if getattr(self, "_offcaseload_mode", False):
-            return self._offcaseload_rows or []
-        if getattr(self, "_search_archived", False):
-            return (self.app._caseload_rows or []) + (self._archived_rows or [])
-        return self.app._caseload_rows or []
-
     def populate(self) -> None:
-        rows = self._source_rows()
+        rows = self.app._caseload_rows or []
         if not rows:
             self.tree.delete(*self.tree.get_children())
             self.tree["columns"] = ()
@@ -17228,8 +16085,7 @@ class CaseloadPanel:
         # Per-task facet columns (Task1Date/Count/Status, …) are hidden
         # helpers behind the single visible "Task N" column — keep them out
         # of the grid (the Task1/2/3 columns already show date+count+glyph).
-        headers = [h for h in rows[0].keys()
-                   if not _is_task_facet_col(h) and not h.startswith("_")]
+        headers = [h for h in rows[0].keys() if not _is_task_facet_col(h)]
         if tuple(self.tree["columns"]) != tuple(headers):
             # Reset displaycolumns to "#all" BEFORE swapping the column set.
             # ttk validates the existing displaycolumns against the new
@@ -17282,14 +16138,11 @@ class CaseloadPanel:
         self._row_by_iid = {}
         for i, r in enumerate(view):
             checked = self._row_key(r) in self._checked_ids
-            tags = ["even" if i % 2 == 0 else "odd"]
-            if r.get("_archived"):
-                tags.append("archived")   # dim past students merged into a search
             iid = self.tree.insert(
                 "", "end", image=self._chk_img(checked),
                 values=[self._task_cell_value(r, h, task_cols)
                         for h in headers],
-                tags=tuple(tags),
+                tags=("even" if i % 2 == 0 else "odd",),
             )
             self._row_by_iid[iid] = r
         self._after_selection_change()
@@ -17336,20 +16189,7 @@ class CaseloadPanel:
 
     def _open_row(self, event, new_tab: bool) -> None:
         query, _label = self._row_query_label(event)
-        row = self._row_by_iid.get(self.tree.focus())
-        if row and row.get("_offcaseload"):
-            # Off-caseload search match — open directly by its Contact id.
-            cid = str(row.get("Contact id") or "").strip()
-            if cid:
-                self.app._open_contact_id(cid, str(row.get("Name") or ""))
-            return
-        if not query:
-            return
-        if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
-            # Off-caseload (archived) students aren't in the caseload row filter
-            # — open via Salesforce global search (by Student ID).
-            self.app._open_student_global(query)
-        else:
+        if query:
             self.app._find_student_by_query(query, new_tab=new_tab)
 
     def _focus_first_row(self, event=None):
@@ -17373,18 +16213,7 @@ class CaseloadPanel:
         Double-click stays open-only for a quick switch without notes."""
         iid = self.tree.focus()
         query, label = self._query_label_for_iid(iid)
-        row = self._row_by_iid.get(iid)
-        if row and row.get("_offcaseload"):
-            cid = str(row.get("Contact id") or "").strip()
-            if cid:
-                self.app._open_contact_id(cid, str(row.get("Name") or ""))
-            return "break"
         if query:
-            if getattr(self, "_archived_mode", False) or (row and row.get("_archived")):
-                # Off-caseload: open the Salesforce record (no caseload-scoped
-                # notes fetch — that relies on the live caseload).
-                self.app._open_student_global(query)
-                return "break"
             self.tree.selection_set(iid)
             # selection_set queues a <<TreeviewSelect>> → show_quick_view →
             # _notes_hint, which would overwrite the "Loading…" message. Defer
@@ -17504,246 +16333,6 @@ class CaseloadPanel:
                      else ("#9a6700", "#ffd166") if mins < 120
                      else ("#b00020", "#ff7b72"))
         self.freshness_lbl.configure(text=txt, text_color=color)
-
-
-class QueuePanel:
-    """The 'Queue' tab: review multiple BATCH actions up front, then run them
-    in sequence. Review happens when an action is ADDED (its edited payload is
-    stored on the QueueItem); the actual sending/saving happens only on Run.
-
-    Stage 1 builds the shell — the control bar and the row list rendered from
-    ``app.action_queue`` — with the model-only interactions wired (check /
-    uncheck / remove a PENDING row). Add-to-queue (stage 2), Run (stage 3),
-    and Pause/Continue/Cancel (stage 4) fill in the inert controls."""
-
-    # status -> (glyph, (light_color, dark_color))
-    _STATUS_ICON = {
-        QueueStatus.PENDING: ("○", ("gray45", "gray60")),
-        QueueStatus.RUNNING: ("●", ("#1f6feb", "#4a9eff")),
-        QueueStatus.DONE:    ("✓", ("#2e7d32", "#3fb950")),
-        QueueStatus.ERROR:   ("✗", ("#c62828", "#e0524f")),
-    }
-
-    def __init__(self, app) -> None:
-        self.app = app
-        self.tab = None
-        self.ctrls = None
-        self.listbox = None          # scrollable frame holding the rows
-        self._add_btn = None
-        self._start_btn = None
-        self._pause_btn = None
-        self._cancel_btn = None
-        self._clear_done_btn = None
-
-    # ---- mount -----------------------------------------------------------
-    def attach(self, tab) -> None:
-        self.tab = tab
-        self.mount(tab)
-
-    def mount(self, parent) -> None:
-        for w in parent.winfo_children():
-            w.destroy()
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
-
-        # Control bar: Add-to-queue toggle | Start | Pause | Cancel.
-        self.ctrls = ctk.CTkFrame(parent, fg_color="transparent")
-        self.ctrls.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
-        self._add_btn = ctk.CTkButton(
-            self.ctrls, text="➕ Add to queue", width=130,
-            command=self._toggle_add_mode,
-        )
-        self._add_btn.pack(side="left")
-        self._start_btn = ctk.CTkButton(
-            self.ctrls, text="▶ Start", width=80,
-            command=self._on_start, state="disabled",
-        )
-        self._start_btn.pack(side="left", padx=(8, 0))
-        self._pause_btn = ctk.CTkButton(
-            self.ctrls, text="⏸ Pause", width=90,
-            command=self._on_pause, state="disabled", **SECONDARY_BTN_KWARGS,
-        )
-        self._pause_btn.pack(side="left", padx=(8, 0))
-        self._cancel_btn = ctk.CTkButton(
-            self.ctrls, text="✕ Cancel", width=90,
-            command=self._on_cancel, state="disabled", **SECONDARY_BTN_KWARGS,
-        )
-        self._cancel_btn.pack(side="left", padx=(8, 0))
-        # Clear the completed (✓ DONE) rows — tidies the list after a run.
-        # Right-aligned, away from the run controls. Kept-ERROR rows stay.
-        self._clear_done_btn = ctk.CTkButton(
-            self.ctrls, text="🧹 Clear completed", width=140,
-            command=self._on_clear_done, state="disabled",
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._clear_done_btn.pack(side="right")
-
-        # Scrollable row list.
-        self.listbox = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        self.listbox.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 6))
-        self.listbox.grid_columnconfigure(0, weight=1)
-        self.refresh()
-
-    # ---- render ----------------------------------------------------------
-    def refresh(self) -> None:
-        """Rebuild the row list from app.action_queue and sync control state."""
-        if self.listbox is None:
-            return
-        for w in self.listbox.winfo_children():
-            w.destroy()
-
-        items = self.app.action_queue.items
-        if not items:
-            ctk.CTkLabel(
-                self.listbox,
-                text=("No actions queued.\n\nTurn on “➕ Add to queue”, then "
-                      "click the batch actions you want to run in sequence."),
-                justify="left", text_color=("gray40", "gray60"),
-            ).grid(row=0, column=0, sticky="w", padx=8, pady=12)
-        else:
-            for i, it in enumerate(items):
-                self._render_row(i, it)
-
-        self._sync_controls()
-
-    def _render_row(self, row: int, it: QueueItem) -> None:
-        frame = ctk.CTkFrame(self.listbox, fg_color=("gray92", "gray17"))
-        frame.grid(row=row, column=0, sticky="ew", pady=3)
-        frame.grid_columnconfigure(3, weight=1)
-
-        # checkbox — (un)checkable for PENDING/ERROR (ERROR = retry); RUNNING
-        # locked, DONE locked (can't re-send).
-        var = ctk.BooleanVar(value=it.checked)
-        chk = ctk.CTkCheckBox(
-            frame, text="", width=24, variable=var,
-            command=lambda n=it.action_name, v=var: self._toggle_check(n, v),
-        )
-        if not it.status.can_check:
-            chk.configure(state="disabled")
-        chk.grid(row=0, column=0, padx=(8, 4), pady=6)
-
-        # color chip
-        chip = ctk.CTkFrame(frame, width=12, height=12, corner_radius=3,
-                            fg_color=it.color or ("gray70", "gray45"))
-        chip.grid(row=0, column=1, padx=(0, 6))
-        chip.grid_propagate(False)
-
-        # status icon
-        glyph, col = self._STATUS_ICON.get(
-            it.status, self._STATUS_ICON[QueueStatus.PENDING])
-        ctk.CTkLabel(frame, text=glyph, width=18, text_color=col,
-                     font=ctk.CTkFont(size=15, weight="bold")).grid(
-            row=0, column=2, padx=(0, 4))
-
-        # name (+ error detail on failed rows, so 'Start' = retry is obvious)
-        label = it.display_name
-        if it.status == QueueStatus.ERROR and it.error_detail:
-            label += f"   —  ✗ {it.error_detail} (re-check + Start to retry)"
-        name_lbl = ctk.CTkLabel(frame, text=label, anchor="w")
-        if it.status == QueueStatus.ERROR:
-            name_lbl.configure(text_color=("#c0392b", "#e0524f"))
-        name_lbl.grid(row=0, column=3, sticky="ew", padx=2)
-
-        # remove — allowed for anything except the currently-running row.
-        rm = ctk.CTkButton(
-            frame, text="✕", width=28, height=24,
-            command=lambda n=it.action_name: self._remove(n),
-            **SECONDARY_BTN_KWARGS,
-        )
-        if not it.status.can_remove:
-            rm.configure(state="disabled")
-        rm.grid(row=0, column=4, padx=(4, 8))
-
-    def _sync_controls(self) -> None:
-        """Enable/disable the control bar. Start runs when there's at least one
-        checked, still-PENDING item and no run is in progress. Pause/Cancel come
-        alive in stage 4."""
-        running = getattr(self.app, "_queue_running", False)
-        can_start = bool(self.app._queue_run_set()) and not running
-        if self._start_btn is not None:
-            self._start_btn.configure(
-                state="normal" if can_start else "disabled")
-        # add-mode button reflects its toggle state; disabled during a run
-        if self._add_btn is not None:
-            on = getattr(self.app, "_queue_add_mode", False)
-            self._add_btn.configure(
-                text="➕ Adding… (click actions)" if on else "➕ Add to queue",
-                state="disabled" if running else "normal")
-        # clear-completed: enabled when there's a DONE row and no run in progress
-        if self._clear_done_btn is not None:
-            self._clear_done_btn.configure(
-                state="normal" if (self.app.action_queue.has_done()
-                                   and not running) else "disabled")
-
-    def on_run_state_changed(self) -> None:
-        """Reflect the run state on Pause/Cancel (and, via _sync_controls,
-        Start/Add). Pause reads Continue once actually paused, and shows a
-        disabled 'Pausing…' while the in-flight action is still finishing."""
-        running = getattr(self.app, "_queue_running", False)
-        paused = getattr(self.app, "_queue_paused", False)
-        busy = getattr(self.app, "_is_busy", False)
-        if self._pause_btn is not None:
-            if not running:
-                self._pause_btn.configure(state="disabled", text="⏸ Pause")
-            elif paused and busy:
-                self._pause_btn.configure(state="disabled", text="⏸ Pausing…")
-            elif paused:
-                self._pause_btn.configure(state="normal", text="▶ Continue")
-            else:
-                self._pause_btn.configure(state="normal", text="⏸ Pause")
-        if self._cancel_btn is not None:
-            self._cancel_btn.configure(
-                state="normal" if running else "disabled")
-        self._sync_controls()
-
-    # ---- interactions ---------------------------------------------------
-    def _toggle_check(self, action_name: str, var) -> None:
-        it = self.app.action_queue.get(action_name)
-        if it is None or not it.status.can_check:
-            return
-        it.checked = bool(var.get())
-        self._sync_controls()
-
-    def _remove(self, action_name: str) -> None:
-        it = self.app.action_queue.get(action_name)
-        if it is None or not it.status.can_remove:
-            return
-        # (Stage 5 adds the "unsaved review will be discarded" warning.)
-        self.app.action_queue.remove(action_name)
-        self.refresh()
-        self.app._refresh_queue_add_affordance()
-
-    def _toggle_add_mode(self) -> None:
-        # Full button-mode switching arrives in stage 2; stage 1 just flips the
-        # flag + its own label so the control is visibly wired.
-        self.app._queue_add_mode = not getattr(self.app, "_queue_add_mode", False)
-        self._sync_controls()
-        self.app._refresh_queue_add_affordance()
-
-    def _on_start(self) -> None:
-        self.app._queue_start()
-
-    def _on_pause(self) -> None:
-        # One button toggles Pause <-> Continue.
-        if getattr(self.app, "_queue_paused", False):
-            self.app._queue_continue()
-        else:
-            self.app._queue_pause()
-
-    def _on_cancel(self) -> None:
-        self.app._queue_cancel()
-
-    def _on_clear_done(self) -> None:
-        """Remove the completed (✓ DONE) rows from the queue. ERROR rows stay
-        (they may still be retried)."""
-        if getattr(self.app, "_queue_running", False):
-            return
-        gone = self.app.action_queue.remove_done()
-        if gone:
-            self.app._append_log(
-                f"Queue: cleared {len(gone)} completed action(s).")
-        self.refresh()
-        self.app._refresh_queue_add_affordance()
 
 
 class DataPanel:
@@ -19096,14 +17685,21 @@ class App:
         # next safe point (e.g. an action fired by accident). Pinned top-right so
         # it's instantly findable. Stays clickable during a run because
         # _set_busy only disables the scenario/refresh buttons, not this one.
-        self._btn_stop = ctk.CTkButton(
-            topbar, text="■ STOP", width=104, height=32,
-            font=ctk.CTkFont(size=15, weight="bold"),
-            fg_color="#c0392b", hover_color="#a93226", text_color="white",
-            command=self._request_stop,
+        
+        
+        # Inject our new custom isolated Scenario Group Navigation Panel at Row 1 
+        self.navigation_panel = ScenarioNavigationPanel(
+            master=pane,
+            groups=self.groups,
+            scenarios_raw=self._scenario_raw,
+            app_instance=self  # <--- Pass the main app instance here
         )
-        self._btn_stop.grid(row=0, column=2, sticky="e", padx=(10, 0))
 
+        #self.navigation_panel.grid(row=3, column=0, sticky="nsew", padx=8, pady=8)
+     
+        # Make sure row 1 expands vertically to fill the remaining window space
+        pane.grid_rowconfigure(1, weight=1)
+            
         # Find student — searches the in-DOM Caseload table.
         # HIDDEN from view (2026-05-31): the caseload panel's own search
         # box has superseded this. We keep the widgets + wiring intact
@@ -19135,126 +17731,63 @@ class App:
         # "" and fall through to auto-detect or the per-note override.
         self.course_var = ctk.StringVar(value="")
 
-        # Scenario buttons
-        self.button_frame = ctk.CTkFrame(pane)
-        self.button_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
-        self.scenario_buttons: dict[str, ctk.CTkButton] = {}
-        self._rebuild_scenario_buttons()
+        # Scenario buttons - commented out for new UI
+        #self.button_frame = ctk.CTkFrame(pane)
+        #self.button_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
+        #self.scenario_buttons: dict[str, ctk.CTkButton] = {}
+        #self._rebuild_scenario_buttons()
 
-        # Editor toggle row (also hosts the caseload-cache refresh).
+        # === INJECT NEW NAVIGATION PANEL AT ROW 3 ===
+        self.navigation_panel = ScenarioNavigationPanel(
+            master=pane,
+            groups=self.groups,
+            scenarios_raw=self._scenario_raw
+        )
+        self.navigation_panel.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        # Give row 3 a weight of 1 so scrollable list stretches beautifully
+        pane.grid_rowconfigure(3, weight=1)
+        # ============================================
+
+        # ==============================================================================
+        # ROW 4: Advanced Troubleshoot Operations Row
+        # ==============================================================================
         toggle_frame = ctk.CTkFrame(pane, fg_color="transparent")
-        toggle_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 0))
-        self.editor_toggle_btn = ctk.CTkButton(
-            toggle_frame, text="✎ Edit actions", width=140,
-            command=self._toggle_editor, **SECONDARY_BTN_KWARGS,
-        )
-        self.editor_toggle_btn.pack(side="left")
-        self._btn_add_group = ctk.CTkButton(
-            toggle_frame, text="+ Add group", width=110,
-            command=self._add_group, **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_add_group.pack(side="left", padx=(8, 0))
-        self.caseload_toggle_btn = ctk.CTkButton(
-            toggle_frame, text="Hide viewer", width=120,
-            command=self._toggle_caseload, **SECONDARY_BTN_KWARGS,
-        )
-        self.caseload_toggle_btn.pack(side="left", padx=(8, 0))
-        self.caseload_refresh_btn = ctk.CTkButton(
-            toggle_frame, text="↻ Caseload",
-            width=120, command=self._on_caseload_refresh_clicked,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self.caseload_refresh_btn.pack(side="left", padx=(8, 0))
-        # Settings button — opens a small modal for user preferences.
-        # Currently just the advanced-mode toggle; designed to grow.
-        self._btn_settings = ctk.CTkButton(
-            toggle_frame, text="⚙ Settings",
-            width=110, command=self._open_settings,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_settings.pack(side="left", padx=(8, 0))
-        # Recover from a stuck browser (Salesforce or Mongoose hang) without
-        # restarting the whole app — closes + reopens the browser; login is kept.
-        self._btn_restart_browser = ctk.CTkButton(
-            toggle_frame, text="↻ Browser",
-            width=90, command=self._restart_browser,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_restart_browser.pack(side="left", padx=(8, 0))
-        # Auto-export each caseload department's Mongoose contacts segment and
-        # refresh the StudentID -> Contact id map (no manual CSV copying).
-        # The export only feeds the DOM texting fallback; when the API text
-        # path is on it's redundant, so the button is hidden (the export code
-        # stays available as a fallback). Visibility: _update_texting_ids_btn().
-        self._btn_sync_ids = ctk.CTkButton(
-            toggle_frame, text="⬇ Texting IDs",
-            width=120, command=self._sync_contact_ids,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._update_texting_ids_btn()
-        # Open/focus the Mongoose dashboard in the launcher's own browser so the
-        # user can sign in (texting needs an active Mongoose session).
-        self._btn_open_mongoose = ctk.CTkButton(
-            toggle_frame, text="🐭 Mongoose",
-            width=120, command=self._open_mongoose_clicked,
-            **SECONDARY_BTN_KWARGS,
-        )
-        self._btn_open_mongoose.pack(side="left", padx=(8, 0))
-        # Discovery: capture Salesforce's note-submission network
-        # traffic so we can later replay it via REST API instead of
-        # driving the UI. One-click toggle; on stop, writes the
-        # captured requests to a JSON file in the user config dir.
-        # Advanced-only: hidden in basic mode via _apply_advanced_mode.
+        toggle_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 10))
+
         self._capture_active = False
         self.capture_btn = ctk.CTkButton(
-            toggle_frame, text="🔬 Capture",
-            width=100, command=self._on_capture_toggle,
+            toggle_frame, text="🔬 Capture Network Traffic",
+            width=180, command=self._on_capture_toggle,
             **SECONDARY_BTN_KWARGS,
         )
-        self.capture_btn.pack(side="left", padx=(8, 0))
-        # (Busy/refresh indicator now lives in the top bar — see topbar.)
-        # Collapse the rightmost toolbar buttons to emoji-only when the
-        # bar gets too narrow (they're the first to clip).
-        self._toggle_row_frame = toggle_frame
-        self._toggle_row_mode = None
-        toggle_frame.bind(
-            "<Configure>",
-            self._debounce_configure(self._relayout_toggle_row))
+        self.capture_btn.pack(side="left", padx=(0, 8))
 
-        # Activity-log header: collapse toggle + Copy-to-clipboard. The
-        # log box (row 6) can be collapsed to reclaim vertical space.
+
+        # ==============================================================================
+        # ROW 5 & 6: Activity Log System Header & Tab Containers (Untouched)
+        # ==============================================================================
         self._log_pane = pane
         self._log_visible = True
         log_header = ctk.CTkFrame(pane, fg_color="transparent")
         log_header.grid(row=5, column=0, sticky="ew", padx=8, pady=(8, 0))
+
         self._log_collapse_btn = ctk.CTkButton(
             log_header, text="▼ Activity log", width=130, anchor="w",
             command=self._toggle_log, **SECONDARY_BTN_KWARGS,
         )
         self._log_collapse_btn.pack(side="left")
+
         self._log_copy_btn = ctk.CTkButton(
             log_header, text="📋 Copy", width=80, command=self._copy_log,
             **SECONDARY_BTN_KWARGS,
         )
         self._log_copy_btn.pack(side="right")
-        # Pop the Data panel into its own window. Lives here in the header —
-        # which never gets clipped — so it's reachable even when the docked
-        # tab's own controls are squeezed by a short pane.
+
         self._log_data_popout_btn = ctk.CTkButton(
             log_header, text="⧉ Pop out data", width=120,
             command=self._popout_data_panel, **SECONDARY_BTN_KWARGS,
         )
         self._log_data_popout_btn.pack(side="right", padx=(0, 6))
-
-        # Action queue state (see QueuePanel): batch actions the user has
-        # reviewed but not yet run. `_queue_add_mode` gates the stage-2
-        # "click an action to add it" picking mode.
-        self.action_queue = ActionQueue()
-        self._queue_add_mode = False
-        self._queue_pending_review: list[str] = []   # deferred (added while busy)
-        self._queue_running = False
-        self._queue_paused = False
-        self._queue_cancelled = False
 
         # Activity + per-note-type tabs.
         self.log_tabview = ctk.CTkTabview(pane)
@@ -19262,13 +17795,13 @@ class App:
         activity_tab = self.log_tabview.add("Activity")
         activity_tab.grid_columnconfigure(0, weight=1)
         activity_tab.grid_rowconfigure(0, weight=1)
-        # Native tk.Text (not CTkTextbox): the log gets a burst of lines during
-        # a run and repaints lighter/faster than a canvas-backed CTk box.
+
         _log_dark = ctk.get_appearance_mode() == "Dark"
         log_wrap = tk.Frame(activity_tab, bd=0, highlightthickness=0)
         log_wrap.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         log_wrap.grid_rowconfigure(0, weight=1)
         log_wrap.grid_columnconfigure(0, weight=1)
+
         self.log = tk.Text(
             log_wrap, wrap="word", bd=0, highlightthickness=0,
             bg=("#1d1e1e" if _log_dark else "#f9f9fa"),
@@ -19277,50 +17810,66 @@ class App:
             padx=6, pady=4,
         )
         self.log.grid(row=0, column=0, sticky="nsew")
+
         _log_sb = ttk.Scrollbar(log_wrap, command=self.log.yview)
         _log_sb.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=_log_sb.set)
-        # Red highlight for failure lines (see _append_log).
+
         self.log.tag_configure("logerror", foreground="#e0524f")
-        self.log.tag_configure("logok", foreground="#3fb950")  # success green
+        self.log.tag_configure("logok", foreground="#3fb950")
         self.log.configure(state="disabled")
-        register_font_box("activity", self.log)  # Ctrl +/-, Ctrl+wheel
-        # Data tab: analytics/graphs (pop-out capable). See DataPanel.
+        register_font_box("activity", self.log)
+
         self._data_tab = self.log_tabview.add("Data")
         self._data_tab.grid_columnconfigure(0, weight=1)
         self._data_tab.grid_rowconfigure(0, weight=1)
         self.data_panel = DataPanel(self)
         self.data_panel.attach(self._data_tab)
-        # Queue tab: review multiple batch actions up front, then run them in
-        # sequence. See QueuePanel + self.action_queue.
-        self._queue_tab = self.log_tabview.add("Queue")
-        self._queue_tab.grid_columnconfigure(0, weight=1)
-        self._queue_tab.grid_rowconfigure(0, weight=1)
-        self.queue_panel = QueuePanel(self)
-        self.queue_panel.attach(self._queue_tab)
         pane.grid_rowconfigure(6, weight=1)
 
-        # Bottom row. Quit is packed first (side=right) so it always
-        # reserves its slot and stays visible; the other two collapse to
-        # short labels when the row is too narrow.
+
+        # ==============================================================================
+        # ROW 7: Unified System Utilities & Lifecycle Footer Row
+        # ==============================================================================
         bottom = ctk.CTkFrame(pane, fg_color="transparent")
-        bottom.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 8))
-        ctk.CTkButton(
-            bottom, text="Quit", width=80, command=self._on_close,
-        ).pack(side="right")
-        self._btn_hide_taskbar = ctk.CTkButton(
-            bottom, text="Hide to taskbar", width=120, command=self._hide,
+        bottom.grid(row=7, column=0, sticky="ew", padx=8, pady=(4, 8))
+
+        # --- Left Side: Tools & Settings ---
+        self._btn_settings = ctk.CTkButton(
+            bottom, text="⚙ Settings", width=95,
+            command=self._open_settings, **SECONDARY_BTN_KWARGS,
         )
-        self._btn_hide_taskbar.pack(side="left")
+        self._btn_settings.pack(side="left", padx=(0, 6))
+
+        self.caseload_toggle_btn = ctk.CTkButton(
+            bottom, text="👁 Hide Viewer", width=100,
+            command=self._toggle_caseload, **SECONDARY_BTN_KWARGS,
+        )
+        self.caseload_toggle_btn.pack(side="left", padx=6)
+
+        self._btn_open_mongoose = ctk.CTkButton(
+            bottom, text="🐭 Mongoose", width=100,
+            command=self._open_mongoose_clicked, **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_open_mongoose.pack(side="left", padx=6)
+
         self._btn_open_log = ctk.CTkButton(
-            bottom, text="Open log", width=90, command=self._open_log_file,
+            bottom, text="📂 Open Log", width=90, 
+            command=self._open_log_file, **SECONDARY_BTN_KWARGS,
         )
-        self._btn_open_log.pack(side="left", padx=(8, 0))
-        self._bottom_row_frame = bottom
-        self._bottom_row_mode = None
-        bottom.bind(
-            "<Configure>",
-            self._debounce_configure(self._relayout_bottom_row))
+        self._btn_open_log.pack(side="left", padx=6)
+
+        # --- Right Side: App Lifecycle Controls ---
+        ctk.CTkButton(
+            bottom, text="❌ Quit", width=80, 
+            command=self._on_close, fg_color="#8B0000", hover_color="#660000", text_color="white",
+        ).pack(side="right", padx=(6, 0))
+
+        self._btn_hide_taskbar = ctk.CTkButton(
+            bottom, text="🗕 Hide to Taskbar", width=120, command=self._hide,
+            **SECONDARY_BTN_KWARGS,
+        )
+        self._btn_hide_taskbar.pack(side="right", padx=6)
 
     def _on_root_configure(self, event=None) -> None:
         """Detect an active window drag-resize and freeze the heavy panes for
@@ -19450,56 +17999,34 @@ class App:
         name = getattr(sc, "name", "") or ""
         return f"✎ {name}" if getattr(sc, "record_only", False) else name
 
-    def _color_for_scenario(self, name: str) -> Optional[str]:
-        """The group color (hex) for a scenario, or None if it's ungrouped —
-        used to color its Queue row chip and (later) the 'now running' header."""
-        for g in (self.groups or []):
-            if name in (getattr(g, "scenarios", None) or []):
-                return getattr(g, "color", None)
-        return None
-
-    def _refresh_queue_add_affordance(self) -> None:
-        """Reflect queue state on the main action buttons: in add-mode every
-        button gets a highlight border, and already-queued actions are disabled
-        (can't add the same action twice). Outside add-mode the borders clear.
-        Never fights the busy disable — only touches enabled state when idle."""
-        add_mode = getattr(self, "_queue_add_mode", False)
-        for name, btn in getattr(self, "scenario_buttons", {}).items():
-            try:
-                if add_mode:
-                    btn.configure(border_width=2,
-                                  border_color=("#1f6feb", "#4a9eff"))
-                else:
-                    btn.configure(border_width=0)
-                if not self._is_busy:
-                    queued = self.action_queue.has(name)
-                    btn.configure(
-                        state="disabled" if (add_mode and queued) else "normal")
-            except Exception:
-                pass
-
     def _rebuild_scenario_buttons(self) -> None:
-        """Render the scenario button list. Layout depends on whether
-        the user has defined any groups:
+        """Render the scenario button list using a clean Dropdown + Action Grid view.
+        Prevents information overload by only showing the selected group's actions.
+        """
+        # GUARD: If the button frame hasn't been initialized yet (e.g., during login), abort.
+        if not hasattr(self, "button_frame") or self.button_frame is None:
+            return
+            
+        # GUARD: If scenarios or groups aren't initialized yet, abort.
+        if not hasattr(self, "scenarios") or self.scenarios is None:
+            return
 
-        - No groups: flat 2-column grid (legacy behavior).
-        - With groups: Ungrouped section at top (only if non-empty),
-          followed by each group as a collapsible color-coded
-          section. Plus "+ Add group" button at the bottom."""
+        # Clear existing elements and reset tracker
         for w in self.button_frame.winfo_children():
             w.destroy()
         self.scenario_buttons.clear()
+        
+        # Configure layout frame columns
         self.button_frame.grid_columnconfigure(0, weight=1)
         self.button_frame.grid_columnconfigure(1, weight=1)
 
-        # Track collapse state per group across rebuilds.
-        if not hasattr(self, "_group_collapsed"):
-            self._group_collapsed: dict[str, bool] = {}
+        # Track selected group across UI rebuilds
+        if not hasattr(self, "_selected_group_name"):
+            self._selected_group_name: Optional[str] = "All Actions" if not self.groups else self.groups[0].name
 
-        def _scenario_btn(parent, name: str, sc: ScenarioConfig,
-                          color: Optional[str] = None) -> ctk.CTkButton:
-            label = self._action_display_name(sc) + (
-                f"  ({sc.hotkey})" if sc.hotkey else "")
+        # Helper function to generate buttons (Preserved from original logic)
+        def _scenario_btn(parent, name: str, sc: ScenarioConfig, color: Optional[str] = None) -> ctk.CTkButton:
+            label = self._action_display_name(sc) + (f"  ({sc.hotkey})" if sc.hotkey else "")
             kwargs: dict = dict(
                 text=label, command=lambda s=sc: self._fire(s),
                 width=160, height=36,
@@ -19512,95 +18039,69 @@ class App:
             self.scenario_buttons[name] = btn
             return btn
 
-        # No groups → flat grid (original behavior preserved), still
-        # offering "+ Add group" so the first group can be created.
-        if not self.groups:
-            scenario_items = list(self.scenarios.items())
-            for i, (name, sc) in enumerate(scenario_items):
-                btn = _scenario_btn(self.button_frame, name, sc)
-                btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
-            return
+        # Callback function triggered when dropdown value changes
+        def _on_group_changed(choice: str):
+            self._selected_group_name = choice
+            self._rebuild_scenario_buttons()  # Re-render to display the new group's grid
 
-        # With groups → sectioned layout.
-        row = 0
-        grouped_names: set[str] = set()
-        for g in self.groups:
-            grouped_names.update(s for s in g.scenarios if s in self.scenarios)
-        ungrouped = [n for n in self.scenarios if n not in grouped_names]
+        # 1. Build the Group Dropdown Selector
+        group_names = [g.name for g in self.groups] if self.groups else []
+        dropdown_options = ["All Actions"] + group_names if group_names else ["All Actions"]
+        
+        # Guard against selected group disappearing (e.g., if deleted)
+        if self._selected_group_name not in dropdown_options:
+            self._selected_group_name = dropdown_options[0]
 
-        if ungrouped:
-            ctk.CTkLabel(
-                self.button_frame, text="Ungrouped",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=("gray40", "gray70"),
-                anchor="w",
-            ).grid(row=row, column=0, columnspan=2,
-                   sticky="ew", padx=6, pady=(4, 2))
-            row += 1
-            for i, name in enumerate(ungrouped):
-                btn = _scenario_btn(self.button_frame, name, self.scenarios[name])
-                btn.grid(row=row + i // 2, column=i % 2,
-                         padx=6, pady=4, sticky="ew")
-            row += (len(ungrouped) + 1) // 2
+        dropdown_label = ctk.CTkLabel(
+            self.button_frame, text="Select Group:",
+            font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
+        )
+        dropdown_label.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
 
-        for group in self.groups:
-            collapsed = self._group_collapsed.get(group.name, False)
-            # Each group is a box outlined in its own color. The header
-            # mirrors the note-editor dropdown (transparent fill, bold
-            # text, ▼/▶ arrow) so it reads as a section title rather
-            # than another scenario button; member buttons sit indented
-            # inside the box.
-            box = ctk.CTkFrame(
-                self.button_frame, fg_color="transparent",
-                border_width=2, border_color=group.color, corner_radius=8,
+        dropdown = ctk.CTkComboBox(
+            self.button_frame, values=dropdown_options,
+            command=_on_group_changed, height=32
+        )
+        dropdown.set(self._selected_group_name)
+        dropdown.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+
+        # 2. Collect actions to display based on dropdown selection
+        actions_to_render: list[tuple[str, ScenarioConfig, Optional[str]]] = []
+
+        if self._selected_group_name == "All Actions" or not self.groups:
+            # Gather absolutely everything (or fallback legacy flat grid behavior)
+            for name, sc in self.scenarios.items():
+                # Try to grab original group color if it belongs to one
+                color = None
+                for g in self.groups:
+                    if name in g.scenarios:
+                        color = g.color
+                        break
+                actions_to_render.append((name, sc, color))
+        else:
+            # Gather only actions belonging to the active group choice
+            target_group = next((g for g in self.groups if g.name == self._selected_group_name), None)
+            if target_group:
+                valid_names = [s for s in target_group.scenarios if s in self.scenarios]
+                for name in valid_names:
+                    actions_to_render.append((name, self.scenarios[name], target_group.color))
+
+        # 3. Render the dynamic grid of buttons below the dropdown
+        grid_container = ctk.CTkFrame(self.button_frame, fg_color="transparent")
+        grid_container.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
+        grid_container.grid_columnconfigure(0, weight=1)
+        grid_container.grid_columnconfigure(1, weight=1)
+
+        if not actions_to_render:
+            no_actions_lbl = ctk.CTkLabel(
+                grid_container, text="No actions found in this group.",
+                font=ctk.CTkFont(size=12, italic=True), text_color="gray"
             )
-            box.grid(row=row, column=0, columnspan=2,
-                     sticky="ew", padx=4, pady=(8, 2))
-            box.grid_columnconfigure(0, weight=1)
-            box.grid_columnconfigure(1, weight=1)
-            row += 1
-
-            header = ctk.CTkFrame(box, fg_color="transparent")
-            header.grid(row=0, column=0, columnspan=2,
-                        sticky="ew", padx=6, pady=(4, 2))
-            header.grid_columnconfigure(0, weight=1)
-            arrow = "▶" if collapsed else "▼"
-            ctk.CTkButton(
-                header, text=f"{arrow}  {group.name}",
-                anchor="w", height=28,
-                fg_color="transparent",
-                text_color=("gray10", "gray90"),
-                hover_color=("gray85", "gray25"),
-                font=ctk.CTkFont(size=13, weight="bold"),
-                command=lambda gn=group.name: self._toggle_group(gn),
-            ).grid(row=0, column=0, sticky="ew")
-            # '+' adds a new action directly into this group.
-            ctk.CTkButton(
-                header, text="+", width=32, height=28,
-                command=lambda gn=group.name: self._new_scenario_in_group(gn),
-                **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=1, padx=(4, 0))
-            ctk.CTkButton(
-                header, text="⚙", width=32, height=28,
-                command=lambda g=group: self._edit_group(g),
-                **SECONDARY_BTN_KWARGS,
-            ).grid(row=0, column=2, padx=(4, 0))
-            if collapsed:
-                continue
-            valid = [s for s in group.scenarios if s in self.scenarios]
-            for i, name in enumerate(valid):
-                btn = _scenario_btn(
-                    box, name, self.scenarios[name], color=group.color,
-                )
-                # Extra left/right inset so buttons read as indented
-                # children of the group rather than full-width rows.
-                btn.grid(row=1 + i // 2, column=i % 2,
-                         padx=((14, 6) if i % 2 == 0 else (6, 14)),
-                         pady=4, sticky="ew")
-            # Trailing inner pad so the last row doesn't touch the border.
-            ctk.CTkFrame(box, fg_color="transparent", height=4).grid(
-                row=1 + (len(valid) + 1) // 2, column=0, columnspan=2)
-        # ("+ Add group" now lives in the Edit-actions toolbar row.)
+            no_actions_lbl.grid(row=0, column=0, columnspan=2, pady=20)
+        else:
+            for i, (name, sc, color) in enumerate(actions_to_render):
+                btn = _scenario_btn(grid_container, name, sc, color=color)
+                btn.grid(row=i // 2, column=i % 2, padx=6, pady=6, sticky="ew")
 
     def _toggle_group(self, group_name: str) -> None:
         """Flip a group's collapsed flag and re-render the button
@@ -21658,19 +20159,6 @@ class App:
             if vk is not None:
                 self._suppress_vks.add(vk)
 
-        # App-level quick-note hotkey (not tied to a scenario).
-        qn_hk = (getattr(self.settings, "quick_note_hotkey", "") or "").strip()
-        if qn_hk:
-            try:
-                parsed = keyboard.HotKey.parse(to_pynput_hotkey_string(qn_hk))
-                self._hotkeys.append(keyboard.HotKey(
-                    parsed, lambda: self._fire_quick_note_hotkey()))
-                vk = _standalone_fkey_vk(qn_hk)
-                if vk is not None:
-                    self._suppress_vks.add(vk)
-            except Exception as e:
-                self._post_status(f"Skipped quick-note hotkey {qn_hk!r}: {e}")
-
         if not self._hotkeys:
             return
 
@@ -21689,8 +20177,6 @@ class App:
         keys = ", ".join(
             f"{sc.hotkey}->{sc.name}" for sc in self.scenarios.values() if sc.hotkey
         )
-        if qn_hk:
-            keys = (keys + ", " if keys else "") + f"{qn_hk}->quick note"
         suppressed = (
             f"  (claiming {len(self._suppress_vks)} F-keys system-wide)"
             if self._suppress_vks else ""
@@ -21730,13 +20216,6 @@ class App:
 
     def _fire_from_hotkey(self, scenario: ScenarioConfig) -> None:
         self.root.after(0, lambda: self._fire(scenario))
-
-    def _fire_quick_note_hotkey(self) -> None:
-        """Quick-note hotkey → open the quick-note dialog for the selected
-        student in the caseload viewer (marshaled to the UI thread)."""
-        panel = getattr(self, "caseload_panel", None)
-        if panel is not None:
-            self.root.after(0, panel._quick_note)
 
     # ----- Scenario firing -----
 
@@ -22053,150 +20532,6 @@ class App:
 
         self.worker.submit_api_note_test(cid, course, on_done)
 
-    def _open_contact_id(self, contact_id: str, name: str = "") -> None:
-        """Open a specific off-caseload student's Salesforce record by Contact id
-        (from the search picker). Notes then file via the off-caseload path."""
-        if self._is_busy:
-            self._append_log("Busy — finish the current task first.")
-            return
-        if not self.worker.ready_event.is_set():
-            self._append_log("Browser not ready yet — wait and try again.")
-            return
-        self._append_log(f"--- Opening {name or contact_id} (off-caseload) ---")
-
-        def on_done(res):
-            def show():
-                if res and res.get("ok"):
-                    self._append_log(
-                        f"Opened {res.get('name') or name} (off-caseload) — "
-                        "profile loaded; ＋ Note / Ctrl+Shift+N files a note.",
-                        success=True)
-                    panel = getattr(self, "caseload_panel", None)
-                    if panel is not None:
-                        try:
-                            panel.show_offcaseload_quick_view(
-                                contact_id, res.get("name") or name,
-                                res.get("profile") or {})
-                        except Exception:
-                            pass
-                else:
-                    self._append_log(
-                        f"Couldn't open the record: "
-                        f"{(res or {}).get('error', 'unknown error')}", error=True)
-            try:
-                self.root.after(0, show)
-            except Exception:
-                show()
-
-        self.worker.submit_open_contact_id(contact_id, name, on_done)
-
-    def _pick_offcaseload_match(self, query: str, matches: list) -> None:
-        """A name can match several people in Salesforce — show a picker so the
-        user opens the right one (name · Contact id). Opened via _open_contact_id."""
-        dlg = ctk.CTkToplevel(self.root)
-        dlg.title(f"Salesforce matches for {query!r}")
-        dlg.geometry("440x360")
-        try:
-            dlg.transient(self.root)
-            dlg.attributes("-topmost", True)
-            dlg.after(120, lambda: (dlg.lift(), dlg.focus_force()))
-        except Exception:
-            pass
-        ctk.CTkLabel(
-            dlg, text=f"{len(matches)} matches — pick one to open:",
-            font=ctk.CTkFont(size=13, weight="bold")).pack(
-            padx=12, pady=(12, 6), anchor="w")
-        body = ctk.CTkScrollableFrame(dlg)
-        body.pack(fill="both", expand=True, padx=8, pady=4)
-
-        def pick(cid, name):
-            try:
-                dlg.destroy()
-            except Exception:
-                pass
-            self._open_contact_id(cid, name)
-
-        for m in matches:
-            cid = m.get("contact_id", "")
-            name = m.get("name") or "(unknown)"
-            ctk.CTkButton(
-                body, text=f"{name}    ·    {cid}", anchor="w",
-                command=lambda c=cid, n=name: pick(c, n)).pack(fill="x", pady=2)
-        ctk.CTkButton(dlg, text="Cancel", command=dlg.destroy,
-                      **SECONDARY_BTN_KWARGS).pack(pady=(4, 10))
-
-    def _oc_probe_run(self, query: str) -> None:
-        """PROBE (ocprobe:<name/ID>): open an off-caseload student via global
-        search, then dump their record's field label/value pairs + related-list
-        titles to oc_probe.txt — to locate the assigned faculty (ACI), PM, term
-        end, task status, and mobile for the cold-student-triage feature."""
-        query = (query or "").strip()
-        if not query:
-            self._append_log(
-                "ocprobe: give a name or ID, e.g. 'ocprobe: Liberty Frost'.")
-            return
-        if self._is_busy:
-            self._append_log("Busy — finish the current task first.")
-            return
-        if not self.worker.ready_event.is_set():
-            self._append_log("Browser not ready yet — wait and try again.")
-            return
-        self._append_log(
-            f"ocprobe: opening {query!r} and dumping record fields…")
-
-        def on_done(res):
-            def show():
-                import os
-                if res and res.get("ok"):
-                    snips = res.get("snippets") or []
-                    tables = res.get("tables") or []
-                    tbl_lines = []
-                    for i, t in enumerate(tables):
-                        tbl_lines.append(f"--- table {i + 1}  [{t.get('headers','')}]")
-                        tbl_lines += (t.get("rows") or [])
-                    lines = [
-                        f"OC PROBE — {res.get('name')}  ({res.get('contact_id')})",
-                        f"url: {res.get('url')}",
-                        f"clicked tab: {res.get('clicked_tab')}",
-                        f"revealed panel: {res.get('revealed')}",
-                        f"related-list nav: {res.get('nav_related')}",
-                        "", "=== TABLES (headers + rows; [✓] = check icon) ===",
-                        *tbl_lines,
-                        "", "=== RELATED-LIST TITLES ===",
-                        *(res.get("related") or []),
-                        "", "=== VISIBLE TEXT (DOM order — label then value) ===",
-                        *snips,
-                    ]
-                    tab = res.get("clicked_tab") or ""
-                    slug = re.sub(r"[^a-z0-9]+", "-", tab.lower()).strip("-")
-                    fname = f"oc_probe__{slug}.txt" if slug else "oc_probe.txt"
-                    path = os.path.join(os.getcwd(), fname)
-                    try:
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write("\n".join(lines))
-                        self._append_log(
-                            f"ocprobe: dumped {len(tables)} table(s) + "
-                            f"{len(snips)} text snippet(s) "
-                            f"(clicked: {res.get('clicked_tab')}) → {path}",
-                            success=True)
-                    except Exception as e:
-                        self._append_log(f"ocprobe: write failed: {e}", error=True)
-                elif res and res.get("matches"):
-                    ms = res["matches"]
-                    self._append_log(
-                        "ocprobe: multiple matches — retry with a unique ID. ("
-                        + ", ".join(m.get("name") or "?" for m in ms[:6]) + ")")
-                else:
-                    self._append_log(
-                        f"ocprobe: {(res or {}).get('error', 'no match')}",
-                        error=True)
-            try:
-                self.root.after(0, show)
-            except Exception:
-                show()
-
-        self.worker.submit_oc_probe(query, on_done)
-
     def _open_student_global(self, query: str) -> None:
         """Find a student ANYWHERE in Salesforce (global search) by Student ID
         / email / name and open their Contact record — for students in our
@@ -22223,13 +20558,10 @@ class App:
                         "fire a Find-first-off note action to file a note.")
                 elif res and res.get("matches"):
                     ms = res["matches"]
-                    # Show the matches IN the caseload viewer (an "Off-caseload"
-                    # view), not a popup — mirrors normal student searching.
-                    panel = getattr(self, "caseload_panel", None)
-                    if panel is not None:
-                        panel._enter_offcaseload_mode(ms, query)
-                    else:
-                        self._pick_offcaseload_match(query, ms)
+                    names = ", ".join(m.get("name") or "?" for m in ms[:6])
+                    self._append_log(
+                        f"{len(ms)} matches for {query!r} — refine with the "
+                        f"Student ID or email. ({names})")
                 else:
                     self._append_log(
                         f"No Salesforce match for {query!r}: "
@@ -22279,19 +20611,11 @@ class App:
         )
 
     def _fire(self, scenario: ScenarioConfig) -> None:
-        # "Add to queue" mode: clicking an action ADDS it (review now, run
-        # later) instead of firing it.
-        if getattr(self, "_queue_add_mode", False):
-            self._queue_add_action(scenario)
-            return
         if self._is_busy:
-            # Don't just refuse — offer to queue it for after the current run
-            # (the review happens once the browser frees up).
-            if ask_yes_no_topmost(
-                    self.root, "Add to queue?",
-                    f"A task is running.\n\nAdd {scenario.name!r} to the queue "
-                    "and review it after the current run finishes?"):
-                self._queue_defer_add(scenario.name)
+            self._append_log(
+                f"Busy — wait for the current task to finish before "
+                f"firing {scenario.name!r}."
+            )
             return
         if getattr(self, "_task_scrape_running", False):
             self._append_log(
@@ -22345,291 +20669,6 @@ class App:
             self._fire_per_student(scenario, override)
         finally:
             self._set_idle()
-
-    # ==================================================================
-    # Action queue — add flow (review at add time; run in a later stage).
-    # ==================================================================
-
-    def _queue_add_action(self, scenario: ScenarioConfig) -> None:
-        """Review a BATCH action now and add it to the queue (to run later).
-        Pops an explanatory dialog for actions that can't be queued (single-
-        student, and — for now — branched or text-only). Nothing is sent here;
-        the reviewed payload is stored on the queue item and committed when the
-        queue is run."""
-        from tkinter import messagebox
-        name = scenario.name
-        # Eligibility: standard batch actions only.
-        if scenario.batch is None:
-            messagebox.showinfo(
-                "Can't queue this action",
-                f"{name!r} runs on a single student, so it doesn't fit the "
-                "queue.\n\nThe queue is for batch actions that fire across the "
-                "caseload. Fire single-student actions directly.")
-            return
-        if getattr(scenario, "branches", None):
-            messagebox.showinfo(
-                "Can't queue this action yet",
-                f"{name!r} is a branched action. Queueing branched actions "
-                "isn't supported yet — fire it directly for now.")
-            return
-        if self._is_text_only(scenario):
-            messagebox.showinfo(
-                "Can't queue this action yet",
-                f"{name!r} is text-only. Queueing text-only actions isn't "
-                "supported yet — fire it directly for now.")
-            return
-        if self.action_queue.has(name):
-            messagebox.showinfo(
-                "Already queued",
-                f"{name!r} is already in the queue. An action can only be "
-                "queued once.")
-            return
-        if not self.worker.ready_event.is_set():
-            self._append_log("Can't queue — browser not ready yet.")
-            return
-        # Same front guards as a direct fire.
-        if not self._confirm_no_placeholder_email(scenario):
-            self._append_log(
-                f"{name!r}: not queued — sample placeholder email not replaced.")
-            return
-        if not self._mongoose_fresh_gate(scenario):
-            return
-        override = self.course_var.get().strip()
-        self._append_log(f"--- Reviewing {name!r} to add to the queue ---")
-        self._set_busy(f"Queue: reviewing {name}…")
-        try:
-            payload = self._collect_batch_review(scenario, override)
-        finally:
-            self._set_idle()
-        if payload is None:
-            self._append_log(f"{name!r}: not added to queue (review cancelled).")
-            return
-        self.action_queue.add(QueueItem(
-            action_name=name,
-            display_name=self._action_display_name(scenario),
-            color=self._color_for_scenario(name),
-            payload=payload,
-        ))
-        n = len(payload.get("confirmed") or [])
-        self._append_log(
-            f"✓ Queued {name!r} — {n} student(s) reviewed.", success=True)
-        try:
-            self.queue_panel.refresh()
-            self.log_tabview.set("Queue")
-        except Exception:
-            pass
-        self._refresh_queue_add_affordance()
-
-    def _queue_defer_add(self, name: str) -> None:
-        """Remember an action to review + queue once the current run finishes
-        (the 'already running → add to queue?' path — the browser is busy now,
-        so the review waits until it's free; see _drain_pending_review)."""
-        if self.action_queue.has(name) or name in self._queue_pending_review:
-            self._append_log(f"{name!r} is already queued or pending review.")
-            return
-        self._queue_pending_review.append(name)
-        self._append_log(
-            f"{name!r}: will be reviewed + queued after the current run.")
-
-    def _drain_pending_review(self) -> None:
-        """Review + queue actions deferred while busy, one at a time as the
-        browser frees up. Guarded so it never runs mid-task."""
-        if self._is_busy or not self._queue_pending_review:
-            return
-        name = self._queue_pending_review.pop(0)
-        sc = (self.scenarios or {}).get(name)
-        if sc is not None:
-            self._queue_add_action(sc)
-        if self._queue_pending_review and not self._is_busy:
-            self.root.after(300, self._drain_pending_review)
-
-    # ==================================================================
-    # Action queue — run coordinator (a resumable step machine so pause /
-    # continue / cancel — stage 4 — can interleave a manual fire).
-    # ==================================================================
-
-    def _queue_run_set(self) -> list:
-        """Checked, runnable items in queue order — the actions a run will
-        commit. Runnable = PENDING or ERROR, so pressing Start after a partial
-        failure RETRIES the failed rows (DONE rows are skipped)."""
-        return [it for it in self.action_queue.items
-                if it.checked and it.status.is_runnable]
-
-    def _queue_start(self) -> None:
-        """Begin running the checked queue items in sequence. Each item's stored
-        payload is committed (its texts/emails/notes actually go out) via
-        _commit_batch; the row is marked done/error from the verdict."""
-        if self._is_busy:
-            self._append_log("Queue: can't start — a task is running.")
-            return
-        if getattr(self, "_queue_running", False):
-            return
-        runnable = self._queue_run_set()
-        if not runnable:
-            self._append_log("Queue: nothing checked to run.")
-            return
-        # Re-send guard: Starting with checked ERROR rows RETRIES them, which
-        # re-sends emails/texts + re-files notes for ALL of that action's
-        # students (there's no per-student resume). Make it a deliberate choice.
-        retries = [it for it in runnable if it.status == QueueStatus.ERROR]
-        if retries:
-            names = ", ".join(repr(it.action_name) for it in retries[:6])
-            if not ask_yes_no_topmost(
-                    self.root, "Retry failed action(s)?",
-                    f"{len(retries)} action(s) will be RE-RUN: {names}.\n\n"
-                    "Retrying re-sends the emails/texts and re-files the notes "
-                    "for ALL of each action's students — including any that "
-                    "already succeeded (there's no per-student resume yet). "
-                    "Continue?",
-                    yes_label="Retry (re-send)", no_label="Cancel"):
-                self._append_log("Queue: retry cancelled.")
-                return
-        # A fresh Start = retry: reset checked ERROR rows to PENDING so each
-        # runs exactly ONCE this pass. (Without this the step machine, which
-        # advances over runnable items, would re-pick an item the instant it
-        # finished ERROR — an infinite re-send loop.)
-        for it in runnable:
-            if it.status == QueueStatus.ERROR:
-                it.status = QueueStatus.PENDING
-                it.error_detail = ""
-        self._queue_running = True
-        self._queue_paused = False
-        self._queue_cancelled = False
-        self._append_log(f"--- Running queue: {len(runnable)} action(s) ---")
-        self._set_busy("Queue: running…")
-        self.queue_panel.on_run_state_changed()
-        self.root.after(50, self._queue_step)
-
-    def _queue_step(self) -> None:
-        """Advance the run: pick the next checked-PENDING item, mark it RUNNING,
-        then commit it (deferred one tick so the RUNNING row paints first).
-        Checks the cancel/pause flags at each boundary — an in-flight item is
-        never interrupted (pause/cancel take effect before the NEXT item)."""
-        if self._queue_cancelled:
-            self._queue_finish(cancelled=True)
-            return
-        if self._queue_paused:
-            self._queue_enter_paused()
-            return
-        # Only PENDING items run this pass — an item that finishes DONE or ERROR
-        # is terminal for the run and never re-picked (ERROR retries only on a
-        # fresh Start, which resets it to PENDING). This is what stops the
-        # errored-action re-send loop.
-        nxt = next((it for it in self.action_queue.items
-                    if it.checked and it.status == QueueStatus.PENDING), None)
-        if nxt is None:
-            self._queue_finish()
-            return
-        nxt.status = QueueStatus.RUNNING
-        self.queue_panel.refresh()
-        self.root.after(20, lambda it=nxt: self._queue_run_item(it))
-
-    def _queue_run_item(self, it) -> None:
-        """Commit one queue item (blocking) and mark its row from the verdict."""
-        self._append_log(f"--- Queue: running {it.action_name!r} ---")
-        service_down = None
-        try:
-            result = self._commit_batch(it.payload)
-            it.results = result
-            if result and result.get("ok"):
-                it.status = QueueStatus.DONE
-            else:
-                it.status = QueueStatus.ERROR
-                it.error_detail = ((result or {}).get("detail")
-                                   or "completed with errors")
-                service_down = (result or {}).get("service_down")
-        except Exception as e:
-            it.status = QueueStatus.ERROR
-            it.error_detail = str(e)
-            self._append_log(
-                f"Queue: {it.action_name!r} errored — {e}", error=True)
-        self.queue_panel.refresh()
-        # A systemic service failure (Mongoose not logged in, Outlook not
-        # available): don't plow through and fail the rest — PAUSE so the user
-        # can fix it and press Continue to retry the failed action. The action
-        # is pre-flighted before any send, so retry can't double-send. (A
-        # per-student "not textable / no email" is NOT this — handled inline.)
-        if service_down and not self._queue_cancelled:
-            self._queue_paused = True
-            fix = ("sign in (🐭 Mongoose)" if service_down == "Mongoose"
-                   else "open / sign in to Outlook")
-            self._append_log(
-                f"Queue paused — {service_down} isn't ready. {fix.capitalize()}, "
-                "then press ▶ Continue to retry the failed action.", error=True)
-        self.root.after(50, self._queue_step)
-
-    def _queue_finish(self, cancelled: bool = False) -> None:
-        """End the run: drop busy, restore the control bar, log a summary.
-        Checked PENDING items that never ran stay PENDING (re-runnable)."""
-        self._queue_running = False
-        self._queue_paused = False
-        if cancelled:
-            self._append_log("Queue: cancelled — remaining actions not run.",
-                             error=True)
-        else:
-            done = sum(1 for it in self.action_queue.items
-                       if it.status == QueueStatus.DONE)
-            err = sum(1 for it in self.action_queue.items
-                      if it.status == QueueStatus.ERROR)
-            self._append_log(
-                f"Queue finished: {done} done"
-                + (f", {err} with errors" if err else "") + ".",
-                success=(err == 0), error=(err > 0))
-        self._set_idle()
-        self.queue_panel.refresh()
-        self.queue_panel.on_run_state_changed()
-
-    def _queue_pause(self) -> None:
-        """Request a pause. The in-flight action always finishes; stepping stops
-        at the NEXT boundary, where _queue_enter_paused releases the busy state
-        so the user can fire a single action before continuing."""
-        if not self._queue_running or self._queue_paused:
-            return
-        self._queue_paused = True
-        self._append_log(
-            "Queue: pausing — will stop after the current action finishes.")
-        self.queue_panel.on_run_state_changed()
-
-    def _queue_enter_paused(self) -> None:
-        """Settle into the paused state (reached at an item boundary): drop the
-        busy lock so a manual single action can run, and update the controls."""
-        self._set_idle()
-        self._append_log(
-            "Queue paused. Fire a single action if you need to, then Continue.")
-        self.queue_panel.on_run_state_changed()
-        self.queue_panel.refresh()
-
-    def _queue_continue(self) -> None:
-        """Resume a paused run. Guarded so it can't start while a manual action
-        the user fired during the pause is still running."""
-        if not self._queue_running or not self._queue_paused:
-            return
-        if self._is_busy:
-            self._append_log(
-                "Queue: finish the current action before continuing.")
-            return
-        self._queue_paused = False
-        self._append_log("Queue: continuing.")
-        self._set_busy("Queue: running…")
-        self.queue_panel.on_run_state_changed()
-        self.root.after(50, self._queue_step)
-
-    def _queue_cancel(self) -> None:
-        """Cancel the run. If paused (not stepping) finish immediately; if
-        running, flag it and the next item boundary finishes. Either way the
-        in-flight action completes and un-run checked items stay PENDING."""
-        if not self._queue_running:
-            return
-        self._queue_cancelled = True
-        if self._queue_paused and not self._is_busy:
-            # Truly at rest (paused between items, nothing stepping) — finish now.
-            self._queue_finish(cancelled=True)
-        else:
-            # Running, or an in-flight item still finishing (a "Pausing…"
-            # click): the next _queue_step boundary sees the flag and finishes.
-            self._append_log(
-                "Queue: cancelling — will stop after the current action.")
-            self.queue_panel.on_run_state_changed()
 
     def _collect_prompt_vars(
         self, scenario: ScenarioConfig,
@@ -22881,14 +20920,6 @@ class App:
                     course_hint = _ctx["course_code"]
             except Exception:
                 pass
-            if not course_hint:
-                # Off-caseload student: no caseload row and no single course
-                # field on the Contact page — prefill from the active ACI course
-                # captured in the scraped off-caseload profile (_qv_row).
-                panel = getattr(self, "caseload_panel", None)
-                qv = getattr(panel, "_qv_row", None) or {}
-                if qv.get("_offcaseload"):
-                    course_hint = str(qv.get("CourseCode") or "").strip()
         for pos, i in enumerate(edit_idxs):
             n = scenario.notes[i]
             label = f"Note {i + 1}"
@@ -22961,14 +20992,9 @@ class App:
         # before we read context for the email or file the note.
         if deferred_nav is not None:
             q, sid = deferred_nav
-            # A single-fire EMAIL still scrapes student/PM context from the open
-            # record, which a deep-linked standalone layout doesn't have — so
-            # only NON-email single fires deep-link. (Batch emails read context
-            # from the caseload row, so they deep-link fine.)
             if not self._navigate_for_fire_blocking(
                     q, student_id=sid,
-                    allow_deeplink=(self._deeplink_ok(scenario)
-                                    and scenario.email is None)):
+                    allow_deeplink=self._deeplink_ok(scenario)):
                 self._append_log(
                     f"Could not open {prenav_label or prenav_query!r}; "
                     "scenario not fired.")
@@ -22979,16 +21005,7 @@ class App:
         # dropdown when opted in), then auto-sent. Rendered from the
         # scraped student context since there's no CSV row here.
         if scenario.email is not None:
-            # Off-caseload student open on the record → build the email context
-            # from the scraped profile (lookup_caseload_student finds no row, so
-            # student_email/PM/course would come back blank otherwise). Prefer it
-            # whenever an off-caseload student is open, independent of how the
-            # action was fired (main-window vs. a selected-row fire that carries
-            # a prenav_query) — the CC/ACI logic keys off it.
-            student_ctx = self._offcaseload_open_context()
-            if student_ctx is None:
-                student_ctx = self._get_student_context_blocking(
-                    name_hint=chosen_name)
+            student_ctx = self._get_student_context_blocking(name_hint=chosen_name)
             if student_ctx is None:
                 self._append_log(
                     "Couldn't read student context for email; action not fired."
@@ -22999,45 +21016,19 @@ class App:
             who = (chosen_name or student_ctx.get("full_name", "")
                    or "this student")
 
-            # Off-caseload: loop in the ACI + PM by CC (on by default, settable).
-            # The PM email is scraped; the ACI email comes from the local
-            # directory — resolve it, prompting once (pre-filled with the best
-            # guess) for a new ACI. Both appear in the review before it sends.
-            if student_ctx.get("_offcaseload"):
-                cc_on = getattr(self.settings, "cc_aci_offcaseload", True)
-                aci_name = student_ctx.get("aci_name", "")
-                self._append_log(
-                    f"  ↳ Off-caseload email for {who}: ACI = "
-                    f"{aci_name or '(none detected)'}"
-                    f"{'' if cc_on else '  [ACI/PM CC is off in Settings]'}.")
-                if cc_on and aci_name:
-                    aci_email = self._resolve_aci_email(aci_name)
-                    if not aci_email:
-                        aci_email = self._prompt_aci_email(aci_name)
-                    student_ctx["aci_email"] = aci_email
-            extra_cc = self._offcaseload_cc(student_ctx)
-            if student_ctx.get("_offcaseload"):
-                self._append_log(
-                    f"  ↳ ACI CC added: {extra_cc or '(none)'}  "
-                    "(PM CC follows the action's ‘CC Program Mentor’).")
-
             def _render(scn: ScenarioConfig) -> list[dict]:
                 return [self._build_email_preview_data(
-                    scn, {}, prompt_vars, user_info, ctx_override=student_ctx,
-                    extra_cc=extra_cc)]
+                    scn, {}, prompt_vars, user_info, ctx_override=student_ctx)]
 
-            scenario, selected, edits, cc_edits, bcc_edits = \
-                self._run_email_review(scenario, _render, who)
+            scenario, selected, edits = self._run_email_review(
+                scenario, _render, who)
             if not selected:
                 self._append_log("Email review cancelled; note not filed.")
                 return
             ctx_send = {**student_ctx, **prompt_vars}
-            # The reviewer's CC (index 0) is authoritative — pass it as the
-            # override so any ACI/PM the user removed there is honored.
             if not self._send_scenario_email(
                 scenario.email, ctx_send, auto_send=True,
-                body_html_override=edits.get(0), extra_cc=extra_cc,
-                cc_override=cc_edits.get(0), bcc=bcc_edits.get(0, ""),
+                body_html_override=edits.get(0),
             ):
                 self._append_log("Email send failed; note not filed.")
                 return
@@ -23051,8 +21042,7 @@ class App:
             if nav_query:
                 self._navigate_for_fire_blocking(
                     nav_query, student_id=prenav_student_id,
-                    allow_deeplink=(self._deeplink_ok(scenario)
-                                    and scenario.email is None))
+                    allow_deeplink=self._deeplink_ok(scenario))
 
         # Apply the fire-time course / academic-activity edits onto a copy
         # of the scenario (run_scenario reads note.course_code_override and
@@ -23433,32 +21423,6 @@ class App:
                 seen.append(c)
         return seen
 
-    def _update_texting_ids_btn(self) -> None:
-        """Show the manual '⬇ Texting IDs' export button only when the API text
-        path is OFF. The Mongoose segment export it triggers feeds the DOM
-        texting fallback; with API texting on it's redundant, so hide it (the
-        _sync_contact_ids / export code stays reachable as a fallback). Called
-        at build time and whenever the API-text setting changes."""
-        btn = getattr(self, "_btn_sync_ids", None)
-        if btn is None:
-            return
-        if getattr(self.settings, "text_send_via_api", False):
-            try:
-                btn.pack_forget()
-            except Exception:
-                pass
-            return
-        try:
-            if btn.winfo_ismapped():
-                return
-            mongoose = getattr(self, "_btn_open_mongoose", None)
-            if mongoose is not None and mongoose.winfo_ismapped():
-                btn.pack(side="left", padx=(8, 0), before=mongoose)
-            else:
-                btn.pack(side="left", padx=(8, 0))
-        except Exception:
-            pass
-
     def _sync_contact_ids(self) -> None:
         """Auto-export each caseload department's Mongoose contacts segment, then
         refresh the Contact-id map — no manual CSV copying. Drives Mongoose on
@@ -23638,20 +21602,16 @@ class App:
         return (scenario.text is not None and not scenario.notes
                 and scenario.email is None)
 
-    def _deeplink_ok(self, scenario) -> bool:
-        """Whether a fire may DEEP-LINK to the Contact record (fast, ~2.6s)
-        instead of the slower Caseload Fast-find. The deep link opens the
-        STANDARD record layout. Two things historically forced email / gated-note
-        actions onto Fast-find: (1) the email step scraped student/PM context
-        from the on-page Caseload table, and (2) a gated note's Academic-Activity
-        checkboxes aren't the form elements our selectors match. BOTH are moot on
-        the default path now — the email context comes from the caseload grid
-        (StudentEmail + MentorEmail) and notes file via the saveNoteCmpValues API
-        (no form; activities go in the payload). So with API note saving ON,
-        every action can deep-link. With it OFF, keep the old constraints
-        (form-based filing still needs the console layout + on-page scrape)."""
-        if getattr(self.settings, "note_save_via_api", True):
-            return True
+    @staticmethod
+    def _deeplink_ok(scenario) -> bool:
+        """Whether a note fire may DEEP-LINK to the Contact record instead of
+        the Caseload search. The deep link opens the STANDARD record layout,
+        which differs from the Caseload console note panel in two ways that
+        break it: (1) an email step scrapes student/PM context from the on-page
+        Caseload table (absent there), and (2) its Academic Activity checkboxes
+        aren't the `label[for]` elements our selectors match — so a gated note
+        ("Email from Student" etc., which needs an activity) can't be completed.
+        Such fires use the proven console/search path; plain notes deep-link."""
         if scenario.email is not None:
             return False
         for n in (scenario.notes or []):
@@ -23937,71 +21897,36 @@ class App:
         skip — so a combined fire can collect all user input before sending."""
         from src import text_message as tm
         tcfg = scenario.text
-        # Off-caseload student open on the record: no caseload row, but we
-        # scraped their profile. We CAN text them when their active ACI course
-        # is one we support in Mongoose — the API send switches to that course's
-        # department/inbox and returns a clear "no inbox matching course" error
-        # otherwise (self-gating). Mongoose finds the recipient by SF Contact id
-        # (campusStudentId), so the segment mapping isn't needed. Opt-out is
-        # gated authoritatively at send time by Mongoose, so we don't do the
-        # local segment-export opt-in check for these.
-        octx = self._offcaseload_open_context() if not chosen_name else None
-        is_offcaseload = octx is not None
         # Resolve the student WITHOUT needing the Salesforce record open: prefer
         # the cached caseload CSV row (by name) — texting only needs the mobile,
         # timezone, and course, all of which the CSV has. Fall back to scraping
         # the active page only if the name isn't in the cache.
-        if is_offcaseload:
-            course = (octx.get("course_code") or "").strip()
-            if not course:
-                self._append_log(
-                    "Text: no active course for this off-caseload student — "
-                    "can't choose a Mongoose inbox; not sent.", error=True)
-                return False
-            variables = {
-                "first_name": _capitalize_name(octx.get("first_name", "")),
-                "last_name": _capitalize_name(octx.get("last_name", "")),
-                "full_name": _capitalize_name(octx.get("full_name", "")),
-                "preferred_name": _capitalize_name(
-                    octx.get("preferred_name", "") or octx.get("first_name", "")),
-                "student_email": octx.get("student_email", ""),
-                "student_id": (octx.get("student_id") or "").strip(),
-                "course_code": course,
-                "pm_name": _capitalize_name(octx.get("pm_name", "")),
-                "pm_email": octx.get("pm_email", ""),
-            }
-            # Synthetic row — only Timezone + MobilePhone are read downstream
-            # (schedule slot + the recipient display line).
-            row = {"Timezone": octx.get("timezone", ""),
-                   "MobilePhone": octx.get("mobile", "")}
+        row = self._caseload_row_by_name(chosen_name) if chosen_name else None
+        if row is not None:
+            variables = self._text_vars_from_row(row)
         else:
-            row = self._caseload_row_by_name(chosen_name) if chosen_name else None
-            if row is not None:
-                variables = self._text_vars_from_row(row)
-            else:
-                ctx = self._get_student_context_blocking(name_hint=chosen_name)
-                if not ctx:
-                    self._append_log(
-                        "Text: couldn't read student context; not sent.",
-                        error=True)
-                    return False
-                row = self._caseload_row_by_id(ctx.get("student_id", ""))
-                variables = {
-                    "first_name": ctx.get("first_name", ""),
-                    "last_name": ctx.get("last_name", ""),
-                    "full_name": ctx.get("full_name", ""),
-                    "preferred_name": ctx.get("preferred_name", ""),
-                    "student_email": ctx.get("student_email", ""),
-                    "student_id": (ctx.get("student_id") or "").strip(),
-                    "course_code": ctx.get("course_code", ""),
-                    "pm_name": ctx.get("pm_name", ""),
-                    "pm_email": ctx.get("pm_email", ""),
-                }
+            ctx = self._get_student_context_blocking(name_hint=chosen_name)
+            if not ctx:
+                self._append_log("Text: couldn't read student context; not sent.",
+                                 error=True)
+                return False
+            row = self._caseload_row_by_id(ctx.get("student_id", ""))
+            variables = {
+                "first_name": ctx.get("first_name", ""),
+                "last_name": ctx.get("last_name", ""),
+                "full_name": ctx.get("full_name", ""),
+                "preferred_name": ctx.get("preferred_name", ""),
+                "student_email": ctx.get("student_email", ""),
+                "student_id": (ctx.get("student_id") or "").strip(),
+                "course_code": ctx.get("course_code", ""),
+                "pm_name": ctx.get("pm_name", ""),
+                "pm_email": ctx.get("pm_email", ""),
+            }
         if prompt_vars:
             variables.update(prompt_vars)
         who = (variables.get("full_name") or variables.get("student_id")
                or "this student")
-        if row is not None and not is_offcaseload:
+        if row is not None:
             optin = self._texting_optin_status(row)
             if not optin:
                 self._append_log(
@@ -24016,12 +21941,7 @@ class App:
         mobile = tm.normalize_phone(mobile_raw)
         # Prefer the Salesforce Contact id (unique, works when the mobile is
         # blank); fall back to the mobile. The term is what Mongoose searches.
-        # Off-caseload students aren't in the segment map, but we scraped their
-        # Contact id directly — use it (Mongoose matches it as campusStudentId).
-        if is_offcaseload:
-            term = (octx.get("contact_id") or "").strip() or mobile
-        else:
-            term = self._text_term_for(variables.get("student_id", ""), mobile_raw)
+        term = self._text_term_for(variables.get("student_id", ""), mobile_raw)
         if not term:
             self._append_log(
                 f"Text: no Mobile Phone and no Contact id for {who} "
@@ -24117,40 +22037,30 @@ class App:
         return self._send_text_payload(payload)
 
     def _fire_batch(self, scenario: ScenarioConfig, override: str) -> None:
-        """Drive a batch scenario end-to-end (immediate fire): collect the
-        review, then commit it. Split into _collect_batch_review (all pre-flight
-        + user review/input, no sending) and _commit_batch (text send +
-        per-student email→note loop) so the Action Queue can collect at ADD time
-        and commit at RUN time. The activity log is the progress display."""
-        # Text-only batch: no Salesforce notes/navigation — its own driver.
+        """Drive a batch scenario end-to-end: load caseload, filter,
+        review/confirm, then loop email→note per selected student.
+        The activity log is the progress display; cancellation is via
+        any modal Cancel button (which aborts the batch from that
+        point on)."""
+        from tkinter import messagebox
+
+        # Text-only batch: no Salesforce notes/navigation — render each
+        # student's text, review them all, then send/schedule each. Its own
+        # driver (the note/email path below doesn't apply).
         if self._is_text_only(scenario):
             self._fire_batch_text(scenario)
             return
-        payload = self._collect_batch_review(scenario, override)
-        if payload is None:
-            return  # aborted / cancelled during review (already logged)
-        self._commit_batch(payload)
-
-    def _collect_batch_review(self, scenario: ScenarioConfig, override: str):
-        """COLLECT half of a standard (non-text-only, non-branched) batch: run
-        every pre-flight and ALL user review/input — filters, prompts, email
-        review, note inputs, and text REVIEW — and return a payload dict for
-        _commit_batch to run later, WITHOUT sending anything. Returns None if the
-        action was aborted or cancelled at any step (already logged). The Action
-        Queue stores this payload at add time; the immediate-fire path commits
-        it right away."""
-        from tkinter import messagebox
 
         # A combined action will send texts — confirm Mongoose is signed in
         # BEFORE the (expensive) email review, so a lapsed session doesn't
         # waste the review or half-run the action (texts→emails→notes).
         if scenario.text is not None and not self._ensure_mongoose_logged_in():
-            return None
+            return
         # …and confirm Salesforce is signed in BEFORE any texts/emails go out,
         # so an SSO logout aborts the whole batch up front instead of failing
         # at note-filing time with the sends already done.
         if scenario.notes and not self._ensure_salesforce_logged_in():
-            return None
+            return
 
         # Pre-flight: if any note has Submit unchecked, confirm before
         # we touch the caseload. Different message than single-fire
@@ -24160,7 +22070,7 @@ class App:
             self._append_log(
                 f"Batch {scenario.name!r}: aborted at submit-unchecked warning."
             )
-            return None
+            return
 
         # Pre-flight: CSV missing the student-email column. Warn ONCE
         # per session (skip latch is honored on subsequent fires) so
@@ -24172,7 +22082,7 @@ class App:
                 f"Batch {scenario.name!r}: aborted at "
                 "CSV-no-email warning."
             )
-            return None
+            return
 
         self._warn_if_caseload_stale("this batch")
 
@@ -24196,7 +22106,7 @@ class App:
             rows = self._read_all_caseload_rows_blocking()
             if not rows:
                 self._append_log("Batch aborted: couldn't load caseload rows.")
-                return None
+                return
 
         # Step 2: apply filters. Translate any display-name columns
         # (e.g. 'Last Assigned CI Contact') to the CSV / DOM column
@@ -24235,7 +22145,7 @@ class App:
                 "columns in the editor) to refresh the cache. Then "
                 "try again.",
             )
-            return None
+            return
 
         # Route any "Task N" filter to its date/count/status facet by op (the
         # original `filters` keep the visible "Task N" column for the safety
@@ -24248,7 +22158,7 @@ class App:
                 f"No students match the filters for {scenario.name!r}.",
             )
             self._append_log("Batch: no matches; nothing to do.")
-            return None
+            return
         self._append_log(f"Filters matched {len(matched)} students.")
 
         # Step 3: pick the display columns for the review dialog —
@@ -24266,7 +22176,7 @@ class App:
         # they must be collected before review).
         prompt_vars = self._collect_prompt_vars(scenario)
         if prompt_vars is None:
-            return None  # user cancelled a prompt
+            return  # user cancelled a prompt
 
         # Step 5: review-and-confirm — combined per-student email
         # preview when the scenario has an email step (FERPA-quality
@@ -24274,29 +22184,27 @@ class App:
         # review otherwise.
         has_email = scenario.email is not None
         body_overrides: dict = {}
-        addr_overrides: dict = {}
         if has_email:
             filter_summary = ", ".join(
                 f"{f.get('column')} {f.get('op')} {f.get('value')!r}".strip()
                 for f in scenario.batch.filters
                 if f.get("column")
             )
-            scenario, confirmed, body_overrides, addr_overrides = \
-                self._review_emails(
-                    scenario, matched, prompt_vars, filter_summary,
-                )
+            scenario, confirmed, body_overrides = self._review_emails(
+                scenario, matched, prompt_vars, filter_summary,
+            )
             if confirmed is None:
-                return None  # cancelled / nothing selected (already logged)
+                return  # cancelled / nothing selected (already logged)
         elif scenario.batch.preview:
             confirmed = prompt_batch_review(
                 self.root, scenario.name, matched, display_columns,
             )
             if confirmed is None:
                 self._append_log("Batch cancelled.")
-                return None
+                return
             if not confirmed and scenario.text is None:
                 self._append_log("Batch: 0 students confirmed; nothing to do.")
-                return None
+                return
         else:
             confirmed = matched
 
@@ -24311,88 +22219,29 @@ class App:
             note_inputs = self._collect_note_inputs(
                 scenario, len(confirmed), "batch")
             if note_inputs is None:
-                return None  # cancelled at an additional-text prompt
+                return  # cancelled at an additional-text prompt
 
-        # Text channel (combined action): REVIEW only (the last interactive
-        # step) — timezone-grouped + scheduled. The reviewed selection is
-        # stored and SENT at commit time (so a queued action reviews at add
-        # time, sends at run time). Cancelling aborts the action.
-        text_groups = None
-        text_selected = None
+        # Text channel (combined action): review (the last interactive step)
+        # then SEND — timezone-grouped + scheduled. Cancelling aborts the
+        # action. After this point everything runs without user input.
         if scenario.text is not None:
-            text_groups, tskipped = self._build_text_review_groups(
+            tgroups, tskipped = self._build_text_review_groups(
                 scenario, matched, prompt_vars)
-            if text_groups is None:
-                return None
-            if text_groups:
-                text_selected = self._review_texts(
-                    scenario, text_groups, tskipped)
-                if text_selected is None:
-                    self._append_log(
-                        "Action cancelled at text review; nothing sent.")
-                    return None
-
-        return {
-            "scenario": scenario, "override": override,
-            "confirmed": confirmed, "prompt_vars": prompt_vars,
-            "has_email": has_email, "body_overrides": body_overrides,
-            "addr_overrides": addr_overrides,
-            "note_inputs": note_inputs,
-            "text_groups": text_groups, "text_selected": text_selected,
-        }
-
-    def _commit_batch(self, payload: dict) -> dict:
-        """COMMIT half: send the reviewed texts (if any), then run the shared
-        per-student email→note loop. Consumes a payload from
-        _collect_batch_review. A stop/abort at the text send skips the
-        email/note phase (same contract as the old inline flow). Returns a
-        verdict dict {ok, detail, ...} the Action Queue uses to mark the row
-        done/error; immediate fires ignore it."""
-        scenario = payload["scenario"]
-        text_groups = payload.get("text_groups")
-        # Pre-flight Outlook BEFORE any send when this action emails: a systemic
-        # Outlook failure then pauses the queue for a CLEAN retry — nothing has
-        # gone out yet, so a retry can't double-send the text.
-        if payload.get("has_email"):
-            from src import outlook_email
-            if not outlook_email.is_ready():
+            if tgroups is None:
+                return
+            if tgroups and not self._review_and_send_texts(
+                    scenario, tgroups, tskipped):
                 self._append_log(
-                    "Outlook isn't available / not signed in — action not run.",
-                    error=True)
-                return {"ok": False, "service_down": "Outlook",
-                        "detail": "Outlook not available — open Outlook + retry"}
-        if text_groups:
-            if not self._send_reviewed_texts(
-                    scenario, text_groups, payload["text_selected"]):
-                # A Mongoose login failure is recoverable — flag it so a queue
-                # run pauses for sign-in + retry (rather than dropping the whole
-                # action). A user STOP is just a stop.
-                if getattr(self, "_text_login_fail", False):
-                    return {"ok": False, "service_down": "Mongoose",
-                            "detail": "Mongoose not logged in — sign in + retry"}
-                self._append_log(
-                    "Action cancelled/stopped at text send; "
-                    "notes/email not run.")
-                return {"ok": False, "detail": "stopped at text send"}
-        # The per-student loop — shared with the panel mini-batch. Pass the
-        # pre-collected note input so the loop doesn't prompt again.
-        outcome = self._execute_scenario_over_rows(
-            scenario, payload["override"], payload["confirmed"],
-            payload["prompt_vars"], has_email=payload["has_email"],
-            source="batch", body_overrides=payload["body_overrides"],
-            addr_overrides=payload.get("addr_overrides"),
-            prefetched_inputs=payload["note_inputs"],
+                    "Action cancelled at text review; notes/email not run.")
+                return
+
+        # Step 7 (the per-student loop) — shared with the panel mini-batch.
+        # Pass the pre-collected note input so the loop doesn't prompt again.
+        self._execute_scenario_over_rows(
+            scenario, override, confirmed, prompt_vars,
+            has_email=has_email, source="batch", body_overrides=body_overrides,
+            prefetched_inputs=note_inputs,
         )
-        outcome = outcome or {}
-        ok = bool(outcome.get("ok"))
-        skipped = outcome.get("skipped") or []
-        detail = ""
-        if not ok:
-            detail = (f"{len(skipped)} skipped" if skipped
-                      else "completed with errors")
-        return {"ok": ok, "detail": detail,
-                "processed": outcome.get("processed"),
-                "total": outcome.get("total"), "skipped": skipped}
 
     # ==================================================================
     # Action branching — batch / multi-select fires. Partition the student
@@ -24597,11 +22446,10 @@ class App:
 
         has_email = eff.email is not None
         body_overrides: dict = {}
-        addr_overrides: dict = {}
         if has_email:
             summary = f"branch • {len(rows)} student(s)"
-            eff, confirmed, body_overrides, addr_overrides = \
-                self._review_emails(eff, rows, prompt_vars, summary)
+            eff, confirmed, body_overrides = self._review_emails(
+                eff, rows, prompt_vars, summary)
             if confirmed is None:
                 return False
         else:
@@ -24631,7 +22479,7 @@ class App:
         self._execute_scenario_over_rows(
             eff, override, confirmed, prompt_vars,
             has_email=has_email, source=source, body_overrides=body_overrides,
-            addr_overrides=addr_overrides, prefetched_inputs=note_inputs)
+            prefetched_inputs=note_inputs)
         return True
 
     def _fire_branched_batch(self, scenario, override: str) -> None:
@@ -24879,12 +22727,11 @@ class App:
             })
         return review_groups, skipped_names
 
-    def _review_texts(self, scenario, review_groups, skipped_names):
-        """Show the batch-text reviewer and return the per-group recipient
-        selection (a list of recipient-lists), or None if cancelled. Reviews
-        ONLY — the caller sends later via _send_reviewed_texts, so a queued
-        action can review at ADD time and send at RUN time."""
-        self._text_outcome = None
+    def _review_and_send_texts(self, scenario, review_groups, skipped_names):
+        """Show the batch-text reviewer, then send each selected group's text as
+        one multi-recipient scheduled compose. Returns False if the user
+        cancelled the review (so a combined action aborts), True otherwise."""
+        self._text_outcome = None  # set below; read by the per-action summary
         scheduled = True  # texts are always scheduled
         filter_summary = ""
         if scenario.batch is not None:
@@ -24899,17 +22746,7 @@ class App:
             filter_summary, scheduled=scheduled)
         if selected is None:
             self._append_log("Batch text cancelled.")
-            return None
-        return selected
-
-    def _send_reviewed_texts(self, scenario, review_groups, selected):
-        """Send each selected group's text as one multi-recipient scheduled
-        compose. `selected` is the per-group recipient selection returned by
-        _review_texts. Returns False if the user STOPPED mid-send (so a combined
-        action aborts before its email/note phase), True otherwise."""
-        self._text_outcome = None  # set below; read by the per-action summary
-        self._text_login_fail = False  # set on a Mongoose not-logged-in abort
-        scheduled = True  # texts are always scheduled
+            return False
         if not any(selected):
             self._append_log("Batch text: 0 recipients selected; skipping texts.")
             self._text_outcome = {"scheduled_recipients": 0, "groups": 0,
@@ -24961,29 +22798,16 @@ class App:
                     # Setup failure, not a per-group hiccup: stop immediately
                     # (don't time out the remaining groups) and abort the whole
                     # action so a combined fire doesn't go on to send emails.
-                    # In a queue run this becomes a PAUSE + retry (see
-                    # _queue_run_item); a single fire just aborts.
-                    self._text_login_fail = True
                     self._append_log(
                         "Texts NOT sent — Mongoose isn't logged in. Restore the "
                         "browser window, sign in to Mongoose, then re-fire. "
                         "Email/notes were NOT run.", error=True)
                     return False
                 if not res or res.get("error"):
-                    err = (res or {}).get("error") or ""
-                    if "No recipients could be added" in err:
-                        # BENIGN: every recipient in this group is not in Mongoose
-                        # (same as not-opted-in) — a SKIP, not a failure. Counting
-                        # it as failed wrongly marks the whole action ERROR (which
-                        # is what fed the re-run loop). Don't count it either way.
-                        groups_sent -= 1
-                        self._append_log(
-                            f"  text: {grp['label']} — no addable recipients "
-                            "(not in Mongoose); skipped.")
-                    else:
-                        self._append_log(
-                            f"  text failed [{grp['label']}]: {err}", error=True)
-                        failed += 1
+                    self._append_log(
+                        f"  text failed [{grp['label']}]: "
+                        f"{(res or {}).get('error')}", error=True)
+                    failed += 1
                 else:
                     sent += len(mobiles)
         finally:
@@ -25006,15 +22830,6 @@ class App:
         # Returning False on STOP makes a combined action abort before its
         # email/note phase (same contract as a cancelled review).
         return not stopped
-
-    def _review_and_send_texts(self, scenario, review_groups, skipped_names):
-        """Review then immediately send — the non-queued fire path. Thin wrapper
-        over _review_texts + _send_reviewed_texts (the queue calls those two
-        separately so it can review at add time and send at run time)."""
-        selected = self._review_texts(scenario, review_groups, skipped_names)
-        if selected is None:
-            return False
-        return self._send_reviewed_texts(scenario, review_groups, selected)
 
     @staticmethod
     def _row_name_and_query(row: dict) -> tuple[str, str]:
@@ -25145,9 +22960,8 @@ class App:
         confirmed: list[dict], prompt_vars: dict, *,
         has_email: bool, source: str = "batch",
         body_overrides: Optional[dict] = None,
-        addr_overrides: Optional[dict] = None,
         prefetched_inputs: "Optional[tuple[str, dict]]" = None,
-    ) -> dict:
+    ) -> None:
         """Shared execution core for firing a scenario across many
         students — the full caseload batch AND the panel's hand-picked
         mini-batch. Loops fast-find → auto-send email (if configured) → file
@@ -25158,7 +22972,6 @@ class App:
         combined action collects ALL user input before the text send); when
         None we gather them here."""
         body_overrides = body_overrides or {}
-        addr_overrides = addr_overrides or {}
         # Step 6: per-note user input — use the caller's if it front-loaded
         # them, else gather now (selection mini-batch has no text step, so
         # there's nothing to front-load ahead of).
@@ -25168,8 +22981,7 @@ class App:
             collected = self._collect_note_inputs(
                 scenario, len(confirmed), source)
             if collected is None:
-                return {"ok": False, "cancelled": True, "processed": 0,
-                        "total": len(confirmed), "skipped": []}
+                return
             clipboard, custom_bodies = collected
 
         total = len(confirmed)
@@ -25216,13 +23028,8 @@ class App:
                 # (fast, flake-free), else Fast-find (row filter + click,
                 # which also scrapes mailto/contact-card emails). Either way
                 # the worker harvests the opened record's Contact id.
-                # Prefer the grid's Contact id (complete — every student), then
-                # the Mongoose-segment map. (Was segment-only, so students not
-                # in an exported segment never deep-linked and fell to Fast-find.)
-                cid = ""
-                if allow_deeplink:
-                    cid = (str(row.get("contactID") or "").strip()
-                           or (self._contact_ids.get(sid, "") if sid else ""))
+                cid = (self._contact_ids.get(sid, "")
+                       if (sid and allow_deeplink) else "")
                 click_ok, row_emails = self._click_match_by_filter_blocking(
                     query, expected_name=student_name, contact_id=cid,
                 )
@@ -25306,11 +23113,9 @@ class App:
                                 "next attempt's log line."
                             )
                     ctx_info = {**ctx_info, **prompt_vars}
-                    _ov = addr_overrides.get(idx - 1) or {}
                     if not self._send_scenario_email(
                         scenario.email, ctx_info, auto_send=True,
                         body_html_override=body_overrides.get(idx - 1),
-                        cc_override=_ov.get("cc"), bcc=_ov.get("bcc", ""),
                     ):
                         skipped.append((student_name, "auto-send failed"))
                         continue
@@ -25371,10 +23176,6 @@ class App:
         # batch — each keeps its own Lightning DOM alive. Close them back to the
         # Caseload list. Quiet: stay silent when there was nothing to close.
         self._cleanup_record_tabs(quiet=True)
-        # Outcome for callers that need a verdict (the Action Queue marks each
-        # row done/error from this); immediate fires ignore it.
-        return {"ok": ok, "processed": processed, "total": total,
-                "skipped": skipped, "text_failed": text_failed}
 
     def _fire_on_selected(
         self, scenario: ScenarioConfig, rows: list[dict],
@@ -25407,23 +23208,6 @@ class App:
         rows = [r for r in (rows or []) if r]
         if not rows:
             self._append_log("No students selected.")
-            return
-
-        # Off-caseload student (from the off-caseload search view): there's no
-        # caseload row / CSV context and the record is already open — route
-        # through the single-student path (no prenav) so it uses the scraped
-        # profile context and the ACI/PM CC. Only single-select is supported.
-        if any(r.get("_offcaseload") for r in rows):
-            if len(rows) > 1:
-                self._append_log(
-                    "Fire off-caseload students one at a time (their context "
-                    "comes from the open record).")
-                return
-            self._set_busy(f"Running {scenario.name}…")
-            try:
-                self._fire_per_student(scenario, self.course_var.get().strip())
-            finally:
-                self._set_idle()
             return
 
         # Texting actions: offer a Mongoose refresh up front if the export is
@@ -25588,17 +23372,15 @@ class App:
         # review modal (same as batch), including the fire-time template
         # dropdown; otherwise a single count/name confirm.
         body_overrides: dict = {}
-        addr_overrides: dict = {}
         if has_email:
             n0 = len(rows)
             summary = (
                 f"{n0} hand-picked from the caseload panel" if n0 != 1
                 else self._row_name_and_query(rows[0])[0]
             )
-            scenario, confirmed, body_overrides, addr_overrides = \
-                self._review_emails(
-                    scenario, rows, prompt_vars, summary,
-                )
+            scenario, confirmed, body_overrides = self._review_emails(
+                scenario, rows, prompt_vars, summary,
+            )
             if confirmed is None:
                 return  # cancelled / nothing selected (already logged)
         else:
@@ -25625,7 +23407,7 @@ class App:
             self._execute_scenario_over_rows(
                 scenario, override, confirmed, prompt_vars,
                 has_email=has_email, source="selection",
-                body_overrides=body_overrides, addr_overrides=addr_overrides,
+                body_overrides=body_overrides,
             )
         finally:
             self._set_idle()
@@ -25898,10 +23680,6 @@ class App:
         "EnrolledCU", "TermCompletedCU", "TermDaysLeft",
         "City", "State", "CampusCode", "ProgramName", "Programcode",
         "MobilePhone", "TextingPreference", "StudentEmail",
-        # PM (Program Mentor) name + email — the CC target for outreach emails.
-        # Populated for every grid row, so with these layered the email context
-        # is fully grid-sourced (no per-student contact-card / mailto scrape).
-        "MentorEmail", "MentorName",
     )
 
     def _apply_grid_fields_to_rows(self) -> None:
@@ -26071,18 +23849,8 @@ class App:
         it uses the search path. `allow_deeplink` is False when the fire needs
         the on-page Caseload table (e.g. an email step scrapes student/PM
         context) — the deep link opens a standalone record without it."""
-        # Prefer the complete grid Contact-id map (every student) over the
-        # partial Mongoose-segment map, so a single fire deep-links even for
-        # students not in an exported texting segment.
-        contact_id = ""
-        if allow_deeplink and student_id:
-            try:
-                contact_id = (self.worker.grid_student_contact_map().get(
-                    student_id, "") or "").strip()
-            except Exception:
-                contact_id = ""
-            if not contact_id:
-                contact_id = self._contact_ids.get(student_id, "")
+        contact_id = (self._contact_ids.get(student_id, "")
+                      if (student_id and allow_deeplink) else "")
         done_var = tk.BooleanVar(value=False)
         holder: dict = {"ok": False, "contact_id": ""}
 
@@ -26232,20 +24000,19 @@ class App:
             return render(_replace(
                 scenario, email=_replace(scenario.email, body_html_file=tpl)))
 
-        selected, chosen_tpl, edits, cc_edits, bcc_edits = \
-            prompt_batch_email_review(
-                self.root, scenario.name, rendered, summary,
-                templates=templates, current_template=cur_tpl,
-                on_template_change=(_on_tpl if pick else None),
-            )
+        selected, chosen_tpl, edits = prompt_batch_email_review(
+            self.root, scenario.name, rendered, summary,
+            templates=templates, current_template=cur_tpl,
+            on_template_change=(_on_tpl if pick else None),
+        )
         if not selected:
-            return scenario, None, {}, {}, {}
+            return scenario, None, {}
         if pick and chosen_tpl and chosen_tpl != scenario.email.body_html_file:
             scenario = _replace(
                 scenario,
                 email=_replace(scenario.email, body_html_file=chosen_tpl))
             self._append_log(f"Using email template {chosen_tpl!r}.")
-        return scenario, selected, edits, cc_edits, bcc_edits
+        return scenario, selected, edits
 
     def _review_emails(
         self, scenario: ScenarioConfig, rows: list[dict],
@@ -26265,70 +24032,25 @@ class App:
                 for row in rows
             ]
 
-        scenario, selected, edits, cc_edits, bcc_edits = \
-            self._run_email_review(scenario, render, summary)
+        scenario, selected, edits = self._run_email_review(
+            scenario, render, summary)
         if selected is None:
             self._append_log(
                 f"{scenario.name!r}: email review cancelled / nobody selected.")
-            return scenario, None, {}, {}
+            return scenario, None, {}
         confirmed = [rows[i] for i in selected]
-        # Re-key any hand-edited bodies / CC / BCC from reviewer-index to the
-        # position within `confirmed`, which is what the execution loop iterates.
+        # Re-key any hand-edited bodies from reviewer-index to the position
+        # within `confirmed`, which is what the execution loop iterates.
         body_overrides = {
             pos: edits[i] for pos, i in enumerate(selected) if i in edits
         }
-        addr_overrides = {}
-        for pos, i in enumerate(selected):
-            if i in cc_edits or i in bcc_edits:
-                addr_overrides[pos] = {
-                    "cc": cc_edits.get(i),
-                    "bcc": bcc_edits.get(i, ""),
-                }
         self._append_log(
             f"Email review confirmed: {len(confirmed)} of {len(rows)} "
             "student(s)."
             + (f" ({len(body_overrides)} hand-edited)" if body_overrides
                else "")
         )
-        return scenario, confirmed, body_overrides, addr_overrides
-
-    @staticmethod
-    def _derive_wgu_email(name: str) -> str:
-        """Best-effort WGU faculty email from a display name: first.last@wgu.edu
-        (the confirmed WGU pattern — e.g. the scraped PM 'Jim Morgan' →
-        jim.morgan@wgu.edu). Drops middle names / single-letter initials. Returns
-        "" if a first+last can't be resolved. Shown in the email review so the
-        user can correct it before anything sends."""
-        name = (name or "").strip()
-        if not name:
-            return ""
-        parts = [p for p in re.split(r"\s+", name) if p]
-        # Drop middle names and initials like "J." — keep real first/last tokens.
-        parts = [p for p in parts if len(p.rstrip(".")) > 1]
-        if len(parts) < 2:
-            return ""
-
-        def clean(s: str) -> str:
-            return re.sub(r"[^a-z\-]", "", s.lower())
-
-        first, last = clean(parts[0]), clean(parts[-1])
-        if not first or not last:
-            return ""
-        return f"{first}.{last}@wgu.edu"
-
-    @staticmethod
-    def _merge_cc(*addrs: str) -> str:
-        """Join CC address strings, splitting on ; or , deduping case-
-        insensitively and preserving order. Empty parts are dropped."""
-        seen: set = set()
-        out: list = []
-        for group in addrs:
-            for a in re.split(r"[;,]", group or ""):
-                a = a.strip()
-                if a and a.lower() not in seen:
-                    seen.add(a.lower())
-                    out.append(a)
-        return "; ".join(out)
+        return scenario, confirmed, body_overrides
 
     def _build_email_preview_data(
         self,
@@ -26338,7 +24060,6 @@ class App:
         user_info: dict,
         *,
         ctx_override: Optional[dict] = None,
-        extra_cc: str = "",
     ) -> dict:
         """Render one student's email for the batch review modal.
         Returns the dict shape `prompt_batch_email_review` consumes.
@@ -26402,8 +24123,6 @@ class App:
                 to = ctx.get("student_email", "") or ""
             if email_cfg.cc_pm:
                 cc = ctx.get("pm_email", "") or ""
-            if extra_cc:
-                cc = self._merge_cc(cc, extra_cc)
         except Exception as e:
             render_error = f"{type(e).__name__}: {e}"
 
@@ -26429,7 +24148,7 @@ class App:
             "to": to,
             "cc": cc,
             "cc_is_self": cc_is_self,
-            "cc_configured": bool(email_cfg.cc_pm) or bool(extra_cc),
+            "cc_configured": bool(email_cfg.cc_pm),
             "subject": subject,
             "body_html": body_html,
             "render_error": render_error,
@@ -26478,154 +24197,6 @@ class App:
             "pm_email": _first_present_value(row, _CSV_PM_EMAIL_COLS),
             "program_name": _first("ProgramName", "Program Name"),
         }
-
-    def _offcaseload_open_context(self) -> Optional[dict]:
-        """If an off-caseload student is currently open in the viewer, build the
-        email/note/text context from their SCRAPED profile — there's no caseload
-        row for lookup_caseload_student to find, so the normal context read
-        returns blanks. Returns the context dict (with the active ACI carried as
-        aci_name/aci_course for CC), or None when no off-caseload student is
-        open."""
-        panel = getattr(self, "caseload_panel", None)
-        qv = getattr(panel, "_qv_row", None) or {}
-        if not qv.get("_offcaseload"):
-            return None
-        prof = getattr(panel, "_qv_offcaseload_profile", None) or {}
-        name = str(qv.get("Name") or "").strip()
-        first, _, last = name.partition(" ")
-        active = [a for a in (prof.get("aci") or []) if a.get("active")]
-        return {
-            "full_name": name,
-            "first_name": first,
-            "preferred_name": first,
-            "last_name": last,
-            "student_email": prof.get("wgu_email", ""),
-            "student_id": prof.get("student_id", ""),
-            "contact_id": str(qv.get("Contact id") or "").strip(),
-            "course_code": active[0]["course"] if active else "",
-            "pm_name": prof.get("mentor", ""),
-            "pm_email": prof.get("mentor_email", ""),
-            # The assigned course instructor (for Stage 5's auto-CC). Only the
-            # name is scraped so far; the email is resolved in Stage 5.
-            "aci_name": active[0]["mentor"] if active else "",
-            "aci_course": active[0]["course"] if active else "",
-            "mobile": prof.get("mobile", ""),
-            "timezone": prof.get("timezone", ""),
-            "_offcaseload": True,
-        }
-
-    def _offcaseload_cc(self, student_ctx: Optional[dict]) -> str:
-        """Extra CC (the ACI) to add on an OFF-caseload student's email, when the
-        setting is on. ONLY the ACI is added here — the PM CC follows the
-        action's own "CC Program Mentor" flag (that path already uses the scraped
-        pm_email for off-caseload students), so turning it off on the action
-        drops the PM. The ACI email must be a REAL directory value (never a
-        guess). Returns "" for on-caseload students or when the setting is off."""
-        if not (student_ctx or {}).get("_offcaseload"):
-            return ""
-        if not getattr(self.settings, "cc_aci_offcaseload", True):
-            return ""
-        return (student_ctx.get("aci_email") or "").strip()
-
-    # ----- ACI email directory (local, user-maintained) -----
-
-    @staticmethod
-    def _aci_key(name: str) -> str:
-        """Normalize an ACI name to a directory key (lower-case, single-spaced)."""
-        return re.sub(r"\s+", " ", (name or "").strip()).lower()
-
-    def _resolve_aci_email(self, name: str) -> str:
-        """The stored email for an ACI name from the local directory, or "" if we
-        don't have one yet."""
-        key = self._aci_key(name)
-        if not key:
-            return ""
-        d = getattr(self.settings, "aci_emails", None) or {}
-        return str(d.get(key, "") or "").strip()
-
-    def _set_aci_email(self, name: str, email: str) -> None:
-        """Store (or clear, when email is blank) an ACI's email in the local
-        directory and persist it."""
-        key = self._aci_key(name)
-        if not key:
-            return
-        d = dict(getattr(self.settings, "aci_emails", None) or {})
-        email = (email or "").strip()
-        if email:
-            d[key] = email
-        else:
-            d.pop(key, None)
-        self.settings.aci_emails = d
-        save_settings(self.settings)
-
-    def _prompt_aci_email(self, name: str) -> str:
-        """Ask the user to confirm/enter an ACI's email (pre-filled with the best
-        first.last@wgu.edu guess — a starting point, not trusted). Stores the
-        result in the local directory for reuse. Returns the email, or "" if the
-        user cleared it or cancelled."""
-        from tkinter import simpledialog
-        guess = self._derive_wgu_email(name)
-        val = simpledialog.askstring(
-            "Confirm ACI email",
-            f"Email for {name} (assigned course instructor)?\n\n"
-            "Used to CC them on this off-caseload student's email. Saved for "
-            "next time (editable in Settings → Actions → Manage ACI emails).\n"
-            "Leave blank to not CC them.",
-            initialvalue=guess, parent=self.root)
-        if val is None:
-            return ""   # cancelled — don't store, so we ask again next time
-        val = val.strip()
-        self._set_aci_email(name, val)   # blank = remembered "don't CC this ACI"
-        return val
-
-    def _manage_aci_emails_dialog(self) -> None:
-        """Editor for the local ACI email directory (name = email, one per
-        line)."""
-        dlg = ctk.CTkToplevel(self.root)
-        dlg.title("ACI email directory")
-        dlg.geometry("470x430")
-        try:
-            dlg.transient(self.root)
-            dlg.attributes("-topmost", True)
-            dlg.after(120, lambda: (dlg.lift(), dlg.focus_force()))
-        except Exception:
-            pass
-        ctk.CTkLabel(
-            dlg, text="One per line:   Name = email@wgu.edu",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(anchor="w", padx=12, pady=(12, 2))
-        ctk.CTkLabel(
-            dlg, text=("The assigned course instructor's email, looked up by "
-                       "name when CC'ing off-caseload student emails."),
-            text_color=("gray35", "gray70"), wraplength=440, justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 6))
-        box = ctk.CTkTextbox(dlg, wrap="none")
-        box.pack(fill="both", expand=True, padx=12, pady=4)
-        cur = getattr(self.settings, "aci_emails", None) or {}
-        box.insert("1.0", "\n".join(f"{k} = {v}"
-                                    for k, v in sorted(cur.items())))
-
-        def save():
-            d: dict = {}
-            for line in box.get("1.0", "end").splitlines():
-                if "=" not in line:
-                    continue
-                name, _, email = line.partition("=")
-                key = self._aci_key(name)
-                email = email.strip()
-                if key and email:
-                    d[key] = email
-            self.settings.aci_emails = d
-            save_settings(self.settings)
-            self._append_log(f"ACI directory: {len(d)} email(s) saved.")
-            dlg.destroy()
-
-        row = ctk.CTkFrame(dlg, fg_color="transparent")
-        row.pack(fill="x", padx=12, pady=(4, 12))
-        ctk.CTkButton(row, text="Save", command=save, fg_color=_ADD_BTN_BLUE,
-                      hover_color=_ADD_BTN_BLUE_HOVER).pack(side="left")
-        ctk.CTkButton(row, text="Cancel", command=dlg.destroy,
-                      **SECONDARY_BTN_KWARGS).pack(side="left", padx=8)
 
     def _get_student_context_blocking(self, name_hint: str = "") -> Optional[dict]:
         """Ask the worker to read the active student's context (email,
@@ -26830,9 +24401,6 @@ class App:
         *,
         auto_send: bool = False,
         body_html_override: Optional[str] = None,
-        extra_cc: str = "",
-        cc_override: Optional[str] = None,
-        bcc: str = "",
     ) -> bool:
         """Render the template and either Display() the draft for
         review (default) or Send() it programmatically (`auto_send`).
@@ -26947,13 +24515,6 @@ class App:
         else:
             to = student_ctx.get("student_email", "")
         cc = student_ctx.get("pm_email", "") if email_cfg.cc_pm else ""
-        if extra_cc:
-            cc = self._merge_cc(cc, extra_cc)
-        # A CC the user edited in the review is authoritative (replaces the
-        # computed CC entirely); None means "no edit — use the computed CC".
-        if cc_override is not None:
-            cc = self._merge_cc(cc_override)
-        bcc = self._merge_cc(bcc) if bcc else ""
         if not to:
             full_name = student_ctx.get('full_name') or 'this student'
             if auto_send:
@@ -26994,7 +24555,7 @@ class App:
                     outlook_email.compose_email(
                         to=to, cc=cc, subject=subject,
                         html_body=body_html, inline_images=inline_images,
-                        bcc=bcc, auto_send=True,
+                        auto_send=True,
                         signature_name=email_cfg.signature_file,
                     )
                     last_err = None
@@ -27016,7 +24577,7 @@ class App:
         try:
             outlook_email.compose_email(
                 to=to, cc=cc, subject=subject,
-                html_body=body_html, inline_images=inline_images, bcc=bcc,
+                html_body=body_html, inline_images=inline_images,
             )
         except Exception as e:
             self._append_log(f"Outlook compose failed: {e}")
@@ -28238,53 +25799,6 @@ class App:
             text_color=("gray35", "gray70"), anchor="w",
         ).pack(fill="x", padx=44, pady=(0, 10))
 
-        # Off-caseload emails: CC the ACI (assigned course instructor) + PM.
-        cc_aci_var = ctk.BooleanVar(
-            value=getattr(self.settings, "cc_aci_offcaseload", True))
-        ctk.CTkCheckBox(
-            dialog,
-            text="CC the ACI on off-caseload student emails",
-            variable=cc_aci_var, font=ctk.CTkFont(size=13),
-        ).pack(anchor="w", padx=20, pady=(8, 0))
-        ctk.CTkLabel(
-            dialog,
-            text=("When you email a student who's on another instructor's "
-                  "caseload, automatically CC their assigned course instructor "
-                  "(ACI). The ACI email is looked up in your local ACI directory "
-                  "— you confirm each ACI's email once (pre-filled with a "
-                  "first.last@wgu.edu guess) and it's reused after. (The Program "
-                  "Mentor is CC'd separately by each action's own ‘CC Program "
-                  "Mentor’ option.) The CC is shown in the email review."),
-            wraplength=510, justify="left",
-            text_color=("gray35", "gray70"), anchor="w",
-        ).pack(fill="x", padx=44, pady=(0, 6))
-        ctk.CTkButton(
-            dialog, text="Manage ACI emails…",
-            command=self._manage_aci_emails_dialog, **SECONDARY_BTN_KWARGS,
-        ).pack(anchor="w", padx=44, pady=(0, 10))
-
-        # Quick-note hotkey (the ＋ Note button in the caseload viewer).
-        qn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        qn_row.pack(anchor="w", fill="x", padx=20, pady=(8, 0))
-        ctk.CTkLabel(qn_row, text="Quick-note hotkey (＋ Note):").pack(side="left")
-        quicknote_hk_var = ctk.StringVar(
-            value=getattr(self.settings, "quick_note_hotkey", "Ctrl+Shift+N"))
-        ctk.CTkEntry(qn_row, textvariable=quicknote_hk_var, width=150).pack(
-            side="left", padx=(8, 4))
-        ctk.CTkButton(
-            qn_row, text="Press to set", width=100,
-            command=lambda: open_hotkey_capture(
-                dialog, lambda combo: quicknote_hk_var.set(combo)),
-            **SECONDARY_BTN_KWARGS).pack(side="left")
-        ctk.CTkLabel(
-            dialog,
-            text=("Opens the quick-note dialog for the selected student from "
-                  "anywhere. Clear it to disable the hotkey (the ＋ Note button "
-                  "in the viewer still works)."),
-            wraplength=510, justify="left",
-            text_color=("gray35", "gray70"), anchor="w",
-        ).pack(fill="x", padx=44, pady=(0, 10))
-
         # Advanced: action branching (conditional sub-actions).
         branching_var = ctk.BooleanVar(
             value=getattr(self.settings, "enable_branching", False))
@@ -28515,16 +26029,6 @@ class App:
                 self.worker.text_api_enabled = self.settings.text_send_via_api
             except Exception:
                 pass
-            # Hide/show the manual '⬇ Texting IDs' export button to match: the
-            # segment export is only needed for the DOM texting fallback.
-            self._update_texting_ids_btn()
-            # Off-caseload email CC (ACI + PM).
-            self.settings.cc_aci_offcaseload = bool(cc_aci_var.get())
-            # Quick-note hotkey — re-register the global hotkeys if it changed.
-            new_qn_hk = quicknote_hk_var.get().strip()
-            qn_hk_changed = (new_qn_hk != getattr(
-                self.settings, "quick_note_hotkey", ""))
-            self.settings.quick_note_hotkey = new_qn_hk
             # Action branching (advanced) — gates the "+ branch" editor UI.
             new_branching = bool(branching_var.get())
             branching_changed = (
@@ -28541,8 +26045,6 @@ class App:
                     pass
             # Per-area font sizes already persist live via set_font_size.
             save_settings(self.settings)
-            if qn_hk_changed:
-                self._restart_hotkeys()
             if changed:
                 self._apply_advanced_mode()
             # Toggle the "+ branch" create button on every open editor when the
@@ -29309,25 +26811,29 @@ class App:
             pass
 
     def _set_busy(self, message: str) -> None:
-        """Enter a busy state: disable action buttons, show a spinner
-        + status label, and start the animation. Idempotent — calling
-        again while busy just updates the message."""
-        was_already_busy = self._is_busy
-        if not was_already_busy:
-            self._stop_event.clear()   # fresh action — clear any old STOP
-        self._is_busy = True
-        self._busy_message = message
-        try:
-            self.caseload_refresh_btn.configure(state="disabled")
-        except Exception:
-            pass
-        for btn in self.scenario_buttons.values():
-            try:
-                btn.configure(state="disabled")
-            except Exception:
-                pass
-        if not was_already_busy:
-            self._tick_spinner()  # kicks off the animation loop
+         """Enter a busy state: disable action buttons, show a spinner
+         + status label, and start the animation. Idempotent — calling
+         again while busy just updates the message."""
+         was_already_busy = self._is_busy
+         if not was_already_busy:
+             self._stop_event.clear()   # fresh action — clear any old STOP
+         self._is_busy = True
+         self._busy_message = message
+         try:
+             self.caseload_refresh_btn.configure(state="disabled")
+         except Exception:
+             pass
+         
+         # THIS SECTION BELOW IS REPLACED WITH THE SAFETY CHECK
+         if hasattr(self, 'scenario_buttons'):
+             for btn in self.scenario_buttons.values():
+                 try:
+                     btn.configure(state="disabled")
+                 except Exception:
+                     pass
+                 
+         if not was_already_busy:
+             self._tick_spinner()  # kicks off the animation loop
 
     def _set_idle(self) -> None:
         """Leave the busy state — re-enable action buttons, clear the
@@ -29349,16 +26855,13 @@ class App:
             self.caseload_refresh_btn.configure(state="normal")
         except Exception:
             pass
-        for btn in self.scenario_buttons.values():
-            try:
-                btn.configure(state="normal")
-            except Exception:
-                pass
-        # Re-apply the queue add-mode affordance (queued buttons stay disabled
-        # in add-mode) and review any actions the user deferred while busy.
-        self._refresh_queue_add_affordance()
-        if getattr(self, "_queue_pending_review", None):
-            self.root.after(300, self._drain_pending_review)
+        if hasattr(self, 'scenario_buttons'):
+        # The original code inside, safely guarded
+            for btn in self.scenario_buttons.values():
+                try:
+                    btn.configure(state="normal")
+                except Exception:
+                    pass
 
     def _tick_spinner(self) -> None:
         if not self._is_busy:
@@ -31193,13 +28696,6 @@ class App:
         Aura API (no navigation), shown instantly with a 'Load all' affordance.
         If the API isn't available (no grid/creds, or a non-numeric query), go
         straight to the full all-author scrape."""
-        # Off-caseload student: the record is already open (deep-linked). The
-        # my-notes API is keyed to the user's caseload grid, so skip it and
-        # scrape the open record's Notes History directly (via its Contact id).
-        qv = getattr(panel, "_qv_row", None) or {}
-        if qv.get("_offcaseload"):
-            self._review_notes_scrape(query, label, panel)
-            return
         def on_fast(res):
             def render():
                 try:
@@ -31266,25 +28762,8 @@ class App:
                 pass
         # Deep-link by Contact id when we know it (grid map) so the all-authors
         # scrape doesn't depend on the Student ID column being in the caseload
-        # view — the search path stays the fallback for on-caseload lookups.
+        # view — the search path stays the fallback for off-caseload lookups.
         cid = self._contact_ids.get(str(query).strip(), "") if query else ""
-        if not cid:
-            # Off-caseload students aren't in the caseload/segment maps and a
-            # name query can't be row-filtered — use the open record's Contact
-            # id (from the quick-view profile) so the scrape deep-links to them.
-            qv = getattr(panel, "_qv_row", None) or {}
-            if qv.get("_offcaseload"):
-                cid = str(qv.get("Contact id") or "").strip()
-        if not cid and query:
-            # On-caseload student not in the (partial Mongoose-segment) map:
-            # use the COMPLETE grid Student→Contact map so pressing Enter
-            # deep-links straight to the record instead of the slow, flaky
-            # caseload row-filter search.
-            try:
-                cid = (self.worker.grid_student_contact_map().get(
-                    str(query).strip(), "") or "").strip()
-            except Exception:
-                cid = ""
         self.worker.submit_fetch_notes(query, on_done, contact_id=cid)
 
     def _reapply_notes_font(self, size=None) -> None:
